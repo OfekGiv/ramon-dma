@@ -538,7 +538,10 @@ Recommended once: the same `--stress` run on a kernel built with `CONFIG_PROVE_L
 `CONFIG_DEBUG_ATOMIC_SLEEP=y` and `CONFIG_KASAN=y` (lockdep and use-after-free checks).
 
 **What the `spfi` test does to the NN.** Per NN, it creates two streams at the **two highest
-free stream ids** (read from the NN's own table). It writes 8 + 3×8 pages (512 KiB) to them,
+free stream ids in 0..192** (read from the NN's own table). NN rules it follows (smoke 0.8.5):
+never use the last 5 ids (193..197); at most 8 streams open at once (it refuses to start if two
+more would exceed that); an existing stream must be deleted before its id is opened again (it
+only picks ids that do not exist). It writes 8 + 3×8 pages (512 KiB) to them,
 reads them back, then closes and deletes them. Existing streams are never touched. INIT and
 FORMAT are never sent; `--spfi-init` adds INIT type 0 before the test. The write channel is
 4 for both NNs since smoke 0.8.4 (`--spfi-chans A,B` overrides). The old `spfidrvinit` used 5/4,
@@ -675,3 +678,11 @@ ramon_smoke spfi
   padding. The mapping itself was already right; only the numeric form was missing.
 - A stream left open by the failed run (197 on NN0) is skipped by the next `spfi` run, which
   picks the highest free ids.
+
+### Smoke 0.8.5: NN stream rules
+
+- At most 8 streams open, ids 193..197 never used, delete before reopening. The `spfi` test
+  follows all three, and the table printout lists existing streams, marking any that sit on a
+  reserved id.
+- `ramon_smoke spfidel <nn> <sid>` closes a stream if it is open, then deletes it (any id,
+  e.g. `spfidel 0 197` for the stream the channel-5 run left behind).

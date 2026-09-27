@@ -21,6 +21,7 @@
  *   ramon_smoke spfiprep [nn] [--format]
  *                                     the old SPFI bring-up: 0xCC == 0x88, spwdps, INIT 0,
  *                                     FORMAT only with --format (erases all streams), table
+ *   ramon_smoke spfidel <nn> <sid>    CLOSE (if open) + DELETE one stream, e.g. a leftover
  *   ramon_smoke [-d DEV] unbind       unbind with an fd open and a buffer mapped, rebind (root)
  *   ramon_smoke [-d DEV] --errors     error-path sweep (includes a CMA exhaustion check)
  *
@@ -58,7 +59,7 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.4"
+#define SMOKE_VERSION		"0.8.5"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -1546,6 +1547,9 @@ static void test_spw(void)
 #define SPFI_STREAMS		198
 #define SPFI_TABLE_BYTES	(SPFI_HDR_BYTES + SPFI_STREAMS * SPFI_REC_BYTES)
 #define SPFI_ST_EXIST		0x01
+#define SPFI_ST_OPEN		0x02
+#define SPFI_STREAMS_USABLE	(SPFI_STREAMS - 5)	/* NN rule: never use the last 5 */
+#define SPFI_MAX_OPEN		8			/* NN rule: at most 8 open at once */
 #define SPFI_PAGES		8	/* per write */
 #define SPFI_ROUNDS		3	/* writes to the second stream */
 #define SPFI_ALERT_DRAIN	10
@@ -1704,25 +1708,47 @@ static int spfi_read(uint32_t nn, uint32_t sid, uint32_t first, uint32_t pages,
 	return must(RAMON_IOC_SPFI_READ, &r, &r.st, "SPFI_READ");
 }
 
-static void spfi_print_table(uint32_t nn, const uint8_t *tab)
+/* prints the header and the existing streams; returns how many are open */
+static uint32_t spfi_print_table(uint32_t nn, const uint8_t *tab)
 {
 	const struct spfi_table_hdr *h = (const struct spfi_table_hdr *)tab;
-	uint32_t sid, used = 0;
+	uint32_t sid, exist = 0, open = 0;
+	uint8_t st;
 
-	for (sid = 0; sid < SPFI_STREAMS; sid++)
-		if (spfi_rec(tab, sid)->status & SPFI_ST_EXIST)
-			used++;
-	printf("      spfi%u table: media %u pages, allocated %u, used %u, %u stream(s) exist\n",
-	       nn, h->total_media_size, h->total_allocated_size, h->total_used_size, used);
+	for (sid = 0; sid < SPFI_STREAMS; sid++) {
+		st = spfi_rec(tab, sid)->status;
+		exist += !!(st & SPFI_ST_EXIST);
+		open += !!(st & SPFI_ST_OPEN);
+	}
+	printf("      spfi%u table: media %u pages, allocated %u, used %u; %u stream(s) exist, %u open\n",
+	       nn, h->total_media_size, h->total_allocated_size, h->total_used_size, exist, open);
+	for (sid = 0; sid < SPFI_STREAMS; sid++) {
+		st = spfi_rec(tab, sid)->status;
+		if (st & SPFI_ST_EXIST)
+			printf("        stream %3u: status 0x%02x%s latest_write_offs %d%s\n", sid, st,
+			       st & SPFI_ST_OPEN ? " open  " : " closed",
+			       (int)spfi_rec(tab, sid)->latest_write_offs,
+			       sid >= SPFI_STREAMS_USABLE ? "  (reserved id!)" : "");
+	}
+	return open;
 }
 
-/* the two highest stream ids the NN reports as not existing */
+/*
+ * The two highest usable stream ids that do not exist (an existing stream
+ * must be deleted before its id is opened again), provided two more open
+ * streams stay within the NN's limit.
+ */
 static int spfi_free_streams(uint32_t nn, const uint8_t *tab, uint32_t *s1, uint32_t *s2)
 {
-	uint32_t sid, found = 0;
+	uint32_t sid, found = 0, open;
 
-	spfi_print_table(nn, tab);
-	for (sid = SPFI_STREAMS; sid-- > 0 && found < 2;) {
+	open = spfi_print_table(nn, tab);
+	if (open + 2 > SPFI_MAX_OPEN) {
+		fail("spfi%u: %u streams are open; two more would exceed the NN limit of %d "
+		     "(close/delete with \"ramon_smoke spfidel %u <sid>\")", nn, open, SPFI_MAX_OPEN, nn);
+		return -1;
+	}
+	for (sid = SPFI_STREAMS_USABLE; sid-- > 0 && found < 2;) {
 		if (spfi_rec(tab, sid)->status & SPFI_ST_EXIST)
 			continue;
 		if (found++)
@@ -2081,6 +2107,38 @@ static void test_spwsend(void)
 		pass("spw%u: reply received", s.nn);
 	spw_drain(&s);
 	mbuf_del(&s.scratch);
+}
+
+/* ramon_smoke spfidel <nn> <sid>: CLOSE if open, then DELETE (any id, also 193..197) */
+static void test_spfidel(void)
+{
+	uint32_t nn = targ_u32(0, 0), sid = targ_u32(1, SPFI_STREAMS);
+	uint8_t *tab;
+
+	if (targc < 2 || nn >= RAMON_NN_COUNT || sid >= SPFI_STREAMS) {
+		fail("usage: spfidel <nn> <stream id 0..%d>", SPFI_STREAMS - 1);
+		return;
+	}
+	tab = malloc(SPFI_TABLE_BYTES);
+	if (!tab || spfi_table(nn, tab))
+		goto out;
+	if (!(spfi_rec(tab, sid)->status & SPFI_ST_EXIST)) {
+		printf("      spfi%u stream %u does not exist; nothing to do\n", nn, sid);
+		goto out;
+	}
+	if ((spfi_rec(tab, sid)->status & SPFI_ST_OPEN) &&
+	    spfi_stream(nn, RAMON_SPFI_OP_CLOSE_STREAM_FOR_WRITE, sid, 0, "CLOSE"))
+		goto out;
+	if (spfi_stream(nn, RAMON_SPFI_OP_DELETE_STREAM, sid, 0, "DELETE") ||
+	    spfi_table(nn, tab))
+		goto out;
+	if (spfi_rec(tab, sid)->status & SPFI_ST_EXIST)
+		fail("spfi%u stream %u still exists after DELETE", nn, sid);
+	else
+		pass("spfi%u stream %u closed and deleted", nn, sid);
+	spfi_print_table(nn, tab);
+out:
+	free(tab);
 }
 
 /*
@@ -3372,6 +3430,7 @@ static const struct test tests[] = {
 	{ "spwdps",	test_spwdps,	0, 5 },
 	{ "spwsend",	test_spwsend,	0, 5 },
 	{ "spfiprep",	test_spfiprep,	0, 7 },
+	{ "spfidel",	test_spfidel,	0, 7 },
 };
 
 /*
