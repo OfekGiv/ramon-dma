@@ -728,7 +728,10 @@ ramon_smoke spfi
 - `spfiprep` now prints the SPFI diagnostic line (word 50 decoded, interrupt histogram,
   unexpected/timeout counters) after INIT, after FORMAT and after a failed GET_ALL, plus any
   alerts the NN queued. That shows whether the NN answered with something other than `0xD0`.
-- Result: `spfiprep 0 --format` passes. After a power-up the NN needs FORMAT between INIT and
-  GET_ALL_STREAM_STATUS, as the old flow always did (INIT answers `rx_err_code 1`,
-  `init_info 0x2` before the format). Since smoke 0.8.9, `spfiprep` prints this as a hint when
-  GET_ALL fails without `--format`.
+- Result: `spfiprep 0 --format` passes. FORMAT is **not** required before GET_ALL (user). Open
+  question: without FORMAT, GET_ALL was sent immediately after INIT's answer and went
+  unanswered. Either the NN needs time after INIT (FORMAT only added delay), or it was a
+  one-off. The smoke 0.8.9 hint claiming FORMAT is required was wrong and is removed in 0.8.10.
+- `ramon_smoke spficmd <nn> <opcode> [param]` (smoke 0.8.10) sends one short command and prints
+  every result field, with the SPFI diagnostic line before and after, e.g.
+  `spficmd 0 0x59 0` (INIT type 0), then `spficmd 0 0x50` (GET_ALL) a few seconds later.

@@ -22,6 +22,8 @@
  *                                     the old SPFI bring-up: 0xCC == 0x88, spwdps, INIT 0,
  *                                     FORMAT only with --format (erases all streams), table
  *   ramon_smoke spfidel <nn> <sid>    CLOSE (if open) + DELETE one stream, e.g. a leftover
+ *   ramon_smoke spficmd <nn> <op> [p] one SPFI short command (p = stream id / init type / tod),
+ *                                     e.g. "spficmd 0 0x59 0" (INIT), "spficmd 0 0x50" (GET_ALL)
  *   ramon_smoke reg <win> <off> [val] read (or write, then read back) one register, e.g.
  *                                     "reg spfi0 0xc8" for SPFI_WR_STATUS0 (word 50)
  *   ramon_smoke [-d DEV] unbind       unbind with an fd open and a buffer mapped, rebind (root)
@@ -61,7 +63,7 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.9"
+#define SMOKE_VERSION		"0.8.10"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -2179,6 +2181,34 @@ static void spfi_print_alerts(uint32_t nn)
 		printf("      spfi%u: no alerts pending\n", nn);
 }
 
+/*
+ * ramon_smoke spficmd <nn> <opcode> [param]: one short command, waiting for its
+ * answer. param is the stream id (FLUSH/OPEN/CLOSE/DELETE), the init type
+ * (INIT) or the tod (SET_TOD). OPEN is non-cyclic with last offset 0.
+ */
+static void test_spficmd(void)
+{
+	uint32_t nn = targ_u32(0, 0), opcode = targ_u32(1, 0), param = targ_u32(2, 0);
+	struct ramon_spfi_cmd c;
+
+	if (targc < 2) {
+		fail("usage: spficmd <nn> <opcode> [stream id | init type | tod]");
+		return;
+	}
+	memset(&c, 0, sizeof(c));
+	c.stream_id = param;
+	c.init_type = param;
+	c.tod = param;
+	spfi_diag(nn, "before");
+	if (!spfi_cmd(nn, opcode, &c, "SPFI_CMD"))
+		printf("      spfi%u opcode 0x%x: rx_opcode 0x%x rx_err_code %u rx_stream_id %u rx_offset %u rx_init_info 0x%x rx_curr_tod %u rx_status 0x%x%s%s\n",
+		       nn, opcode, c.rx_opcode, c.rx_err_code, c.rx_stream_id, c.rx_offset,
+		       c.rx_init_info, c.rx_curr_tod, c.rx_status, c.st.msg[0] ? " -- " : "",
+		       c.st.msg);
+	spfi_diag(nn, "after");
+	spfi_print_alerts(nn);
+}
+
 /* ramon_smoke reg <window> <offset> [value]: one REG_IO read, or write + read back */
 static void test_reg(void)
 {
@@ -2274,10 +2304,6 @@ static void test_spfiprep(void)
 	} else {
 		spfi_diag(nn, "after the failed GET_ALL_STREAM_STATUS");
 		spfi_print_alerts(nn);
-		if (!spfi_format)
-			printf("      hint: after a power-up the NN answers GET_ALL_STREAM_STATUS only once\n"
-			       "      formatted; the old flow always ran spfifmt here: rerun with --format\n"
-			       "      (it erases every stream on the NN)\n");
 	}
 	free(tab);
 }
@@ -3530,6 +3556,7 @@ static const struct test tests[] = {
 	{ "spfiprep",	test_spfiprep,	0, 7 },
 	{ "spfidel",	test_spfidel,	0, 7 },
 	{ "reg",	test_reg,	0, 3 },
+	{ "spficmd",	test_spficmd,	0, 7 },
 };
 
 /*
