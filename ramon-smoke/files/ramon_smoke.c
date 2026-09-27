@@ -63,7 +63,7 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.10"
+#define SMOKE_VERSION		"0.8.11"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -2283,11 +2283,14 @@ static void test_spfiprep(void)
 		return;
 	}
 	pass("spfi%u: link up", nn);
+	spfi_diag(nn, "at start");
 	if (spw_open_link(&s, nn))
 		return;
+	spfi_diag(nn, "after SPW link sync");
 	spw_dps(&s);
 	spw_drain(&s);
 	mbuf_del(&s.scratch);
+	spfi_diag(nn, "after DPS");
 	spfi_init_nn(nn);
 	spfi_diag(nn, "after INIT");
 	if (spfi_format) {

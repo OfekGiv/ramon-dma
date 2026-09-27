@@ -735,3 +735,14 @@ ramon_smoke spfi
 - `ramon_smoke spficmd <nn> <opcode> [param]` (smoke 0.8.10) sends one short command and prints
   every result field, with the SPFI diagnostic line before and after, e.g.
   `spficmd 0 0x59 0` (INIT type 0), then `spficmd 0 0x50` (GET_ALL) a few seconds later.
+
+### Smoke 0.8.11: where does VC1 bit 5 come from?
+
+- `spfiprep 0` without FORMAT: word 50 = `0x20` (VC1 sticky, no TLAST) right after INIT, then
+  GET_ALL (answered on VC1) went unanswered. Word 50 was `0x0` at boot, and `spfiprep` does no
+  SPFI DMA, so no channel-4 transfer is involved. The driver issues INIT exactly as the old one
+  did: word 7 = 1, word 5 = init type, then word 0 = `0x59`.
+- `spfiprep` now prints the SPFI line at start, after the SPW link sync, after DPS, after INIT
+  and after FORMAT, so one run shows which step sets bit 5.
+- Open questions for the FPGA/NN side: how is bit 5 cleared, and does INIT (or DPS) legitimately
+  leave it set? Does FORMAT clear it? That would explain why the old flow always formatted.
