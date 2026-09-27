@@ -61,7 +61,7 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.8"
+#define SMOKE_VERSION		"0.8.9"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -2274,6 +2274,10 @@ static void test_spfiprep(void)
 	} else {
 		spfi_diag(nn, "after the failed GET_ALL_STREAM_STATUS");
 		spfi_print_alerts(nn);
+		if (!spfi_format)
+			printf("      hint: after a power-up the NN answers GET_ALL_STREAM_STATUS only once\n"
+			       "      formatted; the old flow always ran spfifmt here: rerun with --format\n"
+			       "      (it erases every stream on the NN)\n");
 	}
 	free(tab);
 }
