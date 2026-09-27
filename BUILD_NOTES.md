@@ -686,3 +686,18 @@ ramon_smoke spfi
   reserved id.
 - `ramon_smoke spfidel <nn> <sid>` closes a stream if it is open, then deletes it (any id,
   e.g. `spfidel 0 197` for the stream the channel-5 run left behind).
+
+### Smoke 0.8.6: DATA_WRITE parameters as the old `spfi_send`
+
+- On channel 4 the write stalled: `xilinx-vdma a0030000.dma: Cannot stop channel ...: 10008`,
+  then our timeout and terminate. `xilinx-vdma` is the kernel xilinx_dma driver's device name
+  for every AXI DMA, and `a0030000` is channel 4's axi_dma (our own log line says so). Status
+  `0x10008` = running, neither halted nor idle: the MM2S engine was waiting for the stream sink
+  (SPFI) to take data, i.e. SPFI did not accept the write.
+- Difference found: for a non-cyclic stream the old `spfi_send` sends DATA_WRITE with
+  `stream_last_offset = 0`; the test sent 8 (and 24). Fixed. `tx_offset` (table
+  `latest_write_offs` + 1), `tx_num_offset`, the register order and the sequence (command, then
+  DMA, then wait for VC1TX) already matched.
+- On a write failure the test now prints SPFI words 48..51 (VC ctrl / write status), 19 (rx
+  opcode), 21 (rx err code) and 33 (rx status), plus the SPFI interrupt histogram. It prints the
+  same line once before the first write, for comparison.

@@ -59,7 +59,7 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.5"
+#define SMOKE_VERSION		"0.8.6"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -1666,8 +1666,40 @@ static int spfi_stream(uint32_t nn, uint32_t opcode, uint32_t sid, uint32_t last
 	return 0;
 }
 
-static int spfi_write(uint32_t nn, uint32_t sid, uint32_t tx_offset, uint32_t last,
-		      const struct mbuf *src)
+/* SPFI status words (48..51 VC ctrl / write status, 19 rx opcode, 21 err, 33 rx status) */
+static const uint32_t spfi_diag_words[] = { 48, 49, 50, 51, 19, 21, 33 };
+
+static void spfi_diag(uint32_t nn, const char *when)
+{
+	struct ramon_get_stats g;
+	char win[8];
+	uint32_t i, v;
+
+	snprintf(win, sizeof(win), "spfi%u", nn);
+	printf("      spfi%u %s: words", nn, when);
+	for (i = 0; i < sizeof(spfi_diag_words) / sizeof(spfi_diag_words[0]); i++) {
+		struct ramon_reg_io r;
+
+		memset(&r, 0, sizeof(r));
+		snprintf(r.name, sizeof(r.name), "%s", win);
+		r.offset = spfi_diag_words[i] * 4;
+		v = ioctl(fd, RAMON_IOC_REG_IO, &r) ? 0xdeadbeef : r.value;
+		printf(" [%u]=0x%x", spfi_diag_words[i], v);
+	}
+	memset(&g, 0, sizeof(g));
+	if (!ioctl(fd, RAMON_IOC_GET_STATS, &g)) {
+		printf("; irq vectors:");
+		for (i = 0; i < RAMON_SPFI_IRQ_VECTORS; i++)
+			if (g.spfi_irq_hist[nn][i])
+				printf(" 0x%x:%" PRIu64, i, (uint64_t)g.spfi_irq_hist[nn][i]);
+		printf("; unexpected %" PRIu64 " timeouts %" PRIu64, (uint64_t)g.spfi_unexpected[nn],
+		       (uint64_t)g.spfi_timeouts[nn]);
+	}
+	printf("\n");
+}
+
+/* DATA_WRITE of SPFI_PAGES pages; non-cyclic, so stream_last_offset is 0 (old spfi_send) */
+static int spfi_write(uint32_t nn, uint32_t sid, uint32_t tx_offset, const struct mbuf *src)
 {
 	struct ramon_sg_item it[SPFI_PAGES];
 	struct ramon_spfi_write w;
@@ -1683,12 +1715,16 @@ static int spfi_write(uint32_t nn, uint32_t sid, uint32_t tx_offset, uint32_t la
 	w.nn = nn;
 	w.chan = spfi_chan[nn];
 	w.stream_id = sid;
-	w.stream_last_offset = last;
 	w.tx_offset = tx_offset;
 	w.tx_num_offset = SPFI_PAGES;
 	w.n_items = SPFI_PAGES;
 	w.items = (uintptr_t)it;
-	return must(RAMON_IOC_SPFI_WRITE, &w, &w.st, "SPFI_WRITE");
+	printf("      spfi%u DATA_WRITE stream %u: tx_offset %u, tx_num_offset %u, stream_type 0, last 0, chan %u\n",
+	       nn, sid, tx_offset, SPFI_PAGES, spfi_chan[nn]);
+	if (!must(RAMON_IOC_SPFI_WRITE, &w, &w.st, "SPFI_WRITE"))
+		return 0;
+	spfi_diag(nn, "after the failed write");
+	return -1;
 }
 
 static int spfi_read(uint32_t nn, uint32_t sid, uint32_t first, uint32_t pages,
@@ -1790,8 +1826,7 @@ static void *spfi_writer_thread(void *arg)
 
 	for (r = 0; r < SPFI_ROUNDS; r++) {
 		fill((uint32_t *)w->src->p, w->src->size, 0x5000 + r);
-		if (spfi_write(w->nn, w->sid, w->tx + r * SPFI_PAGES, SPFI_ROUNDS * SPFI_PAGES,
-			       w->src))
+		if (spfi_write(w->nn, w->sid, w->tx + r * SPFI_PAGES, w->src))
 			return NULL;
 	}
 	w->ok = 1;
@@ -1829,7 +1864,8 @@ static void spfi_streams(uint32_t nn, uint8_t *tab, uint32_t s1, uint32_t s2, in
 		goto out;
 	*open1 = 1;
 	fill((uint32_t *)src.p, src.size, 0x4000 + nn);
-	if (spfi_write(nn, s1, tx1, SPFI_PAGES, &src) ||
+	spfi_diag(nn, "before the first write");
+	if (spfi_write(nn, s1, tx1, &src) ||
 	    spfi_stream(nn, RAMON_SPFI_OP_FLUSH_STREAM, s1, 0, "FLUSH") ||
 	    spfi_read(nn, s1, tx1, SPFI_PAGES, &dst))
 		goto out;
