@@ -681,6 +681,8 @@ ramon_smoke spfi
 
 ### Smoke 0.8.5: NN stream rules
 
+- Cyclic streams are not supported by the NN: the test opens and writes non-cyclic streams
+  only (`stream_type` 0, DATA_WRITE `stream_last_offset` 0).
 - At most 8 streams open, ids 193..197 never used, delete before reopening. The `spfi` test
   follows all three, and the table printout lists existing streams, marking any that sit on a
   reserved id.
