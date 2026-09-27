@@ -22,6 +22,8 @@
  *                                     the old SPFI bring-up: 0xCC == 0x88, spwdps, INIT 0,
  *                                     FORMAT only with --format (erases all streams), table
  *   ramon_smoke spfidel <nn> <sid>    CLOSE (if open) + DELETE one stream, e.g. a leftover
+ *   ramon_smoke reg <win> <off> [val] read (or write, then read back) one register, e.g.
+ *                                     "reg spfi0 0xc8" for SPFI_WR_STATUS0 (word 50)
  *   ramon_smoke [-d DEV] unbind       unbind with an fd open and a buffer mapped, rebind (root)
  *   ramon_smoke [-d DEV] --errors     error-path sweep (includes a CMA exhaustion check)
  *
@@ -59,7 +61,7 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.6"
+#define SMOKE_VERSION		"0.8.7"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -1669,6 +1671,17 @@ static int spfi_stream(uint32_t nn, uint32_t opcode, uint32_t sid, uint32_t last
 /* SPFI status words (48..51 VC ctrl / write status, 19 rx opcode, 21 err, 33 rx status) */
 static const uint32_t spfi_diag_words[] = { 48, 49, 50, 51, 19, 21, 33 };
 
+/* SPFI_WR_STATUS0 (word 50) bits, as described by the FPGA team */
+static void spfi_decode_ws0(uint32_t v)
+{
+	if (v & (1u << 5))
+		printf(" VC1-sticky-no-TLAST");
+	if (v & (1u << 3))
+		printf(" VC1-FULL");
+	if (v & (1u << 1))
+		printf(" VC1-CMD-OVERFLOW");
+}
+
 static void spfi_diag(uint32_t nn, const char *when)
 {
 	struct ramon_get_stats g;
@@ -1685,6 +1698,8 @@ static void spfi_diag(uint32_t nn, const char *when)
 		r.offset = spfi_diag_words[i] * 4;
 		v = ioctl(fd, RAMON_IOC_REG_IO, &r) ? 0xdeadbeef : r.value;
 		printf(" [%u]=0x%x", spfi_diag_words[i], v);
+		if (spfi_diag_words[i] == 50)
+			spfi_decode_ws0(v);
 	}
 	memset(&g, 0, sizeof(g));
 	if (!ioctl(fd, RAMON_IOC_GET_STATS, &g)) {
@@ -1797,18 +1812,21 @@ static int spfi_free_streams(uint32_t nn, const uint8_t *tab, uint32_t *s1, uint
 	return found < 2 ? -1 : 0;
 }
 
-/* OPEN, then the next page to write, from the NN's own table (as the old spfi_send) */
-static int spfi_open(uint32_t nn, uint32_t sid, uint32_t last, uint8_t *tab, uint32_t *tx)
+/*
+ * The first page to write comes from the table read *before* OPEN (as the old
+ * spfiginfo + spfi_send did); no GET_ALL_STREAM_STATUS between OPEN and the
+ * first DATA_WRITE, matching the old command order.
+ */
+static int spfi_open(uint32_t nn, uint32_t sid, uint32_t last, const uint8_t *tab, uint32_t *tx)
 {
-	const struct spfi_record *r;
+	const struct spfi_record *r = spfi_rec(tab, sid);
 
-	if (spfi_stream(nn, RAMON_SPFI_OP_OPEN_STREAM_FOR_WRITE, sid, last, "OPEN") ||
-	    spfi_table(nn, tab))
-		return -1;
-	r = spfi_rec(tab, sid);
 	*tx = r->latest_write_offs + 1;
-	printf("      spfi%u stream %u open: status 0x%x latest_write_offs %d -> first page %u\n",
+	if (spfi_stream(nn, RAMON_SPFI_OP_OPEN_STREAM_FOR_WRITE, sid, last, "OPEN"))
+		return -1;
+	printf("      spfi%u stream %u opened: table before OPEN had status 0x%x latest_write_offs %d -> first page %u\n",
 	       nn, sid, r->status, (int)r->latest_write_offs, *tx);
+	spfi_diag(nn, "after OPEN");
 	return 0;
 }
 
@@ -1864,7 +1882,6 @@ static void spfi_streams(uint32_t nn, uint8_t *tab, uint32_t s1, uint32_t s2, in
 		goto out;
 	*open1 = 1;
 	fill((uint32_t *)src.p, src.size, 0x4000 + nn);
-	spfi_diag(nn, "before the first write");
 	if (spfi_write(nn, s1, tx1, &src) ||
 	    spfi_stream(nn, RAMON_SPFI_OP_FLUSH_STREAM, s1, 0, "FLUSH") ||
 	    spfi_read(nn, s1, tx1, SPFI_PAGES, &dst))
@@ -2014,7 +2031,11 @@ static int spfi_one(uint32_t nn)
 		goto out;
 	if (spfi_init_first)
 		spfi_init_nn(nn);
-	if (spfi_table(nn, tab) || spfi_free_streams(nn, tab, &s1, &s2))
+	spfi_diag(nn, "at start");
+	if (spfi_table(nn, tab))
+		goto out;
+	spfi_diag(nn, "after GET_ALL_STREAM_STATUS");
+	if (spfi_free_streams(nn, tab, &s1, &s2))
 		goto out;
 	spfi_streams(nn, tab, s1, s2, &open1, &open2);
 	/* only what this test created is closed and deleted */
@@ -2143,6 +2164,25 @@ static void test_spwsend(void)
 		pass("spw%u: reply received", s.nn);
 	spw_drain(&s);
 	mbuf_del(&s.scratch);
+}
+
+/* ramon_smoke reg <window> <offset> [value]: one REG_IO read, or write + read back */
+static void test_reg(void)
+{
+	uint32_t off = targ_u32(1, 0), v = targ_u32(2, 0), index;
+	const char *name;
+
+	if (targc < 2) {
+		fail("usage: reg <window name or index> <offset> [value]");
+		return;
+	}
+	/* a leading digit selects by index, anything else by name */
+	name = isdigit((unsigned char)targv[0][0]) ? NULL : targv[0];
+	index = name ? 0 : targ_u32(0, 0);
+	if (targc > 2 && reg_io(name, index, RAMON_REG_OP_WRITE, off, &v))
+		return;
+	if (!reg_read(name, index, off, &v))
+		printf("      %s[0x%x] = 0x%08x (%u)\n", targv[0], off, v, v);
 }
 
 /* ramon_smoke spfidel <nn> <sid>: CLOSE if open, then DELETE (any id, also 193..197) */
@@ -3467,6 +3507,7 @@ static const struct test tests[] = {
 	{ "spwsend",	test_spwsend,	0, 5 },
 	{ "spfiprep",	test_spfiprep,	0, 7 },
 	{ "spfidel",	test_spfidel,	0, 7 },
+	{ "reg",	test_reg,	0, 3 },
 };
 
 /*

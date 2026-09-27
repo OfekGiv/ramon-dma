@@ -703,3 +703,17 @@ ramon_smoke spfi
 - On a write failure the test now prints SPFI words 48..51 (VC ctrl / write status), 19 (rx
   opcode), 21 (rx err code) and 33 (rx status), plus the SPFI interrupt histogram. It prints the
   same line once before the first write, for comparison.
+
+### Smoke 0.8.7: SPFI command order as the old flow; word 50 tracing
+
+- SPFI_WR_STATUS0 (word 50, `0xC8`) bits from the FPGA team: bit 5 = VC1 sticky error, no TLAST
+  during a TX DMA transfer; bit 3 = VC1 full (send no more VC1 commands); bit 1 = VC1 command
+  overflow. After the channel-5 run it read `0x2a`. After a reboot it reads `0x20` before our
+  first DATA_WRITE, and the last RX opcode (word 19) was `0xD0`, the GET_ALL_STREAM_STATUS answer.
+- The old flow is GET_ALL (`spfiginfo`), then OPEN, then DATA_WRITE. The test did OPEN, then
+  GET_ALL, then DATA_WRITE, i.e. a VC1-answered command right before the VC1 write. It now uses
+  the old order: the first page comes from the table read before OPEN.
+- Word 50 is printed and decoded at the start, after GET_ALL_STREAM_STATUS, after OPEN and after
+  a failed write, so one run shows which command sets bit 5.
+- `ramon_smoke reg <window|index> <offset> [value]` reads a register, or writes it and reads it
+  back, e.g. `ramon_smoke reg spfi0 0xc8`.
