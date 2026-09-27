@@ -28,6 +28,16 @@ module_param(max_buf_mb, uint, 0444);
 MODULE_PARM_DESC(max_buf_mb, "largest single BUF_ALLOC in MiB (default "
 		 __stringify(RAMON_MAX_BUF_MB_DEFAULT) ")");
 
+/*
+ * Debug knob, writable at runtime: pause between the DATA_WRITE command and
+ * the start of its DMA. The old stack had tens of microseconds there (two
+ * ioctls from userspace).
+ */
+static unsigned int spfi_write_gap_us;
+module_param(spfi_write_gap_us, uint, 0644);
+MODULE_PARM_DESC(spfi_write_gap_us, "pause between DATA_WRITE and its DMA, us (default 0, max "
+		 __stringify(RAMON_SPFI_WRITE_GAP_MAX_US) ")");
+
 static unsigned int zdma_channels = RAMON_ZDMA_CHANNELS_DEFAULT;
 module_param(zdma_channels, uint, 0444);
 MODULE_PARM_DESC(zdma_channels, "DMA_MEMCPY channels to take for ZDMA_COPY, 0.."
@@ -131,6 +141,11 @@ u64 ramon_max_buf_bytes(void)
 u32 ramon_param_zdma_channels(void)
 {
 	return zdma_channels;
+}
+
+u32 ramon_param_spfi_write_gap_us(void)
+{
+	return min_t(u32, READ_ONCE(spfi_write_gap_us), RAMON_SPFI_WRITE_GAP_MAX_US);
 }
 
 /* ioctl timeouts: 0 selects @def, anything above RAMON_TIMEOUT_MAX_MS is clamped */

@@ -752,3 +752,20 @@ ramon_smoke spfi
   VC1 TX. A `0x20` seen "after INIT" is most likely left over from an earlier stalled write
   (sticky). A faulted VC1 may also block VC1 RX (GET_ALL answers), to be confirmed by the FPGA
   team.
+
+### Driver 0.8.2 / smoke 0.8.12: experiment knobs for the SPFI write stall
+
+After a clean `spfiprep 0 --format`, `spfi` still stalls on channel 4, while the old app and
+driver work on the same board (word 50 = `0x20` there too, so bit 5 is not the cause). The
+register writes and their order match the old driver exactly; what remains:
+- **Timing.** The old stack writes DATA_WRITE and starts the DMA from two separate ioctls,
+  which leaves tens of microseconds in between. Ours starts the DMA a few microseconds after
+  the command. New driver parameter `spfi_write_gap_us` (default 0 = unchanged behaviour,
+  max 100000, writable at runtime) inserts a pause:
+  `echo 200 > /sys/module/ramon_dma/parameters/spfi_write_gap_us`.
+- **Parameters.** `--spfi-stream N` (first stream id; the second is the highest free one) and
+  `--spfi-pages N` (pages per write, 1..64) repeat the old `spfitest` arguments exactly.
+- **Buffers.** The old `spfitest` took its buffers from the ps2ps device (`ps2ps_alloc`); ours
+  come from the ramon_dma device. This only matters if the ps2ps DT node has a `memory-region`.
+
+New kernel import: `usleep_range_state` / `msleep` (from `fsleep`), both whitelisted.

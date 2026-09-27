@@ -363,6 +363,7 @@ static int ramon_spfi_write_run(struct ramon_spfi *sp, struct ramon_spfi_write *
 				struct ramon_axi_job *job, u32 timeout_ms,
 				struct ramon_status *st)
 {
+	u32 gap_us;
 	long left;
 	int ret;
 
@@ -382,6 +383,9 @@ static int ramon_spfi_write_run(struct ramon_spfi *sp, struct ramon_spfi_write *
 	spin_unlock_irq(&sp->lock);
 	mutex_unlock(&sp->cmd_lock);
 
+	gap_us = ramon_param_spfi_write_gap_us();
+	if (gap_us)
+		fsleep(gap_us);
 	/* only write_lock is held while the channel lock is taken */
 	ret = ramon_axi_job_run(sp->rd, job, timeout_ms, st);
 	if (ret) {

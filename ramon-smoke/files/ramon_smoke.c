@@ -33,7 +33,9 @@
  * as the old "spwappinit 0 +68"), --target N (NN node id for the version
  * request, default 0x41, as the old get_nn_version()), --spfi-chans A,B (AXI
  * write channel of NN0,NN1, default 4,4: channel 5 was removed), --spfi-init
- * (send INIT type 0 before the SPFI stream test), --minutes N (--stress).
+ * (send INIT type 0 before the SPFI stream test), --spfi-stream N (first stream id,
+ * default the highest free one), --spfi-pages N (pages per write, default 8,
+ * max 64), --minutes N (--stress).
  *
  * Built by ramon-smoke.bb against the header installed by ramon-dma.bb, or by hand:
  *   $CC -Wall -Wextra -O2 -I ramon-dma/files -o ramon_smoke ramon-smoke/files/ramon_smoke.c -lpthread
@@ -63,7 +65,7 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.11"
+#define SMOKE_VERSION		"0.8.12"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -1554,7 +1556,7 @@ static void test_spw(void)
 #define SPFI_ST_OPEN		0x02
 #define SPFI_STREAMS_USABLE	(SPFI_STREAMS - 5)	/* NN rule: never use the last 5 */
 #define SPFI_MAX_OPEN		8			/* NN rule: at most 8 open at once */
-#define SPFI_PAGES		8	/* per write */
+#define SPFI_PAGES_MAX		64	/* --spfi-pages bound */
 #define SPFI_ROUNDS		3	/* writes to the second stream */
 #define SPFI_ALERT_DRAIN	10
 
@@ -1596,6 +1598,8 @@ _Static_assert(sizeof(struct spfi_record) == SPFI_REC_BYTES, "table record");
 static uint32_t spfi_chan[RAMON_NN_COUNT] = { 4, 4 };
 static int spfi_init_first;
 static int spfi_format;
+static uint32_t spfi_pages = 8;			/* per write, --spfi-pages */
+static uint32_t spfi_first_stream = ~0u;	/* --spfi-stream, else highest free */
 
 #define SPFI_LINK_STATUS	0xCC	/* word 51; the old "spfireg +204" */
 #define SPFI_LINK_MASK		0xFF	/* only the low byte is the link state, e.g. 0x4488 */
@@ -1715,14 +1719,14 @@ static void spfi_diag(uint32_t nn, const char *when)
 	printf("\n");
 }
 
-/* DATA_WRITE of SPFI_PAGES pages; non-cyclic, so stream_last_offset is 0 (old spfi_send) */
+/* DATA_WRITE of spfi_pages pages; non-cyclic, so stream_last_offset is 0 (old spfi_send) */
 static int spfi_write(uint32_t nn, uint32_t sid, uint32_t tx_offset, const struct mbuf *src)
 {
-	struct ramon_sg_item it[SPFI_PAGES];
+	struct ramon_sg_item it[SPFI_PAGES_MAX];
 	struct ramon_spfi_write w;
 	uint32_t i;
 
-	for (i = 0; i < SPFI_PAGES; i++) {
+	for (i = 0; i < spfi_pages; i++) {
 		it[i].handle = src->h;
 		it[i].pad = 0;
 		it[i].offset = (uint64_t)i * SPFI_PAGE;
@@ -1733,11 +1737,11 @@ static int spfi_write(uint32_t nn, uint32_t sid, uint32_t tx_offset, const struc
 	w.chan = spfi_chan[nn];
 	w.stream_id = sid;
 	w.tx_offset = tx_offset;
-	w.tx_num_offset = SPFI_PAGES;
-	w.n_items = SPFI_PAGES;
+	w.tx_num_offset = spfi_pages;
+	w.n_items = spfi_pages;
 	w.items = (uintptr_t)it;
 	printf("      spfi%u DATA_WRITE stream %u: tx_offset %u, tx_num_offset %u, stream_type 0, last 0, chan %u\n",
-	       nn, sid, tx_offset, SPFI_PAGES, spfi_chan[nn]);
+	       nn, sid, tx_offset, spfi_pages, spfi_chan[nn]);
 	if (!must(RAMON_IOC_SPFI_WRITE, &w, &w.st, "SPFI_WRITE"))
 		return 0;
 	spfi_diag(nn, "after the failed write");
@@ -1747,7 +1751,7 @@ static int spfi_write(uint32_t nn, uint32_t sid, uint32_t tx_offset, const struc
 static int spfi_read(uint32_t nn, uint32_t sid, uint32_t first, uint32_t pages,
 		     const struct mbuf *dst)
 {
-	uint32_t off[SPFI_PAGES * SPFI_ROUNDS], i;
+	uint32_t off[SPFI_PAGES_MAX * SPFI_ROUNDS], i;
 	struct ramon_spfi_read r;
 
 	for (i = 0; i < pages; i++)
@@ -1801,8 +1805,18 @@ static int spfi_free_streams(uint32_t nn, const uint8_t *tab, uint32_t *s1, uint
 		     "(close/delete with \"ramon_smoke spfidel %u <sid>\")", nn, open, SPFI_MAX_OPEN, nn);
 		return -1;
 	}
+	if (spfi_first_stream != ~0u) {
+		if (spfi_first_stream >= SPFI_STREAMS_USABLE ||
+		    (spfi_rec(tab, spfi_first_stream)->status & SPFI_ST_EXIST)) {
+			fail("spfi%u: --spfi-stream %u is reserved or exists (spfidel %u %u first)", nn,
+			     spfi_first_stream, nn, spfi_first_stream);
+			return -1;
+		}
+		*s1 = spfi_first_stream;
+		found = 1;
+	}
 	for (sid = SPFI_STREAMS_USABLE; sid-- > 0 && found < 2;) {
-		if (spfi_rec(tab, sid)->status & SPFI_ST_EXIST)
+		if ((spfi_rec(tab, sid)->status & SPFI_ST_EXIST) || sid == spfi_first_stream)
 			continue;
 		if (found++)
 			*s2 = sid;
@@ -1846,7 +1860,7 @@ static void *spfi_writer_thread(void *arg)
 
 	for (r = 0; r < SPFI_ROUNDS; r++) {
 		fill((uint32_t *)w->src->p, w->src->size, 0x5000 + r);
-		if (spfi_write(w->nn, w->sid, w->tx + r * SPFI_PAGES, w->src))
+		if (spfi_write(w->nn, w->sid, w->tx + r * spfi_pages, w->src))
 			return NULL;
 	}
 	w->ok = 1;
@@ -1871,28 +1885,28 @@ static void spfi_streams(uint32_t nn, uint8_t *tab, uint32_t s1, uint32_t s2, in
 	uint32_t tx1, r;
 	pthread_t th;
 
-	if (mbuf_new(&src, SPFI_PAGES * SPFI_PAGE))
+	if (mbuf_new(&src, spfi_pages * SPFI_PAGE))
 		return;
-	if (mbuf_new(&dst, SPFI_PAGES * SPFI_PAGE))
+	if (mbuf_new(&dst, spfi_pages * SPFI_PAGE))
 		goto out_src;
-	if (mbuf_new(&src2, SPFI_PAGES * SPFI_PAGE))
+	if (mbuf_new(&src2, spfi_pages * SPFI_PAGE))
 		goto out_dst;
-	if (mbuf_new(&dst2, SPFI_ROUNDS * SPFI_PAGES * SPFI_PAGE))
+	if (mbuf_new(&dst2, SPFI_ROUNDS * spfi_pages * SPFI_PAGE))
 		goto out_src2;
 
-	if (spfi_open(nn, s1, SPFI_PAGES, tab, &tx1))
+	if (spfi_open(nn, s1, spfi_pages, tab, &tx1))
 		goto out;
 	*open1 = 1;
 	fill((uint32_t *)src.p, src.size, 0x4000 + nn);
 	if (spfi_write(nn, s1, tx1, &src) ||
 	    spfi_stream(nn, RAMON_SPFI_OP_FLUSH_STREAM, s1, 0, "FLUSH") ||
-	    spfi_read(nn, s1, tx1, SPFI_PAGES, &dst))
+	    spfi_read(nn, s1, tx1, spfi_pages, &dst))
 		goto out;
 	spfi_verify(nn, &dst, dst.size, 0x4000 + nn, "stream 1 read back");
 	pass("spfi%u stream %u: open, write %d x 16 KiB, flush, read back, verified", nn, s1,
-	     SPFI_PAGES);
+	     spfi_pages);
 
-	if (spfi_open(nn, s2, SPFI_ROUNDS * SPFI_PAGES, tab, &w.tx))
+	if (spfi_open(nn, s2, SPFI_ROUNDS * spfi_pages, tab, &w.tx))
 		goto out;
 	*open2 = 1;
 	if (pthread_create(&th, NULL, spfi_writer_thread, &w)) {
@@ -1901,16 +1915,16 @@ static void spfi_streams(uint32_t nn, uint8_t *tab, uint32_t s1, uint32_t s2, in
 	}
 	for (r = 0; r < SPFI_ROUNDS; r++) {
 		memset(dst.p, 0, dst.size);
-		if (!spfi_read(nn, s1, tx1, SPFI_PAGES, &dst))
+		if (!spfi_read(nn, s1, tx1, spfi_pages, &dst))
 			spfi_verify(nn, &dst, dst.size, 0x4000 + nn, "concurrent read");
 	}
 	pthread_join(th, NULL);
 	if (!w.ok || spfi_stream(nn, RAMON_SPFI_OP_FLUSH_STREAM, s2, 0, "FLUSH") ||
-	    spfi_read(nn, s2, w.tx, SPFI_ROUNDS * SPFI_PAGES, &dst2))
+	    spfi_read(nn, s2, w.tx, SPFI_ROUNDS * spfi_pages, &dst2))
 		goto out;
 	for (r = 0; r < SPFI_ROUNDS; r++) {
-		long bad = verify((const uint32_t *)(dst2.p + (size_t)r * SPFI_PAGES * SPFI_PAGE),
-				  SPFI_PAGES * SPFI_PAGE, 0x5000 + r);
+		long bad = verify((const uint32_t *)(dst2.p + (size_t)r * spfi_pages * SPFI_PAGE),
+				  spfi_pages * SPFI_PAGE, 0x5000 + r);
 		if (bad >= 0)
 			fail("spfi%u stream %u round %u: data differs at word %ld", nn, s2, r, bad);
 	}
@@ -3584,7 +3598,8 @@ static void usage(const char *argv0)
 	size_t i;
 
 	fprintf(stderr, "usage: %s [-d DEV] [--node N] [--target N] [--spfi-chans A,B] [--spfi-init]\n"
-		"       [--format] [--minutes N] [test [args]] | --version\ntests:", argv0);
+		"       [--spfi-stream N] [--spfi-pages N] [--format] [--minutes N] [test [args]]\n"
+		"       | --version\ntests:", argv0);
 	for (i = 0; i < N_TESTS; i++)
 		fprintf(stderr, " %s", tests[i].name);
 	fprintf(stderr, "\nwith no test, runs the default sequence\n");
@@ -3613,6 +3628,10 @@ int main(int argc, char **argv)
 			stress_minutes = strtoul(argv[++a], NULL, 0);
 		else if (!strcmp(argv[a], "--spfi-init"))
 			spfi_init_first = 1;
+		else if (!strcmp(argv[a], "--spfi-stream") && a + 1 < argc)
+			spfi_first_stream = strtoul(argv[++a], NULL, 0);
+		else if (!strcmp(argv[a], "--spfi-pages") && a + 1 < argc)
+			spfi_pages = strtoul(argv[++a], NULL, 0);
 		else if (!strcmp(argv[a], "--spfi-chans") && a + 1 < argc &&
 			 sscanf(argv[a + 1], "%u,%u", &spfi_chan[0], &spfi_chan[1]) == 2)
 			a++;
@@ -3633,6 +3652,10 @@ int main(int argc, char **argv)
 			usage(argv[0]);
 	}
 
+	if (!spfi_pages || spfi_pages > SPFI_PAGES_MAX) {
+		fprintf(stderr, "--spfi-pages must be 1..%d\n", SPFI_PAGES_MAX);
+		return 2;
+	}
 	crc_init();
 	{
 		struct sigaction sa;

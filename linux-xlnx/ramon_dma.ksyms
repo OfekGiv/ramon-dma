@@ -96,6 +96,7 @@ memdup_user
 memset
 misc_deregister
 misc_register
+msleep
 mutex_lock
 mutex_lock_interruptible
 mutex_lock_killable
@@ -135,6 +136,7 @@ strscpy
 synchronize_srcu
 up_read
 up_write
+usleep_range_state
 vmemdup_user
 vscnprintf
 wait_for_completion_interruptible_timeout

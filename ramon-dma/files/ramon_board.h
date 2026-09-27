@@ -102,6 +102,7 @@ enum ramon_spfi_word {
 #define RAMON_SPFI_IRQ_VC1RX		BIT(3)	/* read data (0x98) or 0xD0 completion */
 #define RAMON_SPFI_READ_SETUP_US	10	/* delay before READ_STREAM (old driver) */
 #define RAMON_SPFI_ALERT_FIFO_DEPTH	16	/* power of two (kfifo) */
+#define RAMON_SPFI_WRITE_GAP_MAX_US	100000	/* bound of the spfi_write_gap_us parameter */
 
 /* ---- default timeouts in ms (0 in an ioctl selects these) ---- */
 #define RAMON_TMO_AXI_MS		2000
