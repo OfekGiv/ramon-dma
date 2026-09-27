@@ -61,7 +61,7 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.7"
+#define SMOKE_VERSION		"0.8.8"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -2166,6 +2166,19 @@ static void test_spwsend(void)
 	mbuf_del(&s.scratch);
 }
 
+/* whatever alerts the NN queued (an answer may have come as an alert) */
+static void spfi_print_alerts(uint32_t nn)
+{
+	struct ramon_spfi_wait_alert a;
+	int i;
+
+	for (i = 0; i < SPFI_ALERT_DRAIN && !spfi_wait_alert(nn, 100, &a); i++)
+		printf("      spfi%u alert: code 0x%x sub 0x%x param1 0x%x param2 0x%x status 0x%x\n",
+		       nn, a.code, a.sub_code, a.param1, a.param2, a.rx_status);
+	if (!i)
+		printf("      spfi%u: no alerts pending\n", nn);
+}
+
 /* ramon_smoke reg <window> <offset> [value]: one REG_IO read, or write + read back */
 static void test_reg(void)
 {
@@ -2246,16 +2259,21 @@ static void test_spfiprep(void)
 	spw_drain(&s);
 	mbuf_del(&s.scratch);
 	spfi_init_nn(nn);
+	spfi_diag(nn, "after INIT");
 	if (spfi_format) {
 		printf("      spfi%u: FORMAT erases every stream on the NN\n", nn);
 		memset(&c, 0, sizeof(c));
 		if (!spfi_cmd(nn, RAMON_SPFI_OP_FORMAT, &c, "SPFI FORMAT"))
 			printf("      spfi%u FORMAT: rx_err_code %u\n", nn, c.rx_err_code);
+		spfi_diag(nn, "after FORMAT");
 	}
 	tab = malloc(SPFI_TABLE_BYTES);
 	if (tab && !spfi_table(nn, tab)) {
 		spfi_print_table(nn, tab);
 		pass("spfi%u prepared", nn);
+	} else {
+		spfi_diag(nn, "after the failed GET_ALL_STREAM_STATUS");
+		spfi_print_alerts(nn);
 	}
 	free(tab);
 }

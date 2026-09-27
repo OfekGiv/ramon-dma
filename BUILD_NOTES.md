@@ -717,3 +717,14 @@ ramon_smoke spfi
   a failed write, so one run shows which command sets bit 5.
 - `ramon_smoke reg <window|index> <offset> [value]` reads a register, or writes it and reads it
   back, e.g. `ramon_smoke reg spfi0 0xc8`.
+
+### Smoke 0.8.8: spfiprep diagnostics
+
+- After a reboot: word 50 = `0x0` at boot. `spfiprep 0` (no `--format`): INIT gives
+  `rx_err_code 1`, `init_info 0x2` (expected, per the user), then GET_ALL_STREAM_STATUS is not
+  acknowledged within 3000 ms. The first `spfiprep` run, before the reboot, did get an answer.
+- The old flow always runs FORMAT between INIT and GET_ALL (`spfiinit 0` -> `spfifmt` ->
+  `spfiginfo`). Next try: `spfiprep 0 --format`.
+- `spfiprep` now prints the SPFI diagnostic line (word 50 decoded, interrupt histogram,
+  unexpected/timeout counters) after INIT, after FORMAT and after a failed GET_ALL, plus any
+  alerts the NN queued. That shows whether the NN answered with something other than `0xD0`.
