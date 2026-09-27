@@ -746,3 +746,9 @@ ramon_smoke spfi
   and after FORMAT, so one run shows which step sets bit 5.
 - Open questions for the FPGA/NN side: how is bit 5 cleared, and does INIT (or DPS) legitimately
   leave it set? Does FORMAT clear it? That would explain why the old flow always formatted.
+- SPFI virtual channels (user): INIT request and answer on VC0; GET_ALL_STREAM_STATUS request
+  on VC0, answer on VC1; DATA_WRITE data on VC1 TX. So word 50 bit 5 ("VC1 no TLAST during TX
+  DMA") belongs to the DATA_WRITE data path. INIT cannot set it, and `spfiprep` sends nothing on
+  VC1 TX. A `0x20` seen "after INIT" is most likely left over from an earlier stalled write
+  (sticky). A faulted VC1 may also block VC1 RX (GET_ALL answers), to be confirmed by the FPGA
+  team.
