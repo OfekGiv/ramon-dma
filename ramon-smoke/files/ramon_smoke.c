@@ -27,7 +27,7 @@
  * Options: -d DEV (default /dev/ramon_dma), --node N (our SPW node id, default 68,
  * as the old "spwappinit 0 +68"), --target N (NN node id for the version
  * request, default 0x41, as the old get_nn_version()), --spfi-chans A,B (AXI
- * write channel of NN0,NN1, default 5,4 as the old spfidrvinit), --spfi-init
+ * write channel of NN0,NN1, default 4,4: channel 5 was removed), --spfi-init
  * (send INIT type 0 before the SPFI stream test), --minutes N (--stress).
  *
  * Built by ramon-smoke.bb against the header installed by ramon-dma.bb, or by hand:
@@ -58,7 +58,7 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.3"
+#define SMOKE_VERSION		"0.8.4"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -996,7 +996,7 @@ static void test_chan(void)
 			fail("chan %u: type %u dir %u out of range", i, ci.type, ci.dir);
 			continue;
 		}
-		printf("      %2u %-4s %-10s device-id %2u phys 0x%09" PRIx64 " %.32s\n", i,
+		printf("      %2u %-4s %-10s device-id %2u phys %#" PRIx64 " %.32s\n", i,
 		       type[ci.type], dir[ci.dir], ci.device_id, (uint64_t)ci.phys, ci.name);
 		if ((i < gi.n_axi_chan) != (ci.type == RAMON_CHAN_AXI) ||
 		    (ci.type == RAMON_CHAN_ZDMA) != (ci.dir == RAMON_DIR_MEMCPY))
@@ -1581,7 +1581,11 @@ struct spfi_record {
 _Static_assert(sizeof(struct spfi_table_hdr) == SPFI_HDR_BYTES, "table header");
 _Static_assert(sizeof(struct spfi_record) == SPFI_REC_BYTES, "table record");
 
-static uint32_t spfi_chan[RAMON_NN_COUNT] = { 5, 4 };	/* old spfidrvinit */
+/*
+ * AXI write channel per SPFI NN. The old spfidrvinit used { 5, 4 }; channel 5
+ * has since been removed from the FPGA and channel 4 is the SPFI write path.
+ */
+static uint32_t spfi_chan[RAMON_NN_COUNT] = { 4, 4 };
 static int spfi_init_first;
 static int spfi_format;
 

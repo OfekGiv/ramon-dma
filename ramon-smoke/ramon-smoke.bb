@@ -4,7 +4,7 @@ LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://COPYING;md5=12f884d2ae1ff87c09e5b7ccc2c4ca7e"
 
 # Must equal SMOKE_VERSION in ramon_smoke.c (0.<driver step>.<tool revision>).
-PV = "0.8.3"
+PV = "0.8.4"
 
 # ramon_dma_uapi.h comes from the module recipe's sysroot install.
 DEPENDS = "ramon-dma"

@@ -319,9 +319,9 @@ static int ramon_axi_chan_probe(struct ramon_dev *rd, u32 i)
 		return dev_err_probe(dev, ret, "axi ch%u (%s): dma_request_chan failed\n",
 				     i, ch->name);
 	}
-	dev_info(dev, "axi ch%u %s: %s, device-id %u, axi_dma %pOF, copy_align %u\n",
+	dev_info(dev, "axi ch%u %s: %s, device-id %u, axi_dma %pa %pOF, copy_align %u\n",
 		 i, ch->name, ch->dir == DMA_MEM_TO_DEV ? "MEM_TO_DEV (mm2s)" : "DEV_TO_MEM (s2mm)",
-		 ch->device_id, ch->ip_node, 1U << ch->chan->device->copy_align);
+		 ch->device_id, &ch->phys, ch->ip_node, 1U << ch->chan->device->copy_align);
 	return 0;
 }
 

@@ -541,7 +541,9 @@ Recommended once: the same `--stress` run on a kernel built with `CONFIG_PROVE_L
 free stream ids** (read from the NN's own table). It writes 8 + 3×8 pages (512 KiB) to them,
 reads them back, then closes and deletes them. Existing streams are never touched. INIT and
 FORMAT are never sent; `--spfi-init` adds INIT type 0 before the test. The write channel is
-5 for NN0 and 4 for NN1, as in the old `spfidrvinit` (`--spfi-chans A,B` overrides).
+4 for both NNs since smoke 0.8.4 (`--spfi-chans A,B` overrides). The old `spfidrvinit` used 5/4,
+but channel 5 has been removed from the FPGA; a write on it fails with a DMA internal error
+(status 0x10) from its axi_dma IP and times out.
 
 In detail:
 1. It prints the table header (media, allocated and used pages).
@@ -657,3 +659,19 @@ ramon_smoke spwdps 0
 ramon_smoke spfiprep 0       # add --format to match the old flow exactly (erases streams)
 ramon_smoke spfi
 ```
+
+---
+
+## Driver 0.8.1 / smoke 0.8.4
+
+- **SPFI write channel is 4.** Channel 5 was removed from the FPGA. The DT still lists it, so
+  the driver still acquires it, which is harmless as long as nothing transfers on it. Its first
+  use returned `xilinx-vdma a0020000.dma: Channel ... has errors 10` (the AXI DMA
+  internal-error bit), and the transfer was terminated after the timeout. `--spfi-chans`
+  overrides the default.
+- The AXI probe line now prints the axi_dma register address as well as its DT node:
+  `axi ch5 axidma_tx4: MEM_TO_DEV (mm2s), device-id .., axi_dma 0x00000000a0020000
+  /amba_pl@0/dma@a0020000, ...`. `ramon_smoke chan` prints `phys 0xa0020000` without zero
+  padding. The mapping itself was already right; only the numeric form was missing.
+- A stream left open by the failed run (197 on NN0) is skipped by the next `spfi` run, which
+  picks the highest free ids.
