@@ -14,10 +14,10 @@ Placeholders: `<proj>` = PetaLinux project, `<machine>` = its machine name,
 | 2 | buffers, mmap; remove gate changed from rwsem to SRCU | **done** on the non-hardened image: default, `--errors`, `unbind` pass (smoke 0.2.2). Not yet reported: dmesg after `unbind`, compile-log warnings |
 | 3 | register windows, DT discovery, REGWIN_INFO / REG_IO | **done** on the non-hardened image (0.3.0: default, `--errors`, `unbind` pass) |
 | 4 | AXI DMA, CHAN_INFO | **done** on the non-hardened image (0.6.0: `chan`, AXI `--errors` incl. RX timeout, `unbind` pass) |
-| 5 | SPW: IRQ, WAIT_RX / CANCEL / LOOPBACK | 0.6.0 built and loaded; SPW `--errors` pass. The loopback round trip of smoke 0.6.0 timed out (test design); smoke 0.6.1 (link sync + NN version request) pending |
+| 5 | SPW: IRQ, WAIT_RX / CANCEL / LOOPBACK | **done** on the non-hardened image: `spw` (link sync, version round trip with NN) and `spwdps 0` pass; unsynced spw1 is expected |
 | 6 | ZDMA pool, ZDMA_COPY; GET_STATS pulled forward from step 8 | **done** on the non-hardened image (0.6.0: `zdma`, `stats`, ZDMA `--errors` pass) |
-| 7 | SPFI: IRQ, CMD, WRITE, READ, alerts, MEM_READ, TX_OFFS_WRITE | batch B (0.8.0): written, not compiled on target |
-| 8 | remove hardening, `--stress`, `--errors` sweep (GET_STATS came with batch A) | batch B (0.8.0): written, not compiled on target |
+| 7 | SPFI: IRQ, CMD, WRITE, READ, alerts, MEM_READ, TX_OFFS_WRITE | 0.8.0 built and loaded; `spfiprep 0` passes (INIT, GET_ALL_STREAM_STATUS, MEM_READ, SPFI REG_IO). Stream write/read (`spfi`), `--errors`, `unbind`, `--stress` pending |
+| 8 | remove hardening, `--stress`, `--errors` sweep (GET_STATS came with batch A) | 0.8.0 built; runs pending |
 | 9 | README, final petalinux-build + autoload boot (recipes already exist) | not started |
 
 The driver version is `0.<step>.0` while the rewrite is in progress, so
