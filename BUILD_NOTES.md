@@ -634,12 +634,13 @@ test fails only if no present NN syncs.
 - **`ramon_smoke spwsend <nn> <dst> <proto> <app> <attr> [hexpayload]`:** any SPW message,
   header and CRCs as the old `spw_send()`; the reply is printed and CRC-checked.
 - **`ramon_smoke spfiprep [nn] [--format]`:** the old SPFI bring-up in order:
-  1. SPFI `0xCC` (word 51, the old `spfireg +204`) must read `0x88`;
+  1. the low byte of SPFI `0xCC` (word 51, the old `spfireg +204`) must be `0x88`; the full
+     value is printed (e.g. `0x4488`, which is expected);
   2. `spwdps` on the SPW link of the same NN index;
   3. `INIT` type 0;
   4. `FORMAT`, **only with `--format`, because it erases every stream on that NN**;
   5. GET_ALL_STREAM_STATUS, printing the table.
-- **The default `spfi` test** now checks `0xCC == 0x88` first. An NN whose SPFI link is down is
+- **The default `spfi` test** now checks `(0xCC & 0xFF) == 0x88` first. An NN whose SPFI link is down is
   skipped, with a pointer to `spfiprep`; the test fails only if no present NN is up.
   `--errors` and `--stress` skip the link-dependent SPFI checks the same way.
 - The explicit SPW subcommands leave loopback **off** (the operating state). The default `spw`

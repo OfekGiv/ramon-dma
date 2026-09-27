@@ -58,7 +58,7 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.2"
+#define SMOKE_VERSION		"0.8.3"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -1586,6 +1586,7 @@ static int spfi_init_first;
 static int spfi_format;
 
 #define SPFI_LINK_STATUS	0xCC	/* word 51; the old "spfireg +204" */
+#define SPFI_LINK_MASK		0xFF	/* only the low byte is the link state, e.g. 0x4488 */
 #define SPFI_LINK_UP		0x88
 
 /* the old "spfireg +204" check */
@@ -1597,9 +1598,12 @@ static int spfi_link_up(uint32_t nn)
 	snprintf(win, sizeof(win), "spfi%u", nn);
 	if (reg_read(win, 0, SPFI_LINK_STATUS, &v))
 		return 0;
-	if (v == SPFI_LINK_UP)
+	if ((v & SPFI_LINK_MASK) == SPFI_LINK_UP) {
+		printf("      spfi%u: link status 0x%x at 0xCC (low byte 0x%x: up)\n", nn, v,
+		       SPFI_LINK_UP);
 		return 1;
-	printf("      spfi%u: link status 0x%x at 0xCC, not 0x%x\n", nn, v, SPFI_LINK_UP);
+	}
+	printf("      spfi%u: link status 0x%x at 0xCC, low byte not 0x%x\n", nn, v, SPFI_LINK_UP);
 	return 0;
 }
 
@@ -1981,7 +1985,7 @@ static void test_spfi(void)
 		up += spfi_one(nn);
 	}
 	if (present && !up)
-		fail("no SPFI link is up (0xCC != 0x88); run \"ramon_smoke spfiprep <nn>\" first");
+		fail("no SPFI link is up (0xCC low byte != 0x88); run \"ramon_smoke spfiprep <nn>\" first");
 }
 
 /* ---- explicit SPW / SPFI commands (not in the default sequence) ---- */
@@ -2094,10 +2098,10 @@ static void test_spfiprep(void)
 		return;
 	}
 	if (!spfi_link_up(nn)) {
-		fail("spfi%u: link not up; the old flow requires 0x88 at 0xCC", nn);
+		fail("spfi%u: link not up; the old flow requires 0x88 in the low byte of 0xCC", nn);
 		return;
 	}
-	pass("spfi%u: link status 0x88", nn);
+	pass("spfi%u: link up", nn);
 	if (spw_open_link(&s, nn))
 		return;
 	spw_dps(&s);
