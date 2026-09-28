@@ -74,7 +74,8 @@
  * Error codes: X(name, code, errno, description).
  * RAMON_E_<name> == code; the ioctl returns -errno. Namespaces:
  * generic 1-31, buf 32-63, axi 64-95, zdma 96-127, spw 128-159,
- * spfi 160-191, regwin 192-223. Codes are never renumbered.
+ * spfi 160-191, regwin 192-223. Codes are never renumbered; 9 and 10 are
+ * retired (generic CANCELLED / TIMEOUT: every wait has its own code).
  */
 #define RAMON_ERR_LIST(X) \
 	X(OK,			  0, 0,		"success") \
@@ -86,8 +87,6 @@
 	X(NOT_PRESENT,		  6, ENXIO,	"sub-block absent on this board") \
 	X(REMOVED,		  7, ENODEV,	"device was removed") \
 	X(INTERRUPTED,		  8, EINTR,	"interrupted by a signal") \
-	X(CANCELLED,		  9, ECANCELED,	"cancelled") \
-	X(TIMEOUT,		 10, ETIMEDOUT,	"timed out") \
 	X(NO_MEMORY,		 11, ENOMEM,	"kernel memory allocation failed") \
 	X(NOT_ALIGNED,		 12, EINVAL,	"value not aligned as required") \
 	X(BUF_TOO_LARGE,	 32, EINVAL,	"buffer size above max_buf_mb") \

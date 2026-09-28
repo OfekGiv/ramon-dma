@@ -28,16 +28,6 @@ module_param(max_buf_mb, uint, 0444);
 MODULE_PARM_DESC(max_buf_mb, "largest single BUF_ALLOC in MiB (default "
 		 __stringify(RAMON_MAX_BUF_MB_DEFAULT) ")");
 
-/*
- * Debug knob, writable at runtime: pause between the DATA_WRITE command and
- * the start of its DMA. The old stack had tens of microseconds there (two
- * ioctls from userspace).
- */
-static unsigned int spfi_write_gap_us;
-module_param(spfi_write_gap_us, uint, 0644);
-MODULE_PARM_DESC(spfi_write_gap_us, "pause between DATA_WRITE and its DMA, us (default 0, max "
-		 __stringify(RAMON_SPFI_WRITE_GAP_MAX_US) ")");
-
 /* SPFI instances to use; the DT lists both NNs, the board wires only NN0 */
 static unsigned int spfi_mask = RAMON_SPFI_MASK_DEFAULT;
 module_param(spfi_mask, uint, 0444);
@@ -152,11 +142,6 @@ u32 ramon_param_zdma_channels(void)
 u32 ramon_param_spfi_mask(void)
 {
 	return spfi_mask;
-}
-
-u32 ramon_param_spfi_write_gap_us(void)
-{
-	return min_t(u32, READ_ONCE(spfi_write_gap_us), RAMON_SPFI_WRITE_GAP_MAX_US);
 }
 
 /* ioctl timeouts: 0 selects @def, anything above RAMON_TIMEOUT_MAX_MS is clamped */

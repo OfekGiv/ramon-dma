@@ -614,9 +614,8 @@ test fails only if no present NN syncs.
 
 ### Open questions
 
-- **Generic `RAMON_E_CANCELLED` and `RAMON_E_TIMEOUT` have no user.** Every cancel and timeout
-  has a subsystem-specific code, and the spec wants every code used. Should I remove them before
-  the ABI is frozen? No other code changes number.
+- ~~Generic `RAMON_E_CANCELLED` and `RAMON_E_TIMEOUT` have no user.~~ Decided: dropped in driver
+  0.8.7. Codes 9 and 10 are retired; no other code changed number.
 - For the FPGA team, in addition to the three in the spec:
   - Must the TX offset table be written in pairs, i.e. is the zero pad after an odd count
     required?
@@ -835,3 +834,13 @@ Next: reboot, then `insmod ramon_dma.ko` (0.8.5), `ramon_smoke spfiprep 0 --form
   re-enable its interrupts without another reset. It logs `axi chN (...): re-acquired after a
   reset of ...` at debug level. The channel's alignment mask is cached at probe, so preparing a
   transfer never dereferences a channel being re-acquired.
+
+### Driver 0.8.7: ABI cleanup
+
+- `RAMON_E_CANCELLED` (9) and `RAMON_E_TIMEOUT` (10) removed from `RAMON_ERR_LIST` (user
+  decision). They had no user: every cancel and timeout has its own subsystem code. The numbers
+  stay retired. `RAMON_ABI_VERSION` stays 1, since the ABI is not frozen yet.
+- The `spfi_write_gap_us` debug parameter is removed; the timing hypothesis was ruled out on the
+  board.
+- The X-macro error list stays (user asked for the trade-off; recommendation: keep). The 3
+  checkpatch findings on `ramon_dma_uapi.h` remain the known ones.

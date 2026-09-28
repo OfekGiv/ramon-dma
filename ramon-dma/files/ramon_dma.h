@@ -41,7 +41,7 @@
 /* The minor number tracks the implementation step while the rewrite is in progress. */
 #define RAMON_DRV_MAJOR		0
 #define RAMON_DRV_MINOR		8
-#define RAMON_DRV_PATCH		6
+#define RAMON_DRV_PATCH		7
 #define RAMON_DRV_VERSION	__stringify(RAMON_DRV_MAJOR) "." \
 				__stringify(RAMON_DRV_MINOR) "." \
 				__stringify(RAMON_DRV_PATCH)
@@ -220,7 +220,6 @@ void ramon_dev_get(struct ramon_dev *rd);
 void ramon_dev_put(struct ramon_dev *rd);
 u64 ramon_max_buf_bytes(void);
 u32 ramon_param_zdma_channels(void);
-u32 ramon_param_spfi_write_gap_us(void);
 u32 ramon_param_spfi_mask(void);
 u32 ramon_timeout_ms(u32 requested, u32 def);
 
