@@ -6,7 +6,10 @@
  * prep, submit, wait) and release. SPFI_WRITE uses the same three steps.
  *
  * On xilinx_dma a terminate soft-resets the whole axi_dma IP, i.e. both
- * directions, so every terminate is logged with the IP node.
+ * directions, so every terminate is logged with the IP node. The reset also
+ * clears the interrupt enables of the IP's other channels, and xilinx_dma sets
+ * them only when a channel is acquired, so those channels are released and
+ * re-acquired before their next transfer.
  */
 #define pr_fmt(fmt) "ramon_dma: " fmt
 
@@ -53,8 +56,7 @@ static void ramon_axi_done(void *arg)
 static int ramon_axi_item(struct ramon_file *rf, struct ramon_axi_job *job, u32 i,
 			  const struct ramon_sg_item *it, struct ramon_status *st)
 {
-	struct dma_chan *chan = job->ch->chan;
-	u32 align = BIT(chan->device->copy_align) - 1;
+	u32 align = job->ch->align_mask;
 	dma_addr_t dma;
 	int ret;
 
@@ -102,7 +104,7 @@ int ramon_axi_job_prepare(struct ramon_file *rf, u32 chan, u64 uitems, u32 n,
 		return ramon_fail(st, RAMON_E_AXI_BAD_CHAN, chan, rd->n_axi,
 				  "chan %u: only %u AXI channels", chan, rd->n_axi);
 	job->ch = &rd->axi[array_index_nospec(chan, rd->n_axi)];
-	if (!job->ch->chan)
+	if (!READ_ONCE(job->ch->chan))
 		return ramon_fail(st, RAMON_E_NOT_PRESENT, chan, 0,
 				  "axi ch%u (%s): channel unavailable (see probe log)",
 				  chan, job->ch->name);
@@ -152,10 +154,40 @@ void ramon_axi_job_release(struct ramon_axi_job *job)
 static void ramon_axi_terminate(struct ramon_dev *rd, struct ramon_axichan *ch, u32 chan,
 				const char *why)
 {
+	u32 i;
+
 	dmaengine_terminate_sync(ch->chan);
+	for (i = 0; i < rd->n_axi; i++)
+		if (&rd->axi[i] != ch && rd->axi[i].ip_node == ch->ip_node)
+			atomic_set(&rd->axi[i].rearm, 1);
 	dev_warn_ratelimited(&rd->pdev->dev,
 			     "axi ch%u (%s): %s; terminated, which resets axi_dma %pOF (both directions)\n",
 			     chan, ch->name, why, ch->ip_node);
+}
+
+/*
+ * A terminate on another channel of this IP cleared our interrupt enables;
+ * release and re-acquire so xilinx_dma sets them again. ch->lock held.
+ */
+static int ramon_axi_rearm(struct ramon_dev *rd, struct ramon_axichan *ch, u32 chan,
+			   struct ramon_status *st)
+{
+	struct dma_chan *c;
+
+	if (!atomic_xchg(&ch->rearm, 0) || !ch->chan)
+		return 0;
+	dma_release_channel(ch->chan);
+	c = dma_request_chan(&rd->pdev->dev, ch->name);
+	if (IS_ERR(c)) {
+		WRITE_ONCE(ch->chan, NULL);
+		return ramon_fail(st, RAMON_E_AXI_DMA_ERROR, chan, PTR_ERR(c),
+				  "axi ch%u (%s): cannot re-acquire after a reset of its IP (%ld)",
+				  chan, ch->name, PTR_ERR(c));
+	}
+	WRITE_ONCE(ch->chan, c);
+	dev_dbg(&rd->pdev->dev, "axi ch%u (%s): re-acquired after a reset of %pOF\n",
+		chan, ch->name, ch->ip_node);
+	return 0;
 }
 
 /* waits for the job's completion; the channel mutex is held by the caller */
@@ -203,7 +235,14 @@ static int ramon_axi_start(struct ramon_dev *rd, struct ramon_axi_job *job, u32 
 	struct ramon_axichan *ch = job->ch;
 	struct dma_async_tx_descriptor *tx;
 	dma_cookie_t cookie;
+	int ret;
 
+	ret = ramon_axi_rearm(rd, ch, job->chan, st);
+	if (ret)
+		return ret;
+	if (!ch->chan)
+		return ramon_fail(st, RAMON_E_NOT_PRESENT, job->chan, 0,
+				  "axi ch%u (%s): channel unavailable", job->chan, ch->name);
 	tx = dmaengine_prep_slave_sg(ch->chan, job->sg, job->n_bufs, ch->dir,
 				     DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
 	if (!tx)
@@ -214,7 +253,7 @@ static int ramon_axi_start(struct ramon_dev *rd, struct ramon_axi_job *job, u32 
 	/* pairs with smp_store_mb(->dead) in remove(), which then complete_all()s */
 	smp_mb();
 	if (READ_ONCE(rd->dead)) {
-		dmaengine_terminate_sync(ch->chan);
+		ramon_axi_terminate(rd, ch, job->chan, "device removed");
 		return ramon_fail(st, RAMON_E_REMOVED, job->chan, 0,
 				  "axi ch%u (%s): device removed", job->chan, ch->name);
 	}
@@ -320,13 +359,7 @@ static int ramon_axi_chan_probe(struct ramon_dev *rd, u32 i)
 		return dev_err_probe(dev, ret, "axi ch%u (%s): dma_request_chan failed\n",
 				     i, ch->name);
 	}
-	/*
-	 * Start from a halted engine. xilinx_dma does not halt it when a channel
-	 * is released, and a running AXI DMA ignores the CURDESC write of the next
-	 * owner's first transfer, so a previous owner could leave it walking a
-	 * freed descriptor ring.
-	 */
-	dmaengine_terminate_sync(ch->chan);
+	ch->align_mask = BIT(ch->chan->device->copy_align) - 1;
 	dev_info(dev, "axi ch%u %s: %s, device-id %u, axi_dma %pa %pOF, copy_align %u\n",
 		 i, ch->name, ch->dir == DMA_MEM_TO_DEV ? "MEM_TO_DEV (mm2s)" : "DEV_TO_MEM (s2mm)",
 		 ch->device_id, &ch->phys, ch->ip_node, 1U << ch->chan->device->copy_align);
@@ -339,7 +372,10 @@ static void ramon_axi_release(struct ramon_dev *rd, u32 n)
 
 	for (i = 0; i < n; i++) {
 		if (rd->axi[i].chan) {
-			/* leave the engine halted for the next owner (see ramon_axi_chan_probe) */
+			/*
+			 * xilinx_dma does not halt the engine on release, and a running AXI
+			 * DMA ignores the next owner's CURDESC write: leave it halted.
+			 */
 			dmaengine_terminate_sync(rd->axi[i].chan);
 			dma_release_channel(rd->axi[i].chan);
 		}

@@ -818,3 +818,20 @@ Next: reboot, then `insmod ramon_dma.ko` (0.8.5), `ramon_smoke spfiprep 0 --form
 - Result: after a fresh boot with driver 0.8.5, `ramon_smoke spfiprep 0 --format` and
   `ramon_smoke spfi` pass. The SPFI write stall was the wrong channel (4 instead of 5), plus the
   engine left running by a release without terminate.
+
+### Driver 0.8.6: a terminate no longer leaves the other direction deaf
+
+- `spw` stopped working with 0.8.5. Cause: a terminate through xilinx_dma soft-resets the whole
+  axi_dma IP, which clears the interrupt enables of both directions, and xilinx_dma re-enables
+  them only for the channel it was asked to stop (it sets them otherwise only when a channel is
+  acquired). 0.8.5 halted every channel at probe in DT order, so channel 0 (SPW NN A RX) lost its
+  interrupt enables when channel 1 (its TX sibling) was halted. The RX DMA then completes
+  silently and the SPW reply times out. SPFI passed because channel 5 was halted last.
+- The same mechanism already existed on the error path: any terminate (a timeout, e.g. the
+  deliberate AXI RX timeout in `--errors`) left the IP's other channels deaf.
+- Fix: the probe-time halt is removed (halting before release stays, and a reboot resets the
+  engines anyway). After any terminate, every other channel on the same IP is flagged; before its
+  next transfer, under its own lock, it is released and re-acquired, which makes xilinx_dma
+  re-enable its interrupts without another reset. It logs `axi chN (...): re-acquired after a
+  reset of ...` at debug level. The channel's alignment mask is cached at probe, so preparing a
+  transfer never dereferences a channel being re-acquired.

@@ -41,7 +41,7 @@
 /* The minor number tracks the implementation step while the rewrite is in progress. */
 #define RAMON_DRV_MAJOR		0
 #define RAMON_DRV_MINOR		8
-#define RAMON_DRV_PATCH		5
+#define RAMON_DRV_PATCH		6
 #define RAMON_DRV_VERSION	__stringify(RAMON_DRV_MAJOR) "." \
 				__stringify(RAMON_DRV_MINOR) "." \
 				__stringify(RAMON_DRV_PATCH)
@@ -63,7 +63,10 @@ struct ramon_stats {
 	atomic64_t spfi_timeouts[RAMON_NN_COUNT];
 };
 
-/* One AXI DMA channel from the "dmas" list; index == DT position. */
+/*
+ * One AXI DMA channel from the "dmas" list; index == DT position. @chan is
+ * replaced (under @lock) when the channel is re-acquired after a reset.
+ */
 struct ramon_axichan {
 	struct dma_chan *chan;
 	enum dma_transfer_direction dir;
@@ -73,6 +76,8 @@ struct ramon_axichan {
 	struct device_node *ip_node;	/* axi_dma IP; terminate resets the whole IP */
 	struct mutex lock;		/* serializes transfers on this channel */
 	struct completion done;		/* completed by the dmaengine callback */
+	u32 align_mask;			/* dma address alignment the engine needs, minus 1 */
+	atomic_t rearm;			/* another channel's terminate reset this IP */
 };
 
 struct ramon_zdma_chan {
