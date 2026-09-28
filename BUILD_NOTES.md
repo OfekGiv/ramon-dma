@@ -18,7 +18,7 @@ Placeholders: `<proj>` = PetaLinux project, `<machine>` = its machine name,
 | 6 | ZDMA pool, ZDMA_COPY; GET_STATS pulled forward from step 8 | **done** on the non-hardened image (0.6.0: `zdma`, `stats`, ZDMA `--errors` pass) |
 | 7 | SPFI: IRQ, CMD, WRITE, READ, alerts, MEM_READ, TX_OFFS_WRITE | **done** on the non-hardened image with driver 0.8.5: `spfiprep 0 --format` and `spfi` pass (stream write on channel 5, flush, read back + verify, concurrent write/read, close/delete, alerts) |
 | 8 | remove hardening, `--stress`, `--errors` sweep (GET_STATS came with batch A) | driver 0.8.6: `spw`, `spfiprep`/`spfi`, `--errors`, and `spw` again after `--errors` pass; `--stress` 10 min (10 threads) passes; `unbind` passes. **done** |
-| 9 | README, final petalinux-build + autoload boot (recipes already exist) | not started |
+| 9 | README, final petalinux-build + autoload boot (recipes already exist) | `README.md` written; driver 0.8.8 passes default + `--errors` on target. Pending: full-image build + autoload boot, then version 1.0.0 |
 
 The driver version is `0.<step>.0` while the rewrite is in progress, so
 `cat /sys/module/ramon_dma/version` tells which step is on the board. Steps are now delivered in
