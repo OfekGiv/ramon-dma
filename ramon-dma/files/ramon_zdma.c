@@ -373,6 +373,8 @@ void ramon_zdma_remove(struct ramon_dev *rd)
 {
 	u32 i;
 
-	for (i = 0; i < rd->zdma.n; i++)
+	for (i = 0; i < rd->zdma.n; i++) {
+		dmaengine_terminate_sync(rd->zdma.ch[i].chan);
 		dma_release_channel(rd->zdma.ch[i].chan);
+	}
 }

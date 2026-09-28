@@ -320,6 +320,13 @@ static int ramon_axi_chan_probe(struct ramon_dev *rd, u32 i)
 		return dev_err_probe(dev, ret, "axi ch%u (%s): dma_request_chan failed\n",
 				     i, ch->name);
 	}
+	/*
+	 * Start from a halted engine. xilinx_dma does not halt it when a channel
+	 * is released, and a running AXI DMA ignores the CURDESC write of the next
+	 * owner's first transfer, so a previous owner could leave it walking a
+	 * freed descriptor ring.
+	 */
+	dmaengine_terminate_sync(ch->chan);
 	dev_info(dev, "axi ch%u %s: %s, device-id %u, axi_dma %pa %pOF, copy_align %u\n",
 		 i, ch->name, ch->dir == DMA_MEM_TO_DEV ? "MEM_TO_DEV (mm2s)" : "DEV_TO_MEM (s2mm)",
 		 ch->device_id, &ch->phys, ch->ip_node, 1U << ch->chan->device->copy_align);
@@ -331,8 +338,11 @@ static void ramon_axi_release(struct ramon_dev *rd, u32 n)
 	u32 i;
 
 	for (i = 0; i < n; i++) {
-		if (rd->axi[i].chan)
+		if (rd->axi[i].chan) {
+			/* leave the engine halted for the next owner (see ramon_axi_chan_probe) */
+			dmaengine_terminate_sync(rd->axi[i].chan);
 			dma_release_channel(rd->axi[i].chan);
+		}
 		rd->axi[i].chan = NULL;
 		of_node_put(rd->axi[i].ip_node);
 		rd->axi[i].ip_node = NULL;

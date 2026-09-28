@@ -32,7 +32,7 @@
  * Options: -d DEV (default /dev/ramon_dma), --node N (our SPW node id, default 68,
  * as the old "spwappinit 0 +68"), --target N (NN node id for the version
  * request, default 0x41, as the old get_nn_version()), --spfi-chans A,B (AXI
- * write channel of NN0,NN1, default 4,4: channel 5 was removed), --spfi-init
+ * write channel of NN0,NN1, default 5,4 as the old spfidrvinit), --spfi-init
  * (send INIT type 0 before the SPFI stream test), --spfi-stream N (first stream id,
  * default the highest free one), --spfi-pages N (pages per write, default 8,
  * max 64), --minutes N (--stress).
@@ -65,7 +65,7 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.14"
+#define SMOKE_VERSION		"0.8.15"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -1595,10 +1595,10 @@ _Static_assert(sizeof(struct spfi_table_hdr) == SPFI_HDR_BYTES, "table header");
 _Static_assert(sizeof(struct spfi_record) == SPFI_REC_BYTES, "table record");
 
 /*
- * AXI write channel per SPFI NN. The old spfidrvinit used { 5, 4 }; channel 5
- * has since been removed from the FPGA and channel 4 is the SPFI write path.
+ * AXI write channel per SPFI NN, as the old spfidrvinit: NN0 = 5 (axi_dma at
+ * 0xa0020000, confirmed on the board with the old stack), NN1 = 4.
  */
-static uint32_t spfi_chan[RAMON_NN_COUNT] = { 4, 4 };
+static uint32_t spfi_chan[RAMON_NN_COUNT] = { 5, 4 };
 static int spfi_init_first;
 static int spfi_format;
 static uint32_t spfi_pages = 8;			/* per write, --spfi-pages */

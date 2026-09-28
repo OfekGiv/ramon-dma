@@ -795,3 +795,23 @@ New kernel import: `usleep_range_state` / `msleep` (from `fsleep`), both whiteli
 - Smoke: every SPFI step keys off `GET_INFO.spfi_mask`. The `regwin` test no longer reads the
   version register of an unused SPFI window. `reg spfi1 ...` still works when asked for
   explicitly.
+
+### Driver 0.8.5 / smoke 0.8.15: SPFI NN0 writes on channel 5 (a0020000); halt engines on release
+
+- **Measured with the old stack:** reading `MM2S_TAILDESC` (`+0x10`) of every axi_dma engine before
+  and after an old `spfitest` shows that only **`0xa0020000`** changes. That engine is our
+  **channel 5** (`axidma_tx4`), so the old app's `{5,4}` mapping (NN0 = 5) was right and channel 5
+  was never removed. Channel 4 (`a0030000`) is not SPFI0's path; NN0's commands got no data, and
+  `ramon_spfi1` fired once, likely NN1's side receiving it. Smoke default back to `5,4`.
+- **Driver bug fixed:** `xilinx_dma` frees a channel's descriptor ring on release but does not
+  halt the engine. A running AXI DMA ignores the next owner's `CURDESC` write, so after our
+  `rmmod`/unbind (which released without terminating) the next session's first transfer could
+  walk a freed ring. The first channel-5 failure fits this: `errors 10` with
+  `cdr 0x01090100` / `tdr 0x19020500` in unrelated regions. The old driver called
+  `dmaengine_terminate_all()` before releasing. The driver now terminates every AXI and ZDMA
+  channel before releasing it, and once more after requesting it at probe, so each session starts
+  from halted engines. A `Cannot stop channel` line at probe is that cleanup hitting an engine a
+  previous owner left stuck; the reset that follows clears it.
+
+Next: reboot, then `insmod ramon_dma.ko` (0.8.5), `ramon_smoke spfiprep 0 --format`,
+`ramon_smoke spfi`.
