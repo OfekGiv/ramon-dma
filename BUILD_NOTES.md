@@ -19,6 +19,7 @@ Placeholders: `<proj>` = PetaLinux project, `<machine>` = its machine name,
 | 7 | SPFI: IRQ, CMD, WRITE, READ, alerts, MEM_READ, TX_OFFS_WRITE | **done** on the non-hardened image with driver 0.8.5: `spfiprep 0 --format` and `spfi` pass (stream write on channel 5, flush, read back + verify, concurrent write/read, close/delete, alerts) |
 | 8 | remove hardening, `--stress`, `--errors` sweep (GET_STATS came with batch A) | driver 0.8.6: `spw`, `spfiprep`/`spfi`, `--errors`, and `spw` again after `--errors` pass; `--stress` 10 min (10 threads) passes; `unbind` passes. **done** |
 | 9 | README, final petalinux-build + autoload boot (recipes already exist) | `README.md` written; driver 0.8.8 passes default + `--errors` on target. Pending: full-image build + autoload boot, then version 1.0.0 |
+| P2 | Userspace: libramon (`ramon-api`), `ramon_cli` and `ramon_test` (`ramon-tools`), 0.1.0 | **written**; host builds, self-test and emulator runs pass; not yet built with PetaLinux or run on the board. See "Phase 2" at the end |
 
 The driver version is `0.<step>.0` while the rewrite is in progress, so
 `cat /sys/module/ramon_dma/version` tells which step is on the board. Steps are now delivered in
@@ -28,7 +29,8 @@ batches to save file transfers (batch A = steps 4-6, version 0.6.0; batch B = st
 
 ## Installing the recipes in the PetaLinux project (once)
 
-This tree holds two recipes. Copy each recipe directory, including its `files/`, into `meta-user`:
+This tree holds two recipes for the driver (and two more for the userspace, see "Phase 2" at the
+end). Copy each recipe directory, including its `files/`, into `meta-user`:
 
 ```sh
 cp -r ramon-dma   <proj>/project-spec/meta-user/recipes-modules/ramon-dma
@@ -856,3 +858,139 @@ Next: reboot, then `insmod ramon_dma.ko` (0.8.5), `ramon_smoke spfiprep 0 --form
   completion callback. A 5000-item transfer started immediately after another could briefly
   find the pool short and fail with `RAMON_E_AXI_PREP_FAILED` (`ENOSPC`); a retry succeeds.
 - Still needed: `ZYNQMP_DMA_NUM_DESCS` (the ZDMA chunk of 16 assumes 32).
+
+---
+
+## Phase 2: libramon, ramon_cli, ramon_test
+
+Two new recipes, both 0.1.0:
+
+- `ramon-api` builds `libramon.a`, a static C library over `/dev/ramon_dma`. It installs the
+  library to `${libdir}` and its headers (`ramon.h`, `ramon_spw.h`, `ramon_spfi.h`,
+  `ramon_version.h`) to `${includedir}/ramon/`, next to the driver's `ramon_dma_uapi.h`. The
+  runtime package is empty; a customer recipe needs only `DEPENDS += "ramon-api"` and
+  `-lramon -lpthread`. `ramon-api/files/README.md` is the customer documentation.
+- `ramon-tools` builds `ramon_cli` (the successor of `dmaapi_testv2`) and `ramon_test` (the
+  automatic tests), linked statically against libramon. `ramon-tools/files/README.md` lists
+  the commands and tests.
+- License: MIT for both, as the old `testdmasgk.bb`; `ramon-tools` also carries the vendored
+  linenoise line editor (BSD-2-Clause). The driver and `ramon-smoke` stay GPL-2.0.
+- Versions: `RAMON_API_VERSION` (`ramon_version.h`) equals `PV` of `ramon-api.bb`, and
+  `RAMON_TOOLS_VERSION` (`tools_common.h`) equals `PV` of `ramon-tools.bb`. Both tools print
+  the tool, library and driver versions.
+
+### Installing the two recipes (once)
+
+```sh
+cp -r ramon-api   <proj>/project-spec/meta-user/recipes-apps/ramon-api
+cp -r ramon-tools <proj>/project-spec/meta-user/recipes-apps/ramon-tools
+
+cat >> <proj>/project-spec/meta-user/conf/user-rootfsconfig <<'EOT'
+CONFIG_ramon-api
+CONFIG_ramon-tools
+EOT
+petalinux-config -c rootfs
+#   user packages -> enable ramon-tools (ramon-api comes in through DEPENDS; enabling it
+#   installs nothing on the target, since the library is static)
+```
+
+### Build
+
+```sh
+petalinux-build -c ramon-api
+W=<proj>/build/tmp/work/<arch>/ramon-api/0.1.0-r0
+grep -n "warning\|error:" $W/temp/log.do_compile          # expect nothing
+grep -n "QA Issue" $W/temp/log.do_package* $W/temp/log.do_populate_sysroot 2>/dev/null
+ls $W/image/usr/lib/libramon.a $W/image/usr/include/ramon/
+
+petalinux-build -c ramon-tools
+W=<proj>/build/tmp/work/<arch>/ramon-tools/0.1.0-r0
+grep -n "warning\|error:" $W/temp/log.do_compile          # expect nothing
+ls $W/image/usr/bin/ramon_cli $W/image/usr/bin/ramon_test
+
+petalinux-build        # or scp the two binaries to the board's /tmp
+```
+
+`<arch>` is the work directory of target packages, e.g. `cortexa72-cortexa53-xilinx-linux`
+(`ls <proj>/build/tmp/work/`).
+
+### On the board, in this order
+
+```sh
+ramon_test --version
+ramon_test --skip-spw --skip-spfi       # 1. core: buffers, channels, registers, ZDMA, stats
+ramon_test spw-sync spw-version spw-dps spw-cancel
+                                        # 2. SPW with the NN (no loopback)
+ramon_test spw-loop axi-loop stats      # 3. SPW loopback write-read (see "Open points")
+ramon_test --prep spfi-link spfi-stream spfi-perf spfi-rxtx spfi-alerts spfi-rules
+                                        # 4. SPFI; add --format once if old streams are in the way
+ramon_test                              # 5. everything
+ramon_test --long spfi-maxlist          # 6. 2 x 5000-page writes (156 MiB of NN storage)
+ramon_test --minutes 10 soak            # 7. mixed load
+ramon_test --json > /tmp/run.json       # results and MiB/s figures for the record
+
+ramon_cli                               # interactive: "help", TAB completes, Ctrl-D quits
+ramon_cli spfitest auto 64 8            # the old spfitest
+ramon_cli --plain                       # if the serial terminal shows escape sequences
+```
+
+Please send back the output of steps 1-5 (or the JSON line), and anything from `dmesg`.
+
+### Checked here (host, x86_64)
+
+- `make -C ramon-api/files check`: the library builds with `-std=c11 -Wall -Wextra -Wpedantic
+  -Wshadow` without warnings, and `ramon_selftest` passes. It covers the CRC (`"123456789"` gives
+  `0xCBF43926`, as the old `rc_crc32sw`), SPW packet build and parse with corrupted headers,
+  payloads and footers, the SPFI table helpers, SYSMON and time-stamp decoding, and error
+  formatting. It caught a wrong `l3_len` offset in the parser.
+- A simulated recipe build with Yocto's hardening flags (`-D_FORTIFY_SOURCE=2
+  -fstack-protector-strong -Werror=format-security`, `--as-needed`, also with `make -e`): no
+  warnings. The install layout is as above. A C99 and a C++14 program build against the
+  installed headers with `#include <ramon/ramon.h>`. This caught a real break: `make install`
+  in `do_install` pointed at a header path that does not exist in the work directory.
+- An emulator of `/dev/ramon_dma` (ioctls, mmap, SPW loopback, an NN that answers version, DPS,
+  config and SW-update requests, SPFI streams): all 26 tests pass, including `--prep --format`,
+  `--long`, a 1-minute soak and `--json`. The same runs are clean under AddressSanitizer +
+  UBSan and ThreadSanitizer. A 79-command `ramon_cli` script is clean under ASan, and the
+  interactive mode was driven through a pseudo-terminal (completion, hints, history, Ctrl-C,
+  a terminal that reports no width). The emulator is not in the tree. It does not prove the
+  FPGA's behaviour; it proves the code paths.
+
+### Design points (please review)
+
+- **Errors.** Every call returns 0 or `-errno` and fills an optional `struct ramon_status`: the
+  driver's trailer, or a library code `RAMON_EL_*` (from 0x1000) for problems found before the
+  ioctl. There is no global last error.
+- **SPW receive.** Two modes, exclusive per NN: a library RX thread with one callback per NN,
+  or the caller's own thread (`ramon_spw_recv`). Either way, every size from `SPW_WAIT_RX` is
+  followed by exactly one RX transfer of that size. `ramon_spw_request` never polls. The old
+  per-(node, app) user list is replaced by one callback that sees every packet; the old app-id
+  filter was commented out anyway.
+- **SPW loopback** changes reset the link. After switching loopback off, `ramon_spw_loopback`
+  re-syncs the link before it returns. Link sync writes 0 to `0x1C`, as `ramon_smoke` does
+  (`reset_value` in `struct ramon_spw_config` changes it).
+- **SPFI.** `ramon_spfi_init` is optional; channels default to {5, 4}. After any SPFI timeout,
+  the next SPFI call on that NN waits 500 ms, so a late answer is not taken for the next
+  command's. OPEN passes the planned stream size as `stream_last_offset`, as the smoke tool and
+  the old `spfitest` did; DATA_WRITE passes 0. The first page comes from the table once, then
+  `struct ramon_spfi_stream` counts locally. Writes are limited to 5000 pages each.
+- **AXI** `RAMON_E_AXI_PREP_FAILED` is retried once after 2 ms (see driver 0.8.8).
+- **CMA** used by the library by default: 2 x 1 MiB TX buffers, plus 1 MiB of RX buffer per
+  present SPW NN, plus 1 MiB per SPFI NN once a `*_mem` call is used. All sizes are in the
+  config structs.
+- **FDIR.** The 73-word snapshot and the automatic answer to attribute 0xA0 are in `ramon_cli`
+  (`fdir`, `fdirauto`), not in the library. SPFI1's words are filled with 0xCAFECAFE while the
+  driver keeps SPFI1 masked.
+- **ramon_cli** guards `spfifmt`, `spfipdown`, `nnupdate`, `fwupdate` and `spfiprep ... format`
+  with a final `yes`. The old tool had no guard on `spfipdown`.
+
+### Open points
+
+- **SPW loopback carrying data** has never run on the new driver: the smoke tool used loopback
+  only to isolate the RX side. `spw-loop`, `axi-loop` and the SPW part of `stats` depend on it,
+  and on the FPGA appending the 16-byte footer in loopback as it does for NN traffic. If they
+  fail while `spw-version` passes, it is the loopback path.
+- **The largest SPW packet** the FPGA takes is unknown. `spw-loop` goes up to `--spw-max`
+  (default 65536 bytes of payload); lower it if only the largest size fails.
+- `nnupdate` and `nnconf` follow the old CLI's protocol, but have only met the emulator. Try
+  `nnconf` before `nnupdate`.

@@ -11,3 +11,8 @@ Module.symvers
 .tmp_versions/
 # smoke tool built by hand
 /ramon_smoke
+# phase-2 userspace built by hand (make -C ramon-api/files, make -C ramon-tools/files)
+*.a
+/ramon-api/files/ramon_selftest
+/ramon-tools/files/ramon_cli
+/ramon-tools/files/ramon_test

@@ -21,6 +21,8 @@ unchanged.
 |---|---|
 | `ramon-dma/ramon-dma.bb`, `ramon-dma/files/` | module recipe and sources; `ramon_dma_uapi.h` is the ABI |
 | `ramon-smoke/ramon-smoke.bb`, `ramon-smoke/files/ramon_smoke.c` | on-target test tool |
+| `ramon-api/ramon-api.bb`, `ramon-api/files/` | libramon: the static C library customers link (`README.md` there) |
+| `ramon-tools/ramon-tools.bb`, `ramon-tools/files/` | `ramon_cli` (successor of `dmaapi_testv2`) and `ramon_test` (automatic tests) |
 | `linux-xlnx/ramon_dma.ksyms` | export whitelist for kernels built with `CONFIG_TRIM_UNUSED_KSYMS` |
 | `BUILD_NOTES.md` | per-step build/test history, board results, open questions |
 
@@ -40,6 +42,15 @@ cp -r ramon-smoke <proj>/project-spec/meta-user/recipes-apps/
 printf 'CONFIG_ramon-dma\nCONFIG_ramon-smoke\n' >> <proj>/project-spec/meta-user/conf/user-rootfsconfig
 petalinux-config -c rootfs     # enable ramon-dma and ramon-smoke; disable axidmasgk and ps2psk
 petalinux-build -c ramon-dma && petalinux-build -c ramon-smoke
+```
+
+The userspace library and tools are two more recipes:
+
+```sh
+cp -r ramon-api ramon-tools <proj>/project-spec/meta-user/recipes-apps/
+printf 'CONFIG_ramon-api\nCONFIG_ramon-tools\n' >> <proj>/project-spec/meta-user/conf/user-rootfsconfig
+petalinux-config -c rootfs     # enable ramon-tools
+petalinux-build -c ramon-api && petalinux-build -c ramon-tools
 ```
 
 - The module recipe autoloads `ramon_dma` and installs `ramon_dma_uapi.h` to
@@ -219,6 +230,10 @@ More tests, run individually:
 - Explicit commands: `spwdps`, `spwsend`, `spfiprep`, `spfidel`, `spficmd`, `reg`.
 
 `ramon_smoke --help` lists all of them with their options.
+
+`ramon_test` (in `ramon-tools`) tests the same board through libramon: SPW loopback write-read
+and NN round trips, SPFI stream write/read with throughput, register access, buffers, AXI and
+ZDMA. `ramon_test --list` shows the tests. `ramon_cli` is the interactive command line.
 
 ## Open questions for the FPGA team
 
