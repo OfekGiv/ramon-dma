@@ -16,8 +16,8 @@ Placeholders: `<proj>` = PetaLinux project, `<machine>` = its machine name,
 | 4 | AXI DMA, CHAN_INFO | **done** on the non-hardened image (0.6.0: `chan`, AXI `--errors` incl. RX timeout, `unbind` pass) |
 | 5 | SPW: IRQ, WAIT_RX / CANCEL / LOOPBACK | **done** on the non-hardened image: `spw` (link sync, version round trip with NN) and `spwdps 0` pass; unsynced spw1 is expected |
 | 6 | ZDMA pool, ZDMA_COPY; GET_STATS pulled forward from step 8 | **done** on the non-hardened image (0.6.0: `zdma`, `stats`, ZDMA `--errors` pass) |
-| 7 | SPFI: IRQ, CMD, WRITE, READ, alerts, MEM_READ, TX_OFFS_WRITE | 0.8.0 built and loaded; `spfiprep 0` passes (INIT, GET_ALL_STREAM_STATUS, MEM_READ, SPFI REG_IO). Stream write/read (`spfi`), `--errors`, `unbind`, `--stress` pending |
-| 8 | remove hardening, `--stress`, `--errors` sweep (GET_STATS came with batch A) | 0.8.0 built; runs pending |
+| 7 | SPFI: IRQ, CMD, WRITE, READ, alerts, MEM_READ, TX_OFFS_WRITE | **done** on the non-hardened image with driver 0.8.5: `spfiprep 0 --format` and `spfi` pass (stream write on channel 5, flush, read back + verify, concurrent write/read, close/delete, alerts) |
+| 8 | remove hardening, `--stress`, `--errors` sweep (GET_STATS came with batch A) | pending on 0.8.5: `--errors`, `unbind`, `--stress` |
 | 9 | README, final petalinux-build + autoload boot (recipes already exist) | not started |
 
 The driver version is `0.<step>.0` while the rewrite is in progress, so
@@ -815,3 +815,6 @@ New kernel import: `usleep_range_state` / `msleep` (from `fsleep`), both whiteli
 
 Next: reboot, then `insmod ramon_dma.ko` (0.8.5), `ramon_smoke spfiprep 0 --format`,
 `ramon_smoke spfi`.
+- Result: after a fresh boot with driver 0.8.5, `ramon_smoke spfiprep 0 --format` and
+  `ramon_smoke spfi` pass. The SPFI write stall was the wrong channel (4 instead of 5), plus the
+  engine left running by a release without terminate.
