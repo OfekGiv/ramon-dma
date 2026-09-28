@@ -33,7 +33,7 @@
 #define RAMON_NN_COUNT			2
 #define RAMON_NAME_LEN			32
 #define RAMON_MSG_LEN			96
-#define RAMON_AXI_MAX_ITEMS		512
+#define RAMON_AXI_MAX_ITEMS		8192	/* = SPFI offsets per TX offset table */
 #define RAMON_ZDMA_MAX_COPIES		4096
 #define RAMON_SPFI_OFFSET_BYTES		16384	/* one SPFI "offset" unit */
 #define RAMON_SPFI_MEM_READ_MAX		16384	/* RX message table size */

@@ -111,14 +111,15 @@ int ramon_axi_job_prepare(struct ramon_file *rf, u32 chan, u64 uitems, u32 n,
 				  "axi ch%u: n_items %u not in 1..%u",
 				  chan, n, RAMON_AXI_MAX_ITEMS);
 
-	items = memdup_user(u64_to_user_ptr(uitems), array_size(n, sizeof(*items)));
+	items = vmemdup_user(u64_to_user_ptr(uitems), array_size(n, sizeof(*items)));
 	if (IS_ERR(items))
 		return ramon_fail(st, PTR_ERR(items) == -EFAULT ? RAMON_E_COPY_FAULT :
 				  RAMON_E_NO_MEMORY, uitems, n,
 				  "axi ch%u: cannot copy %u items from 0x%llx (%ld)",
 				  chan, n, uitems, PTR_ERR(items));
-	job->bufs = kcalloc(n, sizeof(*job->bufs), GFP_KERNEL);
-	job->sg = kcalloc(n, sizeof(*job->sg), GFP_KERNEL);
+	/* up to 8192 items: 64 KiB of pointers and 256 KiB of sg entries, so kv* */
+	job->bufs = kvcalloc(n, sizeof(*job->bufs), GFP_KERNEL);
+	job->sg = kvcalloc(n, sizeof(*job->sg), GFP_KERNEL);
 	if (!job->bufs || !job->sg) {
 		ret = ramon_fail(st, RAMON_E_NO_MEMORY, n, 0,
 				 "axi ch%u: no memory for %u sg entries", chan, n);
@@ -129,7 +130,7 @@ int ramon_axi_job_prepare(struct ramon_file *rf, u32 chan, u64 uitems, u32 n,
 	for (i = 0; i < n && !ret; i++)
 		ret = ramon_axi_item(rf, job, i, &items[i], st);
 out:
-	kfree(items);
+	kvfree(items);
 	return ret;
 }
 
@@ -140,8 +141,8 @@ void ramon_axi_job_release(struct ramon_axi_job *job)
 	for (i = 0; i < job->n_bufs; i++)
 		if (job->bufs[i])
 			ramon_buf_put(job->bufs[i]);
-	kfree(job->bufs);
-	kfree(job->sg);
+	kvfree(job->bufs);
+	kvfree(job->sg);
 	job->bufs = NULL;
 	job->sg = NULL;
 	job->n_bufs = 0;

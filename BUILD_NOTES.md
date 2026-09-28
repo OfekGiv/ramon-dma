@@ -456,7 +456,7 @@ What the new tests do:
   - 8 threads × 100 copies competing for the pool.
 - `stats`: prints every counter, then checks that `reset` zeroes them.
 - `--errors` adds:
-  - bad channel/index, 0 and 513 items, a bad items pointer, `len 0`, an unknown handle, an
+  - bad channel/index, 0 and `RAMON_AXI_MAX_ITEMS + 1` items, a bad items pointer, `len 0`, an unknown handle, an
     item past the buffer end, and an `offset + len` overflow;
   - **an AXI RX timeout on NN0's RX channel with loopback on and no traffic.** That
     terminate soft-resets that axi_dma IP (both directions), which is expected;
@@ -769,3 +769,15 @@ register writes and their order match the old driver exactly; what remains:
   come from the ramon_dma device. This only matters if the ps2ps DT node has a `memory-region`.
 
 New kernel import: `usleep_range_state` / `msleep` (from `fsleep`), both whitelisted.
+
+### Driver 0.8.3 / smoke 0.8.13: up to 8192 SG items per AXI transfer
+
+- The NN accepts up to 5000 offsets in one DATA_WRITE. The old app builds one SG item per
+  16 KiB offset, so `RAMON_AXI_MAX_ITEMS` goes from 512 to 8192, matching the TX offset table
+  (8192 offsets). The item and scatterlist arrays are now kvmalloc'ed (up to 192 + 64 + 256 KiB).
+  This is a UAPI constant change before the ABI freeze; `RAMON_ABI_VERSION` stays 1.
+- A large write needs no long item list: one contiguous item of `n × 16 KiB` is enough, up to
+  4 GiB - 1 per item and `max_buf_mb` (default 256 MiB, i.e. 16384 offsets).
+- Each item uses at least one xilinx_dma descriptor. If the kernel's `XILINX_DMA_NUM_DESCS` is
+  smaller than the item count, prep fails with `RAMON_E_AXI_PREP_FAILED` (`ENOSPC`). Please
+  run the `grep NUM_DESCS` from step 1 to confirm your kernel's value.

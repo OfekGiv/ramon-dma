@@ -65,7 +65,7 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.12"
+#define SMOKE_VERSION		"0.8.13"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -3095,8 +3095,9 @@ static void errors_axi(const struct ramon_get_info *gi)
 	expect_axi_fail(gi->n_axi_chan, 1, 0, 0, "AXI_XFER bad channel", ENOENT,
 			RAMON_E_AXI_BAD_CHAN, want);
 	expect_axi_fail(0, 0, 0, 0, "AXI_XFER 0 items", EINVAL, RAMON_E_BAD_COUNT, "n_items 0");
+	snprintf(want, sizeof(want), "%u", RAMON_AXI_MAX_ITEMS + 1);
 	expect_axi_fail(0, RAMON_AXI_MAX_ITEMS + 1, 0, 0, "AXI_XFER too many items", EINVAL,
-			RAMON_E_BAD_COUNT, "513");
+			RAMON_E_BAD_COUNT, want);
 	expect_axi_fail(0, 1, 8, 0, "AXI_XFER bad items pointer", EFAULT, RAMON_E_COPY_FAULT,
 			"0x8");
 
