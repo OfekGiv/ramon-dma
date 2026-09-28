@@ -65,7 +65,7 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.13"
+#define SMOKE_VERSION		"0.8.14"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -811,7 +811,7 @@ static void regwin_rtc_ttc(void)
 }
 
 /* the prefix before '@' finds the SPW/SPFI windows; print their version registers */
-static void regwin_spw_spfi(void)
+static void regwin_spw_spfi(uint32_t spfi_mask)
 {
 	static const char *const prefix[] = { "spw0", "spw1", "spfi0", "spfi1" };
 	static const uint32_t reg[] = { SPW_VERSION, SPW_VERSION, SPFI_WR_VERSION, SPFI_WR_VERSION };
@@ -819,6 +819,9 @@ static void regwin_spw_spfi(void)
 
 	for (i = 0; i < 4; i++) {
 		if (!win_present(RAMON_WIN_SPW0 + i))
+			continue;
+		/* SPFI NNs the driver does not use are not touched at all */
+		if (i >= RAMON_NN_COUNT && !(spfi_mask & (1u << (i - RAMON_NN_COUNT))))
 			continue;
 		if (reg_read(prefix[i], 0, reg[i], &by_name) ||
 		    reg_read(NULL, RAMON_WIN_SPW0 + i, reg[i], &by_index))
@@ -896,7 +899,7 @@ static void test_regwin(void)
 	regwin_rstop();
 	regwin_sysmon();
 	regwin_rtc_ttc();
-	regwin_spw_spfi();
+	regwin_spw_spfi(gi.spfi_mask);
 	regwin_concurrent();
 }
 

@@ -781,3 +781,17 @@ New kernel import: `usleep_range_state` / `msleep` (from `fsleep`), both whiteli
 - Each item uses at least one xilinx_dma descriptor. If the kernel's `XILINX_DMA_NUM_DESCS` is
   smaller than the item count, prep fails with `RAMON_E_AXI_PREP_FAILED` (`ENOSPC`). Please
   run the `grep NUM_DESCS` from step 1 to confirm your kernel's value.
+
+### Driver 0.8.4 / smoke 0.8.14: SPFI1 is not used
+
+- Board fact (user): only NN0's SPFI is available. The DT still lists two SPFI reg/interrupt
+  pairs, so a new module parameter `spfi_mask` (default `0x1`, `RAMON_SPFI_MASK_DEFAULT` in
+  `ramon_board.h`) selects the NNs the driver uses. A masked NN gets no IRQ request, no
+  register use and no DT-label memories. Its SPFI ioctls return `RAMON_E_NOT_PRESENT`, and
+  `GET_INFO.spfi_mask` shows only NN0. Probe logs `spfi1: not used (spfi_mask=0x1)`.
+- Seen before this change: `ramon_spfi1` (IRQ 60) fired once during a failed SPFI write, while
+  the old stack showed no SPFI_B interrupts. With the mask, the driver no longer requests that
+  line.
+- Smoke: every SPFI step keys off `GET_INFO.spfi_mask`. The `regwin` test no longer reads the
+  version register of an unused SPFI window. `reg spfi1 ...` still works when asked for
+  explicitly.

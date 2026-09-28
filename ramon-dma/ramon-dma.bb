@@ -8,7 +8,7 @@ LIC_FILES_CHKSUM = "file://COPYING;md5=12f884d2ae1ff87c09e5b7ccc2c4ca7e"
 inherit module
 
 # Tracks MODULE_VERSION in ramon_dma.h (0.<implementation step>.0 during the rewrite).
-PV = "0.8.3"
+PV = "0.8.4"
 
 INHIBIT_PACKAGE_STRIP = "1"
 

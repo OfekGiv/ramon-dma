@@ -38,6 +38,12 @@ module_param(spfi_write_gap_us, uint, 0644);
 MODULE_PARM_DESC(spfi_write_gap_us, "pause between DATA_WRITE and its DMA, us (default 0, max "
 		 __stringify(RAMON_SPFI_WRITE_GAP_MAX_US) ")");
 
+/* SPFI instances to use; the DT lists both NNs, the board wires only NN0 */
+static unsigned int spfi_mask = RAMON_SPFI_MASK_DEFAULT;
+module_param(spfi_mask, uint, 0444);
+MODULE_PARM_DESC(spfi_mask, "SPFI NNs to use, bit n = NN n (default "
+		 __stringify(RAMON_SPFI_MASK_DEFAULT) ")");
+
 static unsigned int zdma_channels = RAMON_ZDMA_CHANNELS_DEFAULT;
 module_param(zdma_channels, uint, 0444);
 MODULE_PARM_DESC(zdma_channels, "DMA_MEMCPY channels to take for ZDMA_COPY, 0.."
@@ -141,6 +147,11 @@ u64 ramon_max_buf_bytes(void)
 u32 ramon_param_zdma_channels(void)
 {
 	return zdma_channels;
+}
+
+u32 ramon_param_spfi_mask(void)
+{
+	return spfi_mask;
 }
 
 u32 ramon_param_spfi_write_gap_us(void)
@@ -559,6 +570,10 @@ static int __init ramon_init(void)
 {
 	if (!max_buf_mb || max_buf_mb > RAMON_MAX_BUF_MB_LIMIT) {
 		pr_err("max_buf_mb=%u out of range 1..%u\n", max_buf_mb, RAMON_MAX_BUF_MB_LIMIT);
+		return -EINVAL;
+	}
+	if (spfi_mask & ~RAMON_SPFI_MASK_ALL) {
+		pr_err("spfi_mask=0x%x has bits beyond the %u NNs\n", spfi_mask, RAMON_NN_COUNT);
 		return -EINVAL;
 	}
 	if (zdma_channels > RAMON_ZDMA_CHANNELS_MAX) {
