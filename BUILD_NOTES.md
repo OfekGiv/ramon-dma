@@ -205,7 +205,7 @@ the X-macro.
 | Item | Why it matters | Step |
 |---|---|---|
 | `of_find_node_opts_by_path` exported? | It was undefined only because of `TRIM_UNUSED_KSYMS`; it is in the whitelist, so the plain `of_find_node_by_path()` can be used instead of porting the manual resolver. Confirm with the `Module.symvers` grep after the kernel rebuild. | 3, 7 |
-| `XILINX_DMA_NUM_DESCS`, `ZYNQMP_DMA_NUM_DESCS` | The AXI item limit (512) and the ZDMA chunk size (16, assuming 32 descriptors) | 4, 6 |
+| `XILINX_DMA_NUM_DESCS`, `ZYNQMP_DMA_NUM_DESCS` | Xilinx: **5000** on the board kernel, so `RAMON_AXI_MAX_ITEMS` = 5000 (0.8.8). ZynqMP: still unknown; the ZDMA chunk (16) assumes 32 | 4, 6 |
 | xilinx_dma / zynqmp_dma built-in or modules | `MODULE_SOFTDEP` only helps if they are modules; `-EPROBE_DEFER` covers both cases | 4, 6 |
 | SMMU enabled for the PL node? | If yes, `dma_free_coherent` after an unbind (buffers of a still-open fd) needs care | 2, 8 |
 | DMA mask | Not changed; left at the platform default (32-bit unless dma-ranges says otherwise), exactly like the old driver, because the AXI DMA IP may be 32-bit | 2 |
@@ -844,3 +844,15 @@ Next: reboot, then `insmod ramon_dma.ko` (0.8.5), `ramon_smoke spfiprep 0 --form
   board.
 - The X-macro error list stays (user asked for the trade-off; recommendation: keep). The 3
   checkpatch findings on `ramon_dma_uapi.h` remain the known ones.
+
+### Driver 0.8.8: AXI item limit = the kernel's descriptor pool
+
+- The board kernel has `XILINX_DMA_NUM_DESCS = 5000` (patched; mainline has 512). Each SG item
+  takes at least one xilinx_dma descriptor, so `RAMON_AXI_MAX_ITEMS` is now 5000 (was 8192):
+  longer lists fail at once with `RAMON_E_BAD_COUNT` instead of halfway through prep with
+  `RAMON_E_AXI_PREP_FAILED`. More than 5000 SPFI offsets per write still work with larger items
+  (a contiguous item uses one descriptor per engine-maximum length, not one per 16 KiB).
+- Edge case: xilinx_dma returns a finished transfer's descriptors to the pool only after the
+  completion callback. A 5000-item transfer started immediately after another could briefly
+  find the pool short and fail with `RAMON_E_AXI_PREP_FAILED` (`ENOSPC`); a retry succeeds.
+- Still needed: `ZYNQMP_DMA_NUM_DESCS` (the ZDMA chunk of 16 assumes 32).

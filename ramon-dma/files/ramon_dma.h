@@ -41,7 +41,7 @@
 /* The minor number tracks the implementation step while the rewrite is in progress. */
 #define RAMON_DRV_MAJOR		0
 #define RAMON_DRV_MINOR		8
-#define RAMON_DRV_PATCH		7
+#define RAMON_DRV_PATCH		8
 #define RAMON_DRV_VERSION	__stringify(RAMON_DRV_MAJOR) "." \
 				__stringify(RAMON_DRV_MINOR) "." \
 				__stringify(RAMON_DRV_PATCH)

@@ -119,7 +119,7 @@ int ramon_axi_job_prepare(struct ramon_file *rf, u32 chan, u64 uitems, u32 n,
 				  RAMON_E_NO_MEMORY, uitems, n,
 				  "axi ch%u: cannot copy %u items from 0x%llx (%ld)",
 				  chan, n, uitems, PTR_ERR(items));
-	/* up to 8192 items: 64 KiB of pointers and 256 KiB of sg entries, so kv* */
+	/* up to 5000 items: ~40 KiB of pointers and ~160 KiB of sg entries, so kv* */
 	job->bufs = kvcalloc(n, sizeof(*job->bufs), GFP_KERNEL);
 	job->sg = kvcalloc(n, sizeof(*job->sg), GFP_KERNEL);
 	if (!job->bufs || !job->sg) {
