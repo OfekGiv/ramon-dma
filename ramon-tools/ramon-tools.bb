@@ -8,7 +8,7 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
                     file://linenoise.c;beginline=13;endline=39;md5=679409940bac49bffd98c80aef73a3e2"
 
 # Must equal RAMON_TOOLS_VERSION in tools_common.h.
-PV = "0.1.0"
+PV = "0.1.1"
 
 # libramon.a and its headers from ramon-api, ramon_dma_uapi.h from ramon-dma.
 DEPENDS = "ramon-api ramon-dma"

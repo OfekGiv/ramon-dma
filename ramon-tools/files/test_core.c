@@ -11,6 +11,7 @@
 #define CMA_SLACK_KB	2048
 #define ZDMA_THREADS	4
 #define ZDMA_THREAD_OPS	100
+#define RTC_CONTROL	0x40
 
 static void test_version(void)
 {
@@ -258,8 +259,13 @@ static void test_reg_rtc_ttc(void)
 	if (t_check(ramon_reg_read(T.c, "rtc", 0x10, &b, &st), "RTC", &st))
 		return;
 	tc_info("RTC %u -> %u over 1.2 s", a, b);
-	if (b - a < 1 || b - a > 2)
-		tc_fail("RTC advanced by %u s over 1.2 s", b - a);
+	if (a == b) {
+		/* as ramon_smoke: a stopped RTC is a board state (oscillator, battery), not a driver fault */
+		if (!t_check(ramon_reg_read(T.c, "rtc", RTC_CONTROL, &v, &st), "RTC control", &st))
+			tc_info("note: the RTC is not counting (control 0x40 = 0x%x); not a failure", v);
+	} else if (b - a > 2) {
+		tc_fail("RTC jumped by %u s over 1.2 s", b - a);
+	}
 	for (i = 0; i < RAMON_TTC_COUNT; i++) {
 		if (t_check(ramon_regwin_info(T.c, RAMON_WIN_TTC0 + i, &ri, &st), "REGWIN_INFO", &st) ||
 		    (ri.flags & RAMON_REGWIN_ABSENT))
@@ -471,7 +477,7 @@ const struct test test_core[] = {
 	{ "regwin", test_regwin, RUN_DEFAULT, 0, "register windows: names, order, flags" },
 	{ "reg-rstop", test_reg_rstop, RUN_DEFAULT, 0, "RS-TOP by name/index, 0x40 read-back, time stamp" },
 	{ "reg-sysmon", test_reg_sysmon, RUN_DEFAULT, 0, "temperatures in range, 37 rails" },
-	{ "reg-rtc-ttc", test_reg_rtc_ttc, RUN_DEFAULT, 0, "RTC advances, TTCs readable" },
+	{ "reg-rtc-ttc", test_reg_rtc_ttc, RUN_DEFAULT, 0, "RTC read (a stopped RTC is only noted), TTCs readable" },
 	{ "reg-spw-spfi", test_reg_spw_spfi, RUN_DEFAULT, 0, "SPW/SPFI version registers by name and index" },
 	{ "reg-ro", test_reg_ro, RUN_DEFAULT, 0, "a read-only window refuses writes" },
 	{ "zdma", test_zdma, RUN_DEFAULT, NEEDS_ZDMA, "ZDMA copies, list, MiB/s, 4 threads" },

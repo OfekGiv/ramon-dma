@@ -97,7 +97,7 @@ error.
 | `regwin` | register window names, order and flags |
 | `reg-rstop` | RS-TOP by name and index, 0x40 read-back, time stamp |
 | `reg-sysmon` | temperatures within -40..125 C, all 37 rails |
-| `reg-rtc-ttc` | the RTC advances, TTCs are readable |
+| `reg-rtc-ttc` | the RTC is readable (a stopped RTC is only noted, as in `ramon_smoke`), TTCs are readable |
 | `reg-spw-spfi` | SPW/SPFI version registers agree by name and by index |
 | `reg-ro` | a read-only window refuses a write with the right error |
 | `zdma` | copies, a 100-entry list, MiB/s, 4 threads |
