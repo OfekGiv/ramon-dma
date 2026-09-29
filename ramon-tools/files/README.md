@@ -36,7 +36,7 @@ Differences from dmaapi_testv2:
 | Device | `version`, `info`, `stats [reset]`, `chan`, `reopen` |
 | Buffers | `alloc`, `free`, `bufinfo`, `fill`, `verify`, `dump`, `zdma`, `zdmalist`, `axiraw` |
 | Registers | `regio`, `regwins`, `rstopregio`, `regaccessio`, `regaccessioname`, `rdrstopver`, `readtimetag`, `sysmon`, `rtcttc` |
-| SpaceWire | `spwinit`, `spwsync`, `loopback`, `spwstatus`, `spwreg`, `spwrx`, `spwdump`, `log`, `spwsend`, `spwrecv`, `spwdrain`, `spwloop`, `axiloop`, `spwdps`, `nnswver`, `nnupdate`, `nnconf`, `fdir`, `fdirauto`, `spwnode`, `spwterm` |
+| SpaceWire | `spwinit`, `spwsync`, `loopback`, `spwstatus`, `spwreg`, `spwrx`, `spwdump`, `log`, `spwsend`, `spwrecv`, `spwdrain`, `spwloop`, `axiloop`, `loopdiag`, `spwdps`, `nnswver`, `nnupdate`, `nnconf`, `fdir`, `fdirauto`, `spwnode`, `spwterm` |
 | SPFI (current NN, `spfinnid`) | `spfiprep`, `spfiinfo`, `spfiinit`, `spfifmt`, `spfiginfo`, `spfiopens`, `spfigsend`, `spfircv`, `spfiflush`, `spficlose`, `spfidel`, `spfistod`, `spfipdown`, `spfireg`, `spfiloop`, `spfitest`, `spfirxtx`, `spfitxoffs`, `spfialerts`, `spfialert`, `spfidrvinit`, `spfidrvterm` |
 | Board extras | `rdlatver`, `wrlatreg`, `rdlatreg`, `fwupdate`, `scrubtest`, `meminfo`, `devtree` |
 

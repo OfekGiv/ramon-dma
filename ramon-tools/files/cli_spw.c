@@ -761,6 +761,208 @@ out:
 	return ret;
 }
 
+/* ---- loopdiag: why does FPGA loopback not return packets? ---- */
+
+#define DIAG_LEN	1024
+#define DIAG_WAIT_MS	1500
+#define DIAG_RAW_MS	2000
+
+struct diag_rx {
+	struct cli *cl;
+	uint32_t chan;
+	ramon_buf *b;
+	uint64_t len;
+	uint32_t timeout_ms;
+	int ret;
+	struct ramon_status st;
+};
+
+static void *diag_rx_thread(void *arg)
+{
+	struct diag_rx *d = arg;
+
+	d->ret = ramon_axi_xfer1(d->cl->c, d->chan, d->b, 0, d->len, d->timeout_ms, &d->st);
+	return NULL;
+}
+
+static void diag_link(struct cli *cl, uint32_t nn, const char *when)
+{
+	uint32_t link = 0, lb = 0;
+	char win[8];
+
+	snprintf(win, sizeof(win), "spw%u", nn);
+	ramon_reg_read(cl->c, win, RAMON_SPW_REG_LINK, &link, NULL);
+	ramon_reg_read(cl->c, win, RAMON_SPW_REG_LOOPBACK, &lb, NULL);
+	printf("      %-26s link 0x28 = 0x%x (%s), loopback 0x10 = 0x%x\n", when, link,
+	       (link & 7) == 5 ? "synced" : "NOT synced", lb);
+}
+
+static uint64_t diag_spw_rx(struct cli *cl, uint32_t nn)
+{
+	struct ramon_get_stats g;
+
+	return ramon_get_stats(cl->c, 0, &g, NULL) ? 0 : g.spw_rx[nn];
+}
+
+/* one SPW packet to our own node, then SPW_WAIT_RX and the RX of that size; 1 if it came back */
+static int diag_packet(struct cli *cl, uint32_t nn, uint32_t rxc, uint32_t txc, ramon_buf *tx,
+		       ramon_buf *rx, const char *step)
+{
+	struct ramon_spw_wait_rx w;
+	struct ramon_spw_msg m;
+	struct ramon_status st;
+	struct ramon_iov iov;
+	uint8_t payload[DIAG_LEN];
+	uint64_t before = diag_spw_rx(cl, nn);
+	uint32_t len;
+	char msg[256];
+
+	tc_fill(payload, sizeof(payload), 0xD1A60000u);
+	memset(&m, 0, sizeof(m));
+	m.dst = cl->node;
+	iov.base = payload;
+	iov.len = sizeof(payload);
+	ramon_spw_build(cl->node, &m, &iov, 1, tx->ptr, tx->size, &len);
+	if (ramon_axi_xfer1(cl->c, txc, tx, 0, len, 0, &st)) {
+		ramon_strerror(&st, msg, sizeof(msg));
+		printf("      %s: TX of %u bytes failed: %s\n", step, len, msg);
+		return 0;
+	}
+	memset(&w, 0, sizeof(w));
+	w.nn = nn;
+	w.timeout_ms = DIAG_WAIT_MS;
+	if (ramon_ioc_spw_wait_rx(cl->c, &w)) {
+		printf("      %s: sent %u bytes; no RX size within %u ms (driver spw_rx +%llu)\n", step,
+		       len, DIAG_WAIT_MS, (unsigned long long)(diag_spw_rx(cl, nn) - before));
+		return 0;
+	}
+	printf("      %s: sent %u bytes; RX size %u arrived (%s)\n", step, len, w.size,
+	       w.size == len + RAMON_SPW_FOOTER_BYTES ? "packet + 16-byte footer" : "unexpected size");
+	if (w.size > rx->size) {
+		printf("      %s: too large for the %llu-byte RX buffer; the RX stream is now out of step\n",
+		       step, (unsigned long long)rx->size);
+		return 0;
+	}
+	memset(rx->ptr, 0, w.size);
+	if (ramon_axi_xfer1(cl->c, rxc, rx, 0, w.size, 0, &st)) {
+		ramon_strerror(&st, msg, sizeof(msg));
+		printf("      %s: RX transfer of %u bytes failed: %s\n", step, w.size, msg);
+		return 0;
+	}
+	printf("      %s: data %s\n", step, !memcmp(rx->ptr, tx->ptr, len) ? "identical" : "DIFFERENT");
+	tc_hexdump(rx->ptr, w.size, 0, 48);
+	return !memcmp(rx->ptr, tx->ptr, len);
+}
+
+/* an RX transfer with no size first, as the old xsgdma did; tx_len 0 = only receive */
+static int diag_blind(struct cli *cl, uint32_t rxc, uint32_t txc, ramon_buf *tx, ramon_buf *rx,
+		      uint32_t tx_len, const char *step)
+{
+	struct diag_rx d = { cl, rxc, rx, rx->size, DIAG_RAW_MS, 0, { 0 } };
+	struct ramon_status st;
+	pthread_t th;
+	char msg[256];
+
+	memset(rx->ptr, 0, rx->size);
+	if (pthread_create(&th, NULL, diag_rx_thread, &d))
+		return 0;
+	if (tx_len) {
+		tc_sleep_ms(20);
+		memset(tx->ptr, 0xA5, tx_len);
+		if (ramon_axi_xfer1(cl->c, txc, tx, 0, tx_len, 0, &st)) {
+			ramon_strerror(&st, msg, sizeof(msg));
+			printf("      %s: TX failed: %s\n", step, msg);
+		}
+	}
+	pthread_join(th, NULL);
+	if (d.ret) {
+		ramon_strerror(&d.st, msg, sizeof(msg));
+		printf("      %s: nothing received in %u ms (%s)\n", step, DIAG_RAW_MS, msg);
+		return 0;
+	}
+	printf("      %s: the RX DMA received data; first bytes:\n", step);
+	tc_hexdump(rx->ptr, rx->size, 0, 48);
+	return 1;
+}
+
+static int cmd_loopdiag(struct cli *cl, int argc, char **argv)
+{
+	uint32_t nn, rxc, txc, tries, dropped = 0;
+	struct ramon_status st;
+	int was_on = 0, ok = 0, synced_ok = 0, stuck = 0, blind = 0, ret;
+	ramon_buf tx, rx;
+
+	memset(&tx, 0, sizeof(tx));
+	memset(&rx, 0, sizeof(rx));
+	ret = cli_opt_u32(cl, argc, argv, 1, 0, "nn", &nn);
+	if (!ret)
+		ret = cli_nn(cl, nn);
+	if (ret)
+		return ret;
+	if (ramon_spw_rx_running(cl->c, nn))
+		return cli_err(cl, EBUSY, "stop the RX thread first (spwrx %u 0)", nn);
+	ret = ramon_axi_find_pair(cl->c, nn, &rxc, &txc, &cl->st);
+	if (!ret)
+		ret = ramon_buf_alloc(cl->c, DIAG_LEN + RAMON_SPW_HDR_BYTES, 0, &tx, &cl->st);
+	if (!ret)
+		ret = ramon_buf_alloc(cl->c, DIAG_LEN + RAMON_SPW_HDR_BYTES + 64, 0, &rx, &cl->st);
+	if (!ret)
+		ret = ramon_spw_loopback_get(cl->c, nn, &was_on, &cl->st);
+	if (ret)
+		goto out;
+	printf("      spw%u: TX channel %u, RX channel %u, node %u. RX timeouts below reset this\n"
+	       "      axi_dma IP; the driver recovers from that.\n", nn, txc, rxc, cl->node);
+	diag_link(cl, nn, "before:");
+	ret = ramon_spw_loopback(cl->c, nn, 1, &cl->st);
+	if (ret)
+		goto out;
+	tc_sleep_ms(100);
+	diag_link(cl, nn, "loopback on, +100 ms:");
+	ramon_spw_drain(cl->c, nn, 20, &dropped, NULL);
+	if (dropped)
+		printf("      dropped %u queued packet(s) first\n", dropped);
+
+	printf("   1. SPW packet, wait for its RX size (how the library and tests work)\n");
+	ok = diag_packet(cl, nn, rxc, txc, &tx, &rx, "1");
+	if (!ok) {
+		printf("   2. link sync with loopback on, then the same packet\n");
+		if (ramon_spw_sync(cl->c, nn, &tries, &st)) {
+			printf("      sync failed after %u resets\n", tries);
+		} else {
+			printf("      synced after %u reset(s)\n", tries);
+			synced_ok = diag_packet(cl, nn, rxc, txc, &tx, &rx, "2");
+		}
+		diag_link(cl, nn, "after step 2:");
+	}
+	if (!ok && !synced_ok) {
+		printf("   3. RX DMA without a size: is data from steps 1-2 waiting in the stream?\n");
+		stuck = diag_blind(cl, rxc, txc, &tx, &rx, 0, "3");
+		printf("   4. old xsgdma: RX DMA started, then %u raw bytes sent\n", DIAG_LEN);
+		blind = diag_blind(cl, rxc, txc, &tx, &rx, DIAG_LEN, "4");
+	}
+
+	printf("   verdict: ");
+	if (ok)
+		printf("loopback returns packets with an RX size; spw-loop should pass. Send the\n"
+		       "            full ramon_test output.\n");
+	else if (synced_ok)
+		printf("loopback works once the link is re-synced after enabling it; the library\n"
+		       "            must sync after switching loopback on.\n");
+	else if (stuck || blind)
+		printf("looped data reaches the RX DMA, but no RX size interrupt is raised;\n"
+		       "            SPW_WAIT_RX cannot see loopback traffic.\n");
+	else
+		printf("loopback returns nothing on this FPGA build.\n");
+out:
+	if (!was_on && ramon_spw_loopback(cl->c, nn, 0, &st))
+		tc_fail_st("restoring loopback off", &st);
+	else if (!was_on)
+		diag_link(cl, nn, "loopback off again:");
+	ramon_buf_free(&tx, NULL);
+	ramon_buf_free(&rx, NULL);
+	return ret;
+}
+
 const struct cli_cmd cli_spw_cmds[] = {
 	{ "spwinit", cmd_spwinit, 0, 0, CMD_NEED_SPW, "", "set up SPW and sync every present link" },
 	{ "spwterm", cmd_spwterm, 0, 0, 0, "", "stop the RX threads and free the SPW buffers" },
@@ -794,5 +996,7 @@ const struct cli_cmd cli_spw_cmds[] = {
 	{ "axiloop", cmd_axiloop, 2, 4, 0, "<nn> <size> [items] [count]",
 	  "raw AXI loopback through SPW, with MiB/s (old xsgdma)" },
 	{ "xsgdma", cmd_axiloop, 2, 4, CMD_HIDDEN, "<nn> <size> [items] [count]", "old name of axiloop" },
+	{ "loopdiag", cmd_loopdiag, 0, 1, CMD_NEED_SPW, "[nn]",
+	  "find out why FPGA loopback does not return packets" },
 	{ NULL, NULL, 0, 0, 0, NULL, NULL },
 };

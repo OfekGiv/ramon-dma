@@ -990,6 +990,11 @@ Please send back the output of steps 1-5 (or the JSON line), and anything from `
   only to isolate the RX side. `spw-loop`, `axi-loop` and the SPW part of `stats` depend on it,
   and on the FPGA appending the 16-byte footer in loopback as it does for NN traffic. If they
   fail while `spw-version` passes, it is the loopback path.
+  **Board result (tools 0.1.0):** both fail; the 0-byte packet never came back and
+  `SPW_WAIT_RX` timed out. `ramon_cli loopdiag 0` (tools 0.1.2) tells the possible causes apart:
+  the link needs a re-sync after loopback is switched on; looped data reaches the RX DMA without
+  an RX-size interrupt (the old `xsgdma` never waited for a size, so it could not show this);
+  or loopback returns nothing. The fix depends on which.
 - **The largest SPW packet** the FPGA takes is unknown. `spw-loop` goes up to `--spw-max`
   (default 65536 bytes of payload); lower it if only the largest size fails.
 - `nnupdate` and `nnconf` follow the old CLI's protocol, but have only met the emulator. Try

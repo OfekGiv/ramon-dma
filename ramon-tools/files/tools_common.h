@@ -11,7 +11,7 @@
 #include "ramon_spfi.h"
 
 /* Must equal PV in ramon-tools.bb. */
-#define RAMON_TOOLS_VERSION	"0.1.1"
+#define RAMON_TOOLS_VERSION	"0.1.2"
 
 #define ARRAY_SIZE(a)		(sizeof(a) / sizeof((a)[0]))
 
