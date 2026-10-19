@@ -999,3 +999,440 @@ Please send back the output of steps 1-5 (or the JSON line), and anything from `
   (default 65536 bytes of payload); lower it if only the largest size fails.
 - `nnupdate` and `nnconf` follow the old CLI's protocol, but have only met the emulator. Try
   `nnconf` before `nnupdate`.
+
+## Acceptance test: ramon_accept (tools 0.2.0)
+
+`ramon-tools` 0.2.0 adds a third program, `ramon_accept`: the manual delivery script
+(`old_acceptance_test/DPC_master_delivery_v8.4.2_script.txt`) as automatic steps with a verdict
+each and a summary to keep as the record. This first batch covers the four commands at the top
+of the script. libramon and the driver are unchanged.
+
+| Step | Was | Pass criterion |
+|---|---|---|
+| `rstop-version` | `rdrstopver` | 0x00/0x04/0x08/0x0C read; not 0.0.0; none 0xffffffff; equals `--rstop-version` if given |
+| `rstop-timetag` | `readtimetag` | 0x10 decodes to a valid date and time (two samples, 1.1 s apart) |
+| `sysmon` | `sysmon` | temperatures within limits (default -40..125 C); rails within the limits file, if any |
+| `ddr4` | `ddr4test` | data bus, address bus, whole region with address and inverted-address patterns |
+
+`ramon-tools/files/README.md` has the options, the limits file format and the DDR4 details.
+
+### Build
+
+```sh
+cp -r ramon-tools <proj>/project-spec/meta-user/recipes-apps/   # replaces the 0.1.2 recipe
+petalinux-build -c ramon-tools
+W=<proj>/build/tmp/work/<arch>/ramon-tools/0.2.0-r0
+grep -n "warning\|error:" $W/temp/log.do_compile          # expect nothing
+ls $W/image/usr/bin/ramon_accept $W/image/usr/share/ramon-tools/accept_limits.example
+```
+
+### On the board, in this order
+
+```sh
+ramon_accept --version
+ramon_accept rstop-version rstop-timetag sysmon      # 1. registers (seconds)
+ramon_accept --ddr4-mb 64 ddr4                       # 2. DDR4 on 64 MiB: region, /dev/mem, speed
+ramon_accept ddr4                                    # 3. the whole PL DDR4 (minutes)
+ramon_accept --rstop-version <X.Y.Z> | tee /tmp/accept.log    # 4. everything, as a record
+```
+
+Please send back the output of 1 and 2 (step 2 prints the DT node, region, and MiB/s, which
+tell how long step 3 will take), and the summary of 3.
+
+### Checked here (host, x86_64)
+
+- Builds with `-std=c11 -Wall -Wextra -Wpedantic -Wshadow` without warnings, together with
+  `ramon_cli` and `ramon_test`.
+- Register steps against an `LD_PRELOAD` shim answering GET_INFO and REG_IO: good board; version
+  mismatch, 0xffffffff and 0.0.0; time tag all-ones, zero, counting, and a second sample that
+  does not decode; SYSMON with the example file, a good file, a rail out of range, a hot sensor,
+  a malformed file (bad line, unknown name, min > max, extra field) and a missing file.
+- `ddr4` against a fake `/proc/device-tree` and a sparse file standing in for `/dev/mem` at
+  0x5_0000_0000: label `ddr4_0`; fallback to one label containing `ddr4`; two labels of one
+  node; two nodes (refused, candidates listed); `--ddr4-label`; no `__symbols__`;
+  `#size-cells` 1 and 2; a truncated `reg`; `--ddr4-base/--ddr4-size`; `--ddr4-mb`; an
+  unaligned base; a missing memory device. The file holds the inverted address pattern at the
+  right offsets afterwards.
+- Fault injection: a region whose upper half maps the lower half's pages (an address line stuck
+  low) is reported by the address-bus check as "address bit 22 ... stuck", and the full pass
+  reports half the words wrong with the faulty bit in the XOR column.
+- AddressSanitizer + UBSan over all of the above: clean.
+
+### Open points
+
+- **/dev/mem.** The DDR4 step reaches the PL DDR4 through `/dev/mem`, as the old test did. It
+  works on a kernel with `CONFIG_DEVMEM=y` and without `CONFIG_IO_STRICT_DEVMEM` claiming the
+  range (`CONFIG_STRICT_DEVMEM` alone allows it, since the PL DDR4 is not System RAM). Is that
+  true of the hardened image? If not, the alternative is a driver change: `ramon_dma` maps the
+  `ddr4_0` region itself and offers it through `mmap`.
+- **DDR4 calibration.** The step checks that the FPGA manager reports `operating` before touching
+  the PL. If the FPGA exposes the MIG's `init_calib_complete` in a register, the step should
+  check it too: an access to an uncalibrated DDR4 can hang the bus.
+- **RS-TOP 0x10.** Is it the FPGA build time stamp (fixed) or a running time tag? The step accepts
+  both and says which it saw.
+- **SYSMON limits.** No rail is checked until `/etc/ramon/accept_limits.conf` lists it. The voltage
+  lines in `accept_limits.example` are datasheet starting points for 0.85 V parts, commented out
+  until someone checks them against the fitted part and the schematic.
+
+## Acceptance batch 2: SpaceWire (tools 0.3.0)
+
+Batch 1 (`rstop-version`, `rstop-timetag`, `sysmon`, `ddr4`) passed on the board with tools
+0.2.0. Batch 2 adds three SPW steps and three NN service steps; libramon and the driver are
+unchanged. `nn-config` and `nn-update` change the NN, so they run only when their file option
+is given, also in a run without step names.
+
+| Step | Was | Pass criterion |
+|---|---|---|
+| `spw-link` | `spwinit` | the links to test sync |
+| `spw-nn-loop` | `loopback 0` + `spwsend ... +68 100` | FPGA loopback off, packets to node 68 routed back by the NN: all back once, intact, in order, no RX overrun |
+| `spw-fpga-loop` | `loopback 1` + `spwsend` | the same with FPGA loopback on |
+| `nn-version` | `nnswver` | each tested NN answers with its versions; image contains `--nn-expect` if given |
+| `nn-config` | `nnconf` | configuration acknowledged (0x101); only with `--nn-config [NN=]FILE` |
+| `nn-update` | `nnupdate` | every update packet accepted; only with `--nn-update [NN=]FILE`; runs last, power-cycle after |
+
+Defaults follow the delivery script: payloads of 1 and 4096 bytes, 10000 packets each,
+application type 100, node 68. Unlike the old `spwsend`, at most 32 packets are in flight
+(`--spw-window`), and every returned packet is checked, not only counted.
+
+### Build
+
+```sh
+cp -r ramon-tools <proj>/project-spec/meta-user/recipes-apps/
+petalinux-build -c ramon-tools
+W=<proj>/build/tmp/work/<arch>/ramon-tools/0.3.0-r0
+grep -n "warning\|error:" $W/temp/log.do_compile          # expect nothing
+```
+
+### On the board, in this order
+
+```sh
+ramon_accept spw-link spw-nn-loop                    # 1. far-end loopback through the NN
+ramon_accept spw-fpga-loop                           # 2. FPGA loopback
+ramon_accept --spw-sizes 1,7,64,1023,4096 --spw-seconds 30 spw-nn-loop
+                                                     # 3. more sizes, 30 s each
+ramon_accept nn-version                              # 4. NN versions
+ramon_accept --nn-config 0=<config.json> nn-config   # 5. NN configuration
+ramon_accept --nn-update 0=<package.pkg> nn-update   # 6. NN update, then power-cycle
+ramon_accept --nn-expect <new image version> nn-version     # 7. after the power cycle
+ramon_accept --rstop-version <X.Y.Z> | tee /tmp/accept.log    # 8. batches 1 and 2 together
+```
+
+Please send back the output of 1, 2 and 4-7, and the throughput lines of 3.
+
+### Checked here (host, x86_64)
+
+- Builds without warnings, also with Yocto's hardening flags.
+- An `LD_PRELOAD` fake of `/dev/ramon_dma` with buffers, `mmap`, AXI transfers,
+  `SPW_WAIT_RX`/`SPW_CANCEL`/`SPW_LOOPBACK`, SPW registers and an NN that routes packets
+  addressed to node 68 back (FPGA loopback returns everything): all seven steps pass together.
+- Faults injected in the fake, each reported as such: a dropped packet (lost, and out of order
+  at the next one), a corrupted payload (payload CRC), two packets swapped (out of order; the
+  late one is reported in the next size, not counted there), a duplicate (repeated), footer
+  error flags, FPGA loopback or NN returning nothing (lost after 2 s, no hang), a slow
+  receiver with a short RX queue (driver overrun; passes with `--spw-window 4`), no link, an
+  NN named in `--spw-nn` whose link is down, both NNs synced, `--spw-seconds` with sizes 0 to
+  6200, and 150000 packets (the 16-bit packet id wraps twice).
+- The fake NN also answers version, configuration and software-update requests: versions
+  printed and `--nn-expect` matched or refused; empty version strings and a silent NN fail;
+  configuration acknowledged, refused (attribute 0x102), too large, missing; per-NN files on
+  two NNs, and a file for an NN whose link is down; update accepted (and the new image version
+  seen by the next `nn-version`), refused at the start ("application running"), refused at
+  the end ("bad package CRC"), NN silent mid-update (3 s timeout), empty package; malformed
+  `NN=FILE` options refused.
+- ThreadSanitizer, AddressSanitizer and UBSan over those runs: clean.
+
+### Open points
+
+- **nn-update and nn-config** have still only met the emulator (as with `ramon_cli`); try
+  `nn-config` first. The progress lines tell how long an update takes on the real NN.
+- **FPGA loopback carrying data** failed with tools 0.1.0 (see the phase 2 open points), and the
+  `loopdiag` result has not come back yet. If `spw-fpga-loop` fails while `spw-nn-loop` passes,
+  please send `ramon_cli loopdiag 0`.
+- **Window.** 32 packets in flight keeps the driver's RX queue (64) from overrunning. If the
+  delivery requires the old unpaced burst, `--spw-window 100000` reproduces it; an overrun then
+  fails the size.
+
+### Tools 0.3.1: SPW link sync as long as the old spw_init()
+
+- **Board result (0.3.0):** `ramon_accept spw-link` failed on both links, while NN A syncs with
+  the old driver and tools.
+- **Cause:** the reset sequence is the same in both stacks (while `(0x28 & 7) != 5`, write 0 to
+  `0x1C`, sleep 10 ms), but `ramon_accept` gave up after 200 resets (2 s) to spare the uncabled
+  NN B. The old `spw_init()`, `ramon_smoke`, `ramon_cli spwsync` and libramon's default all try
+  1000 times (10 s). NN A evidently needs more than 2 s.
+- **Fix:** 1000 resets by default, as the old tool; `--spw-sync-tries N` changes it. With
+  `--spw-nn`, only the named NNs are synced, so `--spw-nn 0` does not spend 10 s on NN B.
+  `spw-link` now prints how many resets and seconds NN A needed, or the raw `0x28` when it gave up.
+- Checked here: a fake link that syncs after 500 resets passes with the default and fails with
+  `--spw-sync-tries 200` (the 0.3.0 behaviour, both links down as on the board).
+- `ramon_test` still uses 200 resets; if its `spw-sync` fails the same way, it has the same cause.
+
+On the board:
+
+```sh
+ramon_cli spwsync 0                  # confirms first: 1000 resets on 0.3.0 already
+ramon_accept --spw-nn 0 spw-link     # 0.3.1: prints "synced after N reset(s), T s"
+```
+
+### libramon 0.2.0, tools 0.3.2, smoke 0.8.16: SPW core enable (0x2C)
+
+- **Board finding (user):** the SPW core must be enabled by writing 1 to SPW register `0x2C`
+  (`spw_reg_io(nn, 1, 0x2C, 1)`) when the application starts SPW. Without it the link never syncs,
+  however often `0x1C` resets it. Neither the old code nor the new wrote `0x2C`; that explains
+  `spw-link` and `ramon_smoke spw` failing on a clean `ramon-dma` image (any earlier syncs came
+  from a core that something else had already enabled).
+- **libramon:** new `ramon_spw_enable(c, nn, st)` writes 1 to `RAMON_SPW_REG_ENABLE` (`0x2C`).
+  `ramon_spw_init()` calls it for every NN it sets up; `ramon_spw_sync()` calls it before its
+  first reset, so `ramon_cli spwsync` works without a full init. Library version 0.2.0.
+- **ramon_smoke:** its own sync loop writes `0x2C = 1` first.
+- **ramon_cli spwstatus** prints `0x2c` with the other SPW registers.
+- **Driver unchanged:** the enable stays in user space, as asked.
+- Checked here: the fake device now refuses to sync until `0x2C` is 1. With it, `ramon_accept`
+  (`spw-link`, both loop steps, `nn-version`), `ramon_cli spwsync`/`spwinit`/`spwstatus` and
+  `ramon_smoke spw` (sync + version round trip) pass; a write trace shows `0x2C = 1` before the
+  first `0x1C` reset. `make check` passes; builds clean, also with Yocto's hardening flags.
+
+Build all three (ramon-tools links libramon statically, so it must be rebuilt after ramon-api):
+
+```sh
+cp -r ramon-api ramon-tools ramon-smoke <proj>/project-spec/meta-user/recipes-apps/
+petalinux-build -c ramon-api && petalinux-build -c ramon-tools && petalinux-build -c ramon-smoke
+```
+
+On the board:
+
+```sh
+ramon_accept --version                 # 0.3.2, libramon 0.2.0
+ramon_cli spwstatus 0                  # 0x2c=0x1 once anything has initialised SPW
+ramon_smoke spw
+ramon_accept --spw-nn 0 spw-link spw-nn-loop spw-fpga-loop nn-version
+```
+
+### libramon 0.2.1, tools 0.3.3: re-sync after FPGA loopback on; link rate in Mbit/s
+
+- **Board result (tools 0.3.2):** `spw-nn-loop` passes; `spw-fpga-loop` fails.
+- **Cause (most likely):** a loopback change takes effect when the link syncs again. The old
+  script says so ("loopback must be set before spwinit ... the loopback register is written to PL
+  when spwinit command is issued"), and the old flow always ran `loopback 1`, then `spwinit`.
+  `ramon_spw_loopback()` re-synced only after switching loopback *off*; after switching it *on*
+  it waited 10 ms and returned, so the link never ran in loopback and nothing came back. This is
+  probably also the "FPGA loopback carrying data" open point from tools 0.1.0: `ramon_test
+  spw-loop`/`axi-loop` and `ramon_cli spwloop`/`loopback` use the same call.
+- **Fix:** `ramon_spw_loopback()` runs `ramon_spw_sync()` after any change, so with loopback on
+  the link syncs with itself; a failure to sync is returned. `ramon_smoke` uses loopback only to
+  keep NN traffic away during its wait/cancel checks and needs no change.
+- Checked here: the fake device now applies a loopback change only after the link re-syncs and
+  sends nothing while the link is down. With 0.2.0's loopback code `spw-fpga-loop` loses every
+  packet ("lost 32, back 0", as expected on the board); with 0.2.1 it passes.
+- **Link rate.** `spw-nn-loop` measured 228 packets/s at 4096 bytes: 228 x (4096 + 40 + 1 EOP)
+  x 10 bits = 9.4 Mbit/s, i.e. the 10 Mbit/s every SpaceWire link starts at; 1-byte packets give
+  ~4.8 Mbit/s (per-packet overhead). The link seems to stay at its start rate. Question for the
+  FPGA team: what rate should NN A run at, and is it set by a register? Neither the old nor the
+  new code writes one. The loop steps now print "Mbit/s on the link" (10 bits per character,
+  header + payload + EOP) to compare with that rate.
+
+Build: `petalinux-build -c ramon-api && petalinux-build -c ramon-tools` (0.2.1 / 0.3.3).
+On the board:
+
+```sh
+ramon_accept --version                            # 0.3.3, libramon 0.2.1
+ramon_accept --spw-nn 0 spw-link spw-fpga-loop spw-nn-loop
+ramon_test spw-loop axi-loop                      # the 0.1.0 loopback open point, same fix
+```
+
+## Acceptance batch 3: SPFI (tools 0.4.0)
+
+Nine SPFI steps in `accept_spfi.c`, following the delivery script. libramon and the driver are
+unchanged (libramon 0.2.1 from the SPW fixes).
+
+| Step | Was | Pass criterion |
+|---|---|---|
+| `spfi-link` | `spfidrvinit`, `spfireg +204` | `0xCC` low byte `0x88` |
+| `spfi-prep` | `spwdps 0`, `spfiinit 0`, `spfifmt`, `spfiginfo 1` | DPS 0x101, INIT answered, FORMAT (`--spfi-format`), table read, room for 2 test streams |
+| `spfi-stream` | #2: 150 x 1000, verify | every page read back intact |
+| `spfi-perf` | #3, #5: 150 x 1000, 5000 x 100 | no errors; MiB/s |
+| `spfi-large` | #4: 5000 x 100, verify | every page intact |
+| `spfi-odd` | #10-#12: 257, 4999, 1 x 100, verify | every page intact |
+| `spfi-rxtx` | `spfirxtx` #17-#20 | no errors, reads intact; MiB/s |
+| `spfi-long` | #13: 5000 x 200 (`--spfi-long`) | no errors; MiB/s |
+| `spfi-soak` | `spfirxtx` #21-#24 (`--spfi-soak`) | no errors, reads intact; cycles over 1 s counted |
+
+Differences from the old flow, on purpose:
+
+- **Streams.** Each test opens new streams on free ids and closes and deletes them, also after a
+  failure. The old script reused fixed ids and only closed them, so a later run needed FORMAT.
+- **FORMAT** only with `--spfi-format`, since it erases the NN's streams. Without it `spfi-prep`
+  fails if fewer than 2 ids are free or 7 or 8 streams are open, and says so.
+- **Verification.** Every page carries a 16-byte stamp (stream, run, page), so a read of the wrong
+  run or page fails too. The old `spfirxtx` did not check the read data; `spfi-rxtx` and
+  `spfi-soak` check the last read of each size in every cycle, outside the timed part.
+- **Old `spfirxtx` arguments** map to `{wpages1, wpages2}`, `{rpages1, rpages2}`,
+  `{wnum1, wnum2}`, `{rnum1, rnum2}`, cycles; cycles run back to back and their time is reported
+  against 1 s ("slack"), as before.
+
+### Build
+
+```sh
+cp -r ramon-tools <proj>/project-spec/meta-user/recipes-apps/
+petalinux-build -c ramon-tools        # 0.4.0 (ramon-api 0.2.1 must be built first)
+```
+
+### On the board, in this order
+
+```sh
+ramon_accept --version                                         # 0.4.0, libramon 0.2.1
+ramon_accept spfi-link
+ramon_accept --spfi-format spfi-prep                           # erases the NN's streams
+ramon_accept --spfi-scale 1 spfi-stream spfi-perf spfi-large spfi-odd spfi-rxtx   # quick: 1%
+ramon_accept spfi-stream spfi-perf spfi-large spfi-odd spfi-rxtx                  # full
+ramon_accept --spfi-long --spfi-soak spfi-long spfi-soak      # about 45 minutes
+```
+
+Please send the output of the quick run first: its MiB/s figures tell how long the full run takes
+(the full default steps move about 60 GB through the NN).
+
+### Checked here (host, x86_64)
+
+- Builds without warnings, also with Yocto's hardening flags; all 15 default steps pass together
+  against the fake device.
+- The fake NN stores streams of 16 KiB pages (each distinct page body once), answers INIT, FORMAT,
+  OPEN, FLUSH, CLOSE, DELETE, GET_ALL and the table, DATA_WRITE and READ_STREAM, and DPS over SPW.
+- Faults, each reported: a corrupted page ("data differs"), the wrong page returned ("stamp
+  differs", with the stamp read), SPFI link down, a data write that fails (the stream is still
+  deleted: no streams left on the NN), 7 streams left open (prep and the concurrent test refuse;
+  `--spfi-format` clears it), DPS refused; `spfi-long`/`spfi-soak` join a run without step names
+  only with their flags; `--spfi-scale 1` soak: 7 and 70 cycles with per-cycle times.
+- ThreadSanitizer, AddressSanitizer and UBSan over those runs: clean.
+
+### Open points
+
+- The fake does not prove the NN's behaviour. In particular: the NN's storage limit (the old
+  script notes stream #16, 5000 x 254 = 20 GB in one stream, "fails vs. NN"); the 5000 x 100
+  tests write 8 GB per stream.
+- The two soak runs write about 220 GB each into one stream, as the old script did. If the NN runs
+  out of space, the write fails and the step reports it.
+
+### Tools 0.4.1: SPW test packets within --spw-max (default 4096)
+
+- **Board result (tools 0.4.0, libramon 0.2.1):** `ramon_test spw-loop` now gets packets back
+  through FPGA loopback (the re-sync fix of libramon 0.2.1 works): payloads 0..4096 intact. The
+  16384-byte packet came back with a bad payload CRC while xilinx_dma reported `errors 10` (AXI
+  DMA internal error, a packet that does not fit what the engine expects), and the next TX on
+  channel 1 timed out: the oversize packet wedged the receive path.
+- **Cause:** `ramon_test` ignored `--spw-max` in three places: the size sweep always included
+  16384, the throughput burst used 16 KiB packets, `axi-loop` 64 KiB packets; the default
+  `--spw-max` was 65536. The delivery script never goes above 4096 (and notes 6200 as working).
+- **Fix:** `--spw-max` (default now 4096) bounds every packet of `spw-loop` (sweep, burst,
+  throughput) and the `axi-loop` packet.
+- Checked here: a fake FPGA that corrupts a packet above 6240 bytes and then returns nothing
+  reproduces the board output (`packet 6: flags 0x2, payload 16384`); with 0.4.1 defaults
+  `spw-loop` and `axi-loop` pass.
+- **Questions for the FPGA team:** the largest SPW packet the FPGA handles, and what an oversize
+  packet should do. Today it comes back corrupted and leaves the receive DMA stuck until the
+  axi_dma IP is reset. `ramon_accept --spw-sizes` allows larger sizes for probing; keep them
+  within that limit for acceptance.
+
+```sh
+petalinux-build -c ramon-tools          # 0.4.1
+ramon_test spw-loop axi-loop
+ramon_test --spw-max 6200 spw-loop      # the largest size the old script noted as working
+```
+
+### libramon 0.3.0, tools 0.4.2, smoke 0.8.17: SPW packets above 4096 bytes are dropped
+
+- **User (FPGA):** the largest SPW packet is 4096 bytes of payload; a larger one must be dropped
+  with a message.
+- **Send:** `ramon_spw_send()` and `ramon_spw_send_buf()` refuse a payload above
+  `RAMON_SPW_MAX_PAYLOAD` (4096) before anything reaches the DMA: `RAMON_EL_TOO_LARGE`, "spw0:
+  payload of 4097 bytes is above the SPW maximum of 4096; packet dropped, not sent", counter
+  `tx_too_large`. `ramon_cli axiloop` (raw AXI) checks the same; `ramon_smoke`'s own packet builder
+  too. `ramon_accept --spw-sizes` and `ramon_test --spw-max` accept at most 4096.
+- **Receive:** a packet whose payload is above 4096 is still taken off the FPGA (the driver's
+  next size belongs to the next packet), then dropped with a warning ("spw0: dropped a received
+  packet of 5056 bytes: payload above the SPW maximum of 4096"), counter `rx_too_large`; a caller
+  receiving in its own thread gets `RAMON_EL_TOO_LARGE`, drain only counts it. `ramon_cli
+  spwstatus` prints both counters.
+- **Exception, to confirm with the FPGA team:** the NN software update keeps the old tool's packet
+  sizes: data packets carry 4100 payload bytes (4-byte prefix + 4096-byte chunk) and the end
+  packet 4104 (8-byte prefix + chunk). The old `cli_sw_update()` sent `sizeof(sw_update_data_t)`
+  and `sizeof(sw_update_end_t)`, i.e. the same sizes, and its updates worked; the corruption we saw
+  was on the receive side, with a 16 KiB packet. If the FPGA's limit also applies to these, the
+  update chunk has to shrink, which changes the NN's update protocol.
+- Checked here (fake device): 4096 sent, 4097 refused and counted; `axiloop` with a 4137-byte
+  packet refused; an NN answer of 5000 payload bytes dropped with the warning, both when the
+  request receives in its own thread (the request fails with the drop message) and with the RX
+  thread (warning, then the request times out); `--spw-sizes 4097` and `--spw-max 5000`
+  refused; `nn-update` passes with 4100/4104-byte packets. `make check` passes; builds clean, also
+  with Yocto's hardening flags.
+
+Build `ramon-api`, then `ramon-tools`, then `ramon-smoke`.
+
+### Driver 0.8.9: an SPFI node with one reg entry gives SPFI0
+
+- **Board result (new image, only `ramon-dma`):** `ramon_cli info` showed `spfi_mask 0x0`, and the
+  driver logged `spfi: node /amba_pl@0/nanrec_spfi_wr@a0050000 has 1 reg entries, need 2; SPFI
+  disabled`. The new device tree describes SPFI0 only (SPFI1 is not used on this board).
+- **Cause:** discovery wanted `reg[0]` and `reg[1]` (and both interrupts) and disabled SPFI
+  altogether otherwise.
+- **Fix:** per NN. `reg[n]` enables SPFI NN n (its register window); `interrupts[n]` enables its
+  commands. A node with one `reg` entry gives SPFI0, logged at info level ("has 1 reg entry; SPFI1
+  and above absent"); a node with none still disables SPFI with a warning. The DT memory labels
+  (TX read-offset and RX message tables) are looked up only for the NNs the node describes, so
+  the absent NNB labels no longer warn. The `spfi_mask` module parameter (default 0x1) still
+  decides which NNs are used.
+- **Not compiled here** (no kernel tree). No new kernel symbols, so `ramon_dma.ksyms` is unchanged.
+- **ramon_accept 0.4.3:** with `spfi_mask 0x0` the SPFI steps now say "the driver reports no SPFI
+  NN (GET_INFO spfi_mask 0x0): see dmesg" instead of "no SPFI link up".
+
+```sh
+petalinux-build -c ramon-dma            # 0.8.9; then reboot or rmmod/insmod
+dmesg | grep -i spfi                    # "spfi0 ...: irq N", "has 1 reg entry; SPFI1 and above absent"
+ramon_cli info                          # spfi_mask 0x1
+ramon_accept spfi-link spfi-prep
+```
+
+### libramon 0.3.1, tools 0.4.4, smoke 0.8.18: SPFI write channel 4 on the current design
+
+- **Board result (new image):** `ramon_accept spfi-link` failed in `ramon_spfi_init`: "spfi0:
+  channel 5 is not an AXI MEM_TO_DEV channel". The current FPGA design has one SPFI write channel,
+  AXI channel **4** (user); index 5 is now past the AXI channels (a ZDMA channel).
+- **Fix:** the default write channel is 4 for both NNs (`RAMON_SPFI_CHAN_NN0/NN1`, user decision);
+  `ramon_smoke` the same. `--spfi-chans A,B` overrides it in `ramon_accept` (new), `ramon_test`,
+  `ramon_cli` and `ramon_smoke`; the earlier design needs `--spfi-chans 5,4`.
+- `spfi-link` now judges the link from the register it just read (it printed "down" whenever
+  `ramon_spfi_init` failed) and fails a down link explicitly; the library's channel message is
+  shortened to fit the status (it was cut off at 96 characters).
+- Checked here: a fake with the current layout (AXI 0-3 SPW, 4 SPFI write, ZDMA from 5)
+  reproduces the board error with `--spfi-chans 5,4` and passes `spfi-link`, `spfi-prep`,
+  `spfi-stream`, `spfi-odd`, `spfi-rxtx` and `ramon_test spfi-stream` with the default, also with
+  both NNs enabled on channel 4.
+- **Open:** the same board run read `0xCC = 0x44`, low byte not `0x88`, so the SPFI0 link is down.
+  On the earlier design `0xCC` read `0x4488`, i.e. `0x44` was the other (down) half. See the
+  questions in the session notes: does SPFI need an enable on the new design, as SPW does with
+  `0x2C`?
+
+### libramon 0.4.0, tools 0.4.5, smoke 0.8.19: SPW before the SPFI link check
+
+- **Board result:** `ramon_accept spfi-link` read `0xCC = 0x44` (link down), while SPFI worked in
+  `ramon_smoke`. Review: `ramon_smoke` checks the link the same way, but its default sequence runs
+  `spw` (SPW core enable `0x2C` + link sync) before `spfi`, as the delivery script ran `spwinit`
+  before `spfireg +204`. On the current design the SPFI link comes up only after the SPW core of
+  the same NN is enabled and synced. `ramon_accept spfi-link` did not touch SPW;
+  `ramon_spfi_prep()` (`ramon_cli spfiprep`, `ramon_test --prep`, `ramon_accept spfi-prep`) and
+  `ramon_smoke spfiprep` checked the SPFI link *before* their SPW sync, so all of them fail after a
+  fresh boot unless SPW was set up first.
+- **Fix:** SPW first, then the SPFI link, waited for up to 2 s:
+  - libramon: `ramon_spfi_prep()` runs SPW init + sync, then the new
+    `ramon_spfi_wait_link(c, nn, timeout_ms, &raw, st)`, then DPS and INIT;
+  - `ramon_accept`: the SPFI steps set up SPW (only the SPFI NNs' links unless `--spw-nn` is
+    given, so an uncabled NN costs no 10 s) and wait for each SPFI link;
+  - `ramon_smoke spfiprep`: SPW enable + sync, then the link (waited for), then DPS.
+- Checked here: a fake whose SPFI link reads `0x44` until the SPW core is enabled and synced, then
+  `0x88`; from a fresh state `ramon_accept spfi-link` (0.2 s), `spfi-prep`, `ramon_cli spfiprep 0`
+  and `ramon_smoke spfiprep 0` pass; the full default run (15 steps) and an SPFI-only run pass.
+
+```sh
+petalinux-build -c ramon-api && petalinux-build -c ramon-tools && petalinux-build -c ramon-smoke
+ramon_accept spfi-link                                  # after a fresh boot
+ramon_accept --spfi-format spfi-prep spfi-stream
+```

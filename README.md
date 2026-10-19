@@ -22,7 +22,7 @@ unchanged.
 | `ramon-dma/ramon-dma.bb`, `ramon-dma/files/` | module recipe and sources; `ramon_dma_uapi.h` is the ABI |
 | `ramon-smoke/ramon-smoke.bb`, `ramon-smoke/files/ramon_smoke.c` | on-target test tool |
 | `ramon-api/ramon-api.bb`, `ramon-api/files/` | libramon: the static C library customers link (`README.md` there) |
-| `ramon-tools/ramon-tools.bb`, `ramon-tools/files/` | `ramon_cli` (successor of `dmaapi_testv2`) and `ramon_test` (automatic tests) |
+| `ramon-tools/ramon-tools.bb`, `ramon-tools/files/` | `ramon_cli` (successor of `dmaapi_testv2`), `ramon_test` (automatic tests) and `ramon_accept` (board acceptance test) |
 | `linux-xlnx/ramon_dma.ksyms` | export whitelist for kernels built with `CONFIG_TRIM_UNUSED_KSYMS` |
 | `BUILD_NOTES.md` | per-step build/test history, board results, open questions |
 
@@ -80,7 +80,7 @@ All are read-only after load.
 |---|---|
 | AXI DMA channels | own node `xlnx,nanrec-axidmasg-1.0`: `dmas` / `dma-names`; **channel index = position in `dmas`**; direction from the child `xlnx,axi-dma-mm2s-channel` / `-s2mm-channel` |
 | SPW NN A / NN B | `xlnx,nanrec-spw-wr-1.0` nodes in tree order: `reg[0]`, `interrupts[0]` |
-| SPFI NN0 / NN1 | first `xlnx,nanrec-spfi-wr-1.0` node: `reg[n]`, `interrupts[n]` |
+| SPFI NN0 / NN1 | first `xlnx,nanrec-spfi-wr-1.0` node: `reg[n]`, `interrupts[n]`; a node with one `reg` entry describes NN0 only |
 | SPFI RX message table / TX read-offset table | DT labels `vH_RS_nanrec_spfi_top_spfi_rx_msg_mem_ctrl_nn{a,b}` / `..._tx_rd_offset_ctrl_nn{a,b}` via `/__symbols__` |
 | RS-TOP | `xlnx,nanrec-rs-top-1.0`; probe writes 1 to offset `0x40` (TRST/SPI_EN), as before |
 | reg-access windows | `reg-access` node: `reg-devices` phandles (up to 8), names from `reg-device-names` |
@@ -234,6 +234,8 @@ More tests, run individually:
 `ramon_test` (in `ramon-tools`) tests the same board through libramon: SPW loopback write-read
 and NN round trips, SPFI stream write/read with throughput, register access, buffers, AXI and
 ZDMA. `ramon_test --list` shows the tests. `ramon_cli` is the interactive command line.
+`ramon_accept` is the board acceptance test: the old manual delivery script as automatic steps
+with a verdict each (`ramon_accept --list`).
 
 ## Open questions for the FPGA team
 
