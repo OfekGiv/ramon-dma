@@ -19,7 +19,7 @@
  *   ramon_smoke spwsend <nn> <dst> <proto> <app> <attr> [hexpayload]
  *                                     any SPW message; the reply is printed
  *   ramon_smoke spfiprep [nn] [--format]
- *                                     the old SPFI bring-up: 0xCC == 0x88, spwdps, INIT 0,
+ *                                     the SPFI bring-up: SPW enable + sync, 0xCC == 0x88, spwdps, INIT 0,
  *                                     FORMAT only with --format (erases all streams), table
  *   ramon_smoke spfidel <nn> <sid>    CLOSE (if open) + DELETE one stream, e.g. a leftover
  *   ramon_smoke spficmd <nn> <op> [p] one SPFI short command (p = stream id / init type / tod),
@@ -32,7 +32,7 @@
  * Options: -d DEV (default /dev/ramon_dma), --node N (our SPW node id, default 68,
  * as the old "spwappinit 0 +68"), --target N (NN node id for the version
  * request, default 0x41, as the old get_nn_version()), --spfi-chans A,B (AXI
- * write channel of NN0,NN1, default 5,4 as the old spfidrvinit), --spfi-init
+ * write channel of NN0,NN1, default 4,4; the earlier FPGA design used 5,4), --spfi-init
  * (send INIT type 0 before the SPFI stream test), --spfi-stream N (first stream id,
  * default the highest free one), --spfi-pages N (pages per write, default 8,
  * max 64), --minutes N (--stress).
@@ -65,7 +65,7 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.15"
+#define SMOKE_VERSION		"0.8.19"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -99,6 +99,7 @@
 #define SPW_WAIT_MS		3000
 #define SPW_SHORT_WAIT_MS	200
 #define SPW_RESET_REG	0x1C
+#define SPW_ENABLE_REG	0x2C	/* write 1 to enable the core; it syncs only then */
 #define CANCEL_AFTER_MS		300
 #define ZDMA_LIST_N		100
 #define ZDMA_LIST_BUF		(4 * 1024 * 1024)
@@ -1166,12 +1167,17 @@ static void spw_drain(struct spw_nn *s)
 		printf("      spw%u: drained %d unsolicited packet(s)\n", s->nn, n);
 }
 
-/* the old spw_init(): reset the core until the link reports synced; 0 synced, 1 not, -1 error */
+/*
+ * Enable the core (0x2C = 1), then the old spw_init(): reset the core until
+ * the link reports synced; 0 synced, 1 not, -1 error
+ */
 static int spw_sync(struct spw_nn *s)
 {
-	uint32_t v = 0, zero = 0;
+	uint32_t v = 0, zero = 0, one = 1;
 	int tries;
 
+	if (reg_io(s->win, 0, RAMON_REG_OP_WRITE, SPW_ENABLE_REG, &one))
+		return -1;
 	for (tries = 0; tries < SPW_SYNC_TRIES; tries++) {
 		if (reg_read(s->win, 0, SPW_LINK_STATUS, &v))
 			return -1;
@@ -1309,7 +1315,7 @@ struct spw_pkt {
 #define SPW_DPS_APP_TYPE	1
 #define SPW_DPS_ATTRIBUTE	0x01
 #define SPW_DPS_REPLY_ATTR	0x101
-#define SPW_MAX_PAYLOAD		4096
+#define SPW_MAX_PAYLOAD		4096	/* the FPGA's largest SPW payload */
 
 static struct spw_msg spw_version_msg(void)
 {
@@ -1328,6 +1334,11 @@ static int spw_build(struct spw_pkt *pkt, const struct spw_msg *m)
 {
 	struct spw_hdr *h;
 
+	if (m->len > SPW_MAX_PAYLOAD) {
+		fail("SPW payload of %u bytes is above the maximum of %u; packet dropped, not sent",
+		     m->len, SPW_MAX_PAYLOAD);
+		return -1;
+	}
 	pkt->len = SPW_HDR_BYTES + m->len;
 	if (mbuf_new(&pkt->buf, pkt->len))
 		return -1;
@@ -1598,7 +1609,7 @@ _Static_assert(sizeof(struct spfi_record) == SPFI_REC_BYTES, "table record");
  * AXI write channel per SPFI NN, as the old spfidrvinit: NN0 = 5 (axi_dma at
  * 0xa0020000, confirmed on the board with the old stack), NN1 = 4.
  */
-static uint32_t spfi_chan[RAMON_NN_COUNT] = { 5, 4 };
+static uint32_t spfi_chan[RAMON_NN_COUNT] = { 4, 4 };	/* one SPFI write channel, 4 (5,4 on the earlier design) */
 static int spfi_init_first;
 static int spfi_format;
 static uint32_t spfi_pages = 8;			/* per write, --spfi-pages */
@@ -1624,6 +1635,22 @@ static int spfi_link_up(uint32_t nn)
 	}
 	printf("      spfi%u: link status 0x%x at 0xCC, low byte not 0x%x\n", nn, v, SPFI_LINK_UP);
 	return 0;
+}
+
+/* polls 0xCC quietly for up to ms, then reports as spfi_link_up() */
+static int spfi_link_wait(uint32_t nn, unsigned ms)
+{
+	char win[8];
+	unsigned waited;
+	uint32_t v;
+
+	snprintf(win, sizeof(win), "spfi%u", nn);
+	for (waited = 0; waited < ms; waited += 10) {
+		if (reg_read(win, 0, SPFI_LINK_STATUS, &v) || (v & SPFI_LINK_MASK) == SPFI_LINK_UP)
+			break;
+		sleep_ms(10);
+	}
+	return spfi_link_up(nn);
 }
 
 static int spfi_cmd(uint32_t nn, uint32_t opcode, struct ramon_spfi_cmd *c, const char *what)
@@ -2278,8 +2305,9 @@ out:
 }
 
 /*
- * ramon_smoke spfiprep [nn] [--format]: the old bring-up
- * spfireg +204 (0x88), spwdps, spfiinit 0, [spfifmt], spfiginfo
+ * ramon_smoke spfiprep [nn] [--format]: the bring-up: SPW enable and sync (the
+ * delivery script's spwinit, which the SPFI link needs), spfireg +204 (0x88),
+ * spwdps, spfiinit 0, [spfifmt], spfiginfo
  */
 static void test_spfiprep(void)
 {
@@ -2295,15 +2323,18 @@ static void test_spfiprep(void)
 		fail("spfi%u is not present", nn);
 		return;
 	}
-	if (!spfi_link_up(nn)) {
-		fail("spfi%u: link not up; the old flow requires 0x88 in the low byte of 0xCC", nn);
-		return;
-	}
-	pass("spfi%u: link up", nn);
+	/* the SPFI link comes up only after the SPW core is enabled and synced */
+	spfi_link_up(nn);
 	spfi_diag(nn, "at start");
 	if (spw_open_link(&s, nn))
 		return;
-	spfi_diag(nn, "after SPW link sync");
+	spfi_diag(nn, "after SPW enable and link sync");
+	if (!spfi_link_wait(nn, 2000)) {
+		fail("spfi%u: link not up after the SPW enable and sync (0xCC low byte must be 0x88)", nn);
+		mbuf_del(&s.scratch);
+		return;
+	}
+	pass("spfi%u: link up", nn);
 	spw_dps(&s);
 	spw_drain(&s);
 	mbuf_del(&s.scratch);
