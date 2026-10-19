@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* Helpers shared by ramon_cli and ramon_test */
+/* Helpers shared by ramon_cli, ramon_test and ramon_accept */
 #ifndef TOOLS_COMMON_H
 #define TOOLS_COMMON_H
 
@@ -11,7 +11,7 @@
 #include "ramon_spfi.h"
 
 /* Must equal PV in ramon-tools.bb. */
-#define RAMON_TOOLS_VERSION	"0.1.2"
+#define RAMON_TOOLS_VERSION	"0.4.5"
 
 #define ARRAY_SIZE(a)		(sizeof(a) / sizeof((a)[0]))
 
@@ -44,7 +44,7 @@ void tc_hexdump(const void *p, size_t n, size_t base, size_t max);
 /* ---- parsing: decimal, 0x hex, 0 octal; the whole string must be a number ---- */
 int tc_parse_u64(const char *s, uint64_t *v);
 int tc_parse_u32(const char *s, uint32_t *v);
-/* "5,4" */
+/* "4,4" */
 int tc_parse_pair(const char *s, uint32_t v[2]);
 
 /* ---- system ---- */

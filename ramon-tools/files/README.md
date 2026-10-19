@@ -1,9 +1,10 @@
-# ramon_cli and ramon_test
+# ramon_cli, ramon_test and ramon_accept
 
-Two programs built on libramon. `ramon_cli` replaces the old `dmaapi_testv2`
+Three programs built on libramon. `ramon_cli` replaces the old `dmaapi_testv2`
 shell. `ramon_test` runs the board tests automatically and reports PASSED or
-FAILED. The driver-level negative tests (`--errors`, `unbind`, `kill`, CMA
-exhaustion) stay in `ramon_smoke`.
+FAILED. `ramon_accept` is the board acceptance test: the old manual delivery
+script as steps with a verdict each. The driver-level negative tests
+(`--errors`, `unbind`, `kill`, CMA exhaustion) stay in `ramon_smoke`.
 
 ## ramon_cli
 
@@ -103,11 +104,11 @@ error.
 | `zdma` | copies, a 100-entry list, MiB/s, 4 threads |
 | `stats` | driver counters follow the traffic; reset |
 | `spw-sync` | at least one SPW link syncs |
-| `spw-loop` | loopback write-read: payloads of 0 bytes to `--spw-max`, a 32-packet burst in order with no overrun, round-trip MiB/s |
+| `spw-loop` | loopback write-read: payloads of 0 bytes to `--spw-max` (default 4096), a 32-packet burst in order with no overrun, round-trip MiB/s; no packet is larger than `--spw-max` |
 | `spw-version` | NN version request, received in the caller's thread and through the RX thread |
 | `spw-dps` | DPS answered with 0x101 |
 | `spw-cancel` | RX thread stop time, one receiver per NN, request timeout |
-| `axi-loop` | raw AXI scatter-gather TX, loopback, RX, compared, MiB/s (the old `xsgdma`) |
+| `axi-loop` | raw AXI scatter-gather TX, loopback, RX, compared, MiB/s (the old `xsgdma`); one packet of `--spw-max` payload bytes |
 | `spfi-link` | link state (0xCC), stream table |
 | `spfi-stream` | open, write, flush, read back, verify, CRC, delete |
 | `spfi-perf` | write and read MiB/s for 1, 8 and `--spfi-pages` pages, each read verified; data is filled and checked outside the timed part |
@@ -122,9 +123,118 @@ previous setting. The SPFI tests use free stream ids and delete what they
 create. The soak test writes one small stream and then only reads, to spare the
 NN's storage.
 
+## ramon_accept
+
+```sh
+ramon_accept                              # every step
+ramon_accept --rstop-version 3.2.1        # also check the RS-TOP version of the delivery
+ramon_accept sysmon ddr4                  # only these
+ramon_accept --ddr4-mb 256 ddr4           # a quick DDR4 check on the first 256 MiB
+ramon_accept spw-link spw-nn-loop spw-fpga-loop
+ramon_accept --spw-seconds 60 spw-nn-loop # SPW for a minute per size
+ramon_accept --spfi-format spfi-link spfi-prep spfi-stream   # the SPFI delivery flow
+ramon_accept --spfi-scale 10 spfi-perf spfi-large spfi-odd spfi-rxtx   # SPFI at 10% of the runs
+ramon_accept --spfi-long --spfi-soak spfi-long spfi-soak     # the long SPFI runs (about 45 min)
+ramon_accept --nn-expect 4.4.0.1 nn-version
+ramon_accept --nn-config 0=config_2SPF_4GBps_DPC.json nn-config
+ramon_accept --nn-update 0=RS3_4.4.0.1.pkg nn-update   # then power-cycle
+ramon_accept | tee accept-$(date +%F).log # keep the record
+ramon_accept --list                       # the steps
+```
+
+The output starts with the tool, library and driver versions, the host, the
+kernel and the date. Each step prints its readings, then `ok:` or `FAIL:`. A
+summary with one line per step ends the run, then `PASSED` or `FAILED`. The
+exit status is 0 for PASSED, 1 for FAILED and 2 for a usage error. A device
+that does not open fails only the steps that need it.
+
+| Step | Was | Checks |
+|---|---|---|
+| `rstop-version` | `rdrstopver` | RS-TOP version (0x00, 0x04, 0x08) and configuration (0x0C) read; not 0.0.0, no register reads 0xffffffff; equal to `--rstop-version` if given |
+| `rstop-timetag` | `readtimetag` | RS-TOP time tag (0x10) decodes to a valid date and time; sampled twice 1.1 s apart, and reported as fixed or counting |
+| `sysmon` | `sysmon` | PS and PL temperatures within limits (default -40..125 C); all 37 rails printed, and checked against the limits file |
+| `ddr4` | `ddr4test` | PL DDR4: data bus (walking ones and zeros), address bus (aliasing at every power-of-two offset), then the whole region written and read back with its own addresses and with their complement |
+| `spw-link` | `spwinit` | every SPW link that should be tested syncs; IP versions printed |
+| `spw-nn-loop` | `loopback 0`, `spwsend ... +68 100` | FPGA loopback off: packets to our own node (68) go out, the NN routes them back; every packet comes back once, intact and in order; packets/s and MiB/s |
+| `spw-fpga-loop` | `loopback 1`, `spwsend` | the same traffic through the FPGA loopback |
+| `spfi-link` | `spfidrvinit`, `spfireg +204` | SPFI link up: low byte of `0xCC` is `0x88`; IP versions printed |
+| `spfi-prep` | `spwdps 0`, `spfiinit 0`, `spfifmt`, `spfiginfo 1` | SPW DPS answered, INIT answered, FORMAT (only with `--spfi-format`), stream table read, room for the tests (2 free ids, 2 more streams can open) |
+| `spfi-stream` | stream #2: `spfitest +2 +150 +1000 1` | 150 pages x 1000 written, flushed, read back, every page verified |
+| `spfi-perf` | streams #3, #5 (`verify 0`) | 150 x 1000 and 5000 x 100: write and read MiB/s |
+| `spfi-large` | stream #4 | 5000 pages x 100, verified |
+| `spfi-odd` | streams #10, #11, #12 | 257, 4999 and 1 page x 100, verified |
+| `spfi-rxtx` | `spfirxtx`, streams #17-#20 | 100 x 5000 pages written while 80 x 5000 are read, and the reverse; reads verified, MiB/s |
+| `spfi-long` | stream #13 | 5000 x 200, throughput (current measurements); only with `--spfi-long` |
+| `spfi-soak` | `spfirxtx`, streams #21-#24 | the two 20-minute concurrent runs (750 and 7000 cycles), reads verified, cycles over 1 s counted; only with `--spfi-soak` |
+| `nn-version` | `nnswver` | each tested NN answers with its 4KBL, RSBL, image and FW versions; the image version contains `--nn-expect` if given |
+| `nn-config` | `nnconf` | the JSON configuration (at most 4096 bytes) is acknowledged; only with `--nn-config` |
+| `nn-update` | `nnupdate` | the NN accepts every packet of the software package; only with `--nn-update`; power-cycle afterwards |
+
+**SYSMON limits.** A rail is checked only if the limits file names it. The
+file is `/etc/ramon/accept_limits.conf` if it exists, or `--limits FILE`. Each
+line is `name min max`; names are `temp_ps`, `temp_pl` and the `ps.<rail>` /
+`pl.<rail>` names the step prints. `accept_limits.example` (installed to
+`/usr/share/ramon-tools/`) is a starting point: its voltage lines are
+commented out until they are checked against the fitted part and the board
+schematic.
+
+**PL DDR4.** The step finds the region through the device-tree label
+`ddr4_0` (as the old test did), or else the one label containing `ddr4`.
+`--ddr4-label` picks another label; `--ddr4-base` with `--ddr4-size` skips the
+device tree. It needs root and `/dev/mem`: a kernel without `CONFIG_DEVMEM`,
+or with `CONFIG_IO_STRICT_DEVMEM` claiming the range, makes the step fail with
+that reason. It overwrites the tested range. It refuses to run when
+`/sys/class/fpga_manager/fpga0/state` is not `operating`, because an access to
+an unprogrammed PL can hang the CPU or end in a kernel panic. The full test
+writes and reads the region twice; at the uncached speed of `/dev/mem` this
+takes minutes for 4 GiB, so the step prints progress every GiB.
+
+**SpaceWire.** The loop steps send, per payload size (`--spw-sizes`,
+default `1,4096`), `--spw-count` packets (default 10000, as the delivery
+script) or packets for `--spw-seconds`, with application type `--spw-app`
+(default 100) to `--spw-node` (default 68). At most `--spw-window` packets
+(default 32) are in flight, so the driver's 64-entry RX queue cannot overrun.
+Each packet that comes back is checked: header and payload CRC, length,
+application type, packet id in sequence, payload pattern, FPGA footer. A size
+fails on any lost, bad, repeated or out-of-order packet, or a driver RX
+overrun. Packets of an earlier size that arrive late are reported but not
+counted against the current one. Throughput is payload MiB/s from the first
+send to the last packet back; the figure with headers adds the 40-byte header.
+Sizes above 4096 bytes, the FPGA's SPW maximum, are refused (`--spw-sizes`,
+`ramon_test --spw-max`, `ramon_cli spwsend`/`axiloop`); a received packet above
+it is dropped with a warning, and `ramon_cli spwstatus` counts both.
+NNs: every NN whose link syncs, or those named with `--spw-nn 0,1` (an NN
+named there whose link is down fails the step; with `--spw-nn` only those NNs
+are synced). A link is synced as the old `spw_init()` did it: while
+`(0x28 & 7) != 5`, write 0 to `0x1C` and wait 10 ms, up to `--spw-sync-tries`
+times (default 1000, 10 s). The loop steps restore the FPGA loopback setting
+they found.
+
+**SPFI.** A page (the old "offset") is 16 KiB. Every SPFI test opens its own
+streams on free ids and deletes them afterwards, so tests do not depend on each
+other or on the NN's old streams; the NN allows at most 8 open streams.
+`spfi-prep` FORMATs the NN only with `--spfi-format` (it erases every stream,
+as `spfifmt` in the delivery script). Verified tests stamp every page with its
+stream, run and page number, so a read that returns another run's or another
+page's data fails, not only corrupted data. `--spfi-scale PCT` runs PCT% of
+the runs and cycles (for a single-cycle concurrent test, of its writes and
+reads) for a quick check. The concurrent tests report each cycle's time against
+the delivery script's 1 s; cycles over 1 s are counted, not failed. NNs: every
+NN whose SPFI link is up, or `--spfi-nn` (SPFI1 is masked by the driver).
+
+**NN services.** `--nn-config` and `--nn-update` take `FILE` (every tested
+NN) or `NN=FILE` (that NN; it overrides `FILE`), and can be repeated, so
+different NNs can get different files as in the delivery script. A file given
+for an NN whose link is down fails the step. These two steps change the NN, so
+they run only when their option is given, also in a run without step names.
+`nn-update` runs last: the board needs a power cycle afterwards, then
+`ramon_accept nn-version --nn-expect <new version>` confirms the update.
+`--nn-sw-type` sets the software type of the update (default 0, as the old
+tool).
+
 ## Building on a PC
 
 ```sh
 make -C ../../ramon-api/files      # libramon.a first
-make                               # ramon_cli and ramon_test (they need /dev/ramon_dma to run)
+make                               # ramon_cli, ramon_test, ramon_accept (they need /dev/ramon_dma to run)
 ```

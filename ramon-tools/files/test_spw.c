@@ -185,7 +185,7 @@ static void test_spw_sync(void)
 static void test_spw_loop(void)
 {
 	static const uint32_t sizes[] = { 0, 1, 7, 64, 1023, 4096, 16384 };
-	uint32_t nn = (uint32_t)T.spw_nn, id = 0, i, first, max = T.o.spw_max;
+	uint32_t nn = (uint32_t)T.spw_nn, id = 0, i, first, max = T.o.spw_max, tput, last = 0;
 	struct ramon_get_stats g0, g1;
 	struct ramon_spw_config cfg;
 	struct ramon_status st;
@@ -196,7 +196,9 @@ static void test_spw_loop(void)
 	ramon_spw_get_config(T.c, &cfg);
 	if (max > cfg.tx_slot_bytes - RAMON_SPW_HDR_BYTES)
 		max = cfg.tx_slot_bytes - RAMON_SPW_HDR_BYTES;
-	buf = malloc(max > TPUT_LEN ? max : TPUT_LEN);
+	/* every packet stays within --spw-max: a larger one wedges the FPGA's receive path */
+	tput = max < TPUT_LEN ? max : TPUT_LEN;
+	buf = malloc(max ? max : 1);
 	if (!buf) {
 		tc_fail("out of memory");
 		return;
@@ -206,11 +208,12 @@ static void test_spw_loop(void)
 	tc_info("spw%u: loopback on, node %u sends to itself", nn, cfg.node_id);
 
 	/* size sweep, one packet at a time */
-	for (i = 0; i <= ARRAY_SIZE(sizes); i++, id++) {
+	for (i = 0; i <= ARRAY_SIZE(sizes); i++) {
 		uint32_t len = i < ARRAY_SIZE(sizes) ? sizes[i] : max;
 
-		if (i == ARRAY_SIZE(sizes) && max <= sizes[i - 1])
-			break;
+		if (len > max || (i == ARRAY_SIZE(sizes) && max <= last))
+			continue;
+		last = len;
 		if (loop_send(nn, id, buf, len))
 			goto end;
 		if (loop_wait(id + 1, LOOP_WAIT_MS)) {
@@ -219,6 +222,7 @@ static void test_spw_loop(void)
 		}
 		if (L.state[id] != 1)
 			tc_fail("spw%u: the %u-byte packet came back wrong", nn, len);
+		id++;
 	}
 	tc_info("size sweep 0..%u bytes done", max);
 
@@ -226,7 +230,7 @@ static void test_spw_loop(void)
 	if (t_check(ramon_get_stats(T.c, 0, &g0, &st), "GET_STATS", &st))
 		goto end;
 	for (first = id, i = 0; i < BURST; i++, id++)
-		if (loop_send(nn, id, buf, 1024))
+		if (loop_send(nn, id, buf, max < 1024 ? max : 1024))
 			goto end;
 	if (loop_wait(id, 2 * LOOP_WAIT_MS))
 		tc_fail("spw%u: burst: %u of %u packets came back", nn, L.got - first, BURST);
@@ -245,14 +249,14 @@ static void test_spw_loop(void)
 	/* throughput */
 	t0 = tc_now_ns();
 	for (first = id, i = 0; i < BURST; i++, id++)
-		if (loop_send(nn, id, buf, TPUT_LEN))
+		if (loop_send(nn, id, buf, tput))
 			goto end;
 	if (loop_wait(id, 2 * LOOP_WAIT_MS))
 		tc_fail("spw%u: throughput burst: %u of %u packets came back", nn, L.got - first, BURST);
 	ns = tc_now_ns() - t0;
-	tc_info("%u x %u bytes round trip: %.1f MiB/s", BURST, TPUT_LEN,
-		tc_mibps((uint64_t)BURST * TPUT_LEN, ns));
-	t_metric("roundtrip_MiBps", tc_mibps((uint64_t)BURST * TPUT_LEN, ns));
+	tc_info("%u x %u bytes round trip: %.1f MiB/s", BURST, tput,
+		tc_mibps((uint64_t)BURST * tput, ns));
+	t_metric("roundtrip_MiBps", tc_mibps((uint64_t)BURST * tput, ns));
 	if (L.foreign)
 		tc_info("%u packet(s) with other ids were ignored", L.foreign);
 end:
@@ -385,6 +389,9 @@ static void test_axi_loop(void)
 {
 	struct ramon_sg_item items[AXI_LOOP_ITEMS];
 	uint32_t nn = (uint32_t)T.spw_nn, rxc, txc, len, i, ok = 0, piece;
+	/* one packet of at most --spw-max payload bytes */
+	uint32_t plen = T.o.spw_max < AXI_LOOP_LEN - RAMON_SPW_HDR_BYTES ? T.o.spw_max :
+			AXI_LOOP_LEN - RAMON_SPW_HDR_BYTES;
 	struct ramon_spw_config cfg;
 	struct ramon_spw_wait_rx w;
 	struct ramon_spw_msg m;
@@ -404,11 +411,11 @@ static void test_axi_loop(void)
 	    t_check(ramon_buf_alloc(T.c, AXI_LOOP_LEN + RAMON_SPW_FOOTER_BYTES, 0, &rx, &st), "alloc",
 		    &st))
 		goto out;
-	tc_fill(payload, AXI_LOOP_LEN - RAMON_SPW_HDR_BYTES, 0xA5A50000u);
+	tc_fill(payload, plen, 0xA5A50000u);
 	memset(&m, 0, sizeof(m));
 	m.dst = cfg.node_id;
 	iov.base = payload;
-	iov.len = AXI_LOOP_LEN - RAMON_SPW_HDR_BYTES;
+	iov.len = plen;
 	ramon_spw_build(cfg.node_id, &m, &iov, 1, tx.ptr, tx.size, &len);
 	piece = len / AXI_LOOP_ITEMS;
 	for (i = 0; i < AXI_LOOP_ITEMS; i++) {

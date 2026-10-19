@@ -200,7 +200,7 @@ static void usage(FILE *f)
 		"      --format           with --prep: FORMAT the NN (erases every stream)\n"
 		"      --spfi-pages N     largest SPFI write in spfi-perf (default 64)\n"
 		"      --runs N           writes/reads per size in spfi-perf (default 8)\n"
-		"      --spw-max N        largest payload in spw-loop (default 65536)\n"
+		"      --spw-max N        largest SPW payload in spw-loop and axi-loop (at most and default 4096)\n"
 		"      --long             also run spfi-maxlist (writes 156 MiB to the NN)\n"
 		"      --minutes N        also run soak for N minutes\n"
 		"      --fail-fast        stop at the first failing test\n"
@@ -216,7 +216,7 @@ static int opt_u32(const char *s, const char *what, uint32_t max, uint32_t *v)
 {
 	if (!tc_parse_u32(s, v) && *v <= max)
 		return 0;
-	fprintf(stderr, "ramon_test: bad %s \"%s\"\n", what, s);
+	fprintf(stderr, "ramon_test: bad %s \"%s\" (0..%u)\n", what, s, max);
 	return -1;
 }
 
@@ -261,7 +261,7 @@ int main(int argc, char **argv)
 	T.o.spfi_chan[1] = RAMON_SPFI_CHAN_NN1;
 	T.o.spfi_pages = 64;
 	T.o.runs = 8;
-	T.o.spw_max = 65536;
+	T.o.spw_max = RAMON_SPW_MAX_PAYLOAD;
 	while ((opt = getopt_long(argc, argv, "d:lVh", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
@@ -304,7 +304,8 @@ int main(int argc, char **argv)
 				return 2;
 			break;
 		case O_SPW_MAX:
-			if (opt_u32(optarg, "--spw-max", RAMON_SPW_BUF_DEFAULT - 64, &T.o.spw_max))
+			/* the FPGA takes at most RAMON_SPW_MAX_PAYLOAD bytes */
+			if (opt_u32(optarg, "--spw-max", RAMON_SPW_MAX_PAYLOAD, &T.o.spw_max))
 				return 2;
 			break;
 		case O_LONG:

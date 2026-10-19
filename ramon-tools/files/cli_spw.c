@@ -245,7 +245,8 @@ static int cmd_spwsync(struct cli *cl, int argc, char **argv)
 static int cmd_spwstatus(struct cli *cl, int argc, char **argv)
 {
 	static const uint32_t regs[] = { RAMON_SPW_REG_TX_FSM, RAMON_SPW_REG_RX_FSM,
-					 RAMON_SPW_REG_LINK, RAMON_SPW_REG_LOOPBACK };
+					 RAMON_SPW_REG_LINK, RAMON_SPW_REG_ENABLE,
+					 RAMON_SPW_REG_LOOPBACK };
 	struct ramon_spw_stats s;
 	struct ramon_get_stats g;
 	uint32_t first, last, nn, v;
@@ -266,12 +267,14 @@ static int cmd_spwstatus(struct cli *cl, int argc, char **argv)
 				printf(" 0x%02x=0x%x", regs[i], v);
 		printf("; RX thread %s\n", ramon_spw_rx_running(cl->c, nn) ? "running" : "off");
 		if (ramon_spw_is_inited(cl->c) && !ramon_spw_get_stats(cl->c, nn, &s, 0))
-			printf("      spw%u: lib tx %llu (%llu bytes, %llu failed), rx %llu (%llu bytes), crc errors %llu, truncated %llu, not for us %llu, footer errors %llu, oversize %llu, lost %llu, dropped %llu, to requests %llu\n",
+			printf("      spw%u: lib tx %llu (%llu bytes, %llu failed, %llu above %u bytes refused), rx %llu (%llu bytes), crc errors %llu, truncated %llu, not for us %llu, footer errors %llu, above %u bytes dropped %llu, lost %llu, dropped %llu, to requests %llu\n",
 			       nn, (unsigned long long)s.tx_packets, (unsigned long long)s.tx_bytes,
-			       (unsigned long long)s.tx_failures, (unsigned long long)s.rx_packets,
+			       (unsigned long long)s.tx_failures, (unsigned long long)s.tx_too_large,
+			       RAMON_SPW_MAX_PAYLOAD, (unsigned long long)s.rx_packets,
 			       (unsigned long long)s.rx_bytes, (unsigned long long)s.rx_crc_errors,
 			       (unsigned long long)s.rx_truncated, (unsigned long long)s.rx_not_for_us,
-			       (unsigned long long)s.rx_footer_errors, (unsigned long long)s.rx_oversize,
+			       (unsigned long long)s.rx_footer_errors, RAMON_SPW_MAX_PAYLOAD,
+			       (unsigned long long)s.rx_too_large,
 			       (unsigned long long)s.rx_consume_failures,
 			       (unsigned long long)s.rx_dropped, (unsigned long long)s.rx_to_request);
 	}
@@ -689,6 +692,10 @@ static int cmd_axiloop(struct cli *cl, int argc, char **argv)
 		     n_items > size))
 		ret = cli_err(cl, EINVAL, "size >= 40 bytes and items 1..min(size, %u)",
 			      RAMON_AXI_MAX_ITEMS);
+	if (!ret && size - RAMON_SPW_HDR_BYTES > RAMON_SPW_MAX_PAYLOAD)
+		ret = cli_err(cl, EMSGSIZE, "packet of %u bytes: payload %u is above the SPW maximum of %u (size <= %u); not sent",
+			      size, size - RAMON_SPW_HDR_BYTES, RAMON_SPW_MAX_PAYLOAD,
+			      RAMON_SPW_MAX_PAYLOAD + RAMON_SPW_HDR_BYTES);
 	if (ret)
 		return ret;
 	if (ramon_spw_rx_running(cl->c, nn))

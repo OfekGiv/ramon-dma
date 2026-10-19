@@ -1,0 +1,34 @@
+# ramon_accept SYSMON limits
+#
+# Copy to /etc/ramon/accept_limits.conf (read by default) or pass with
+# --limits FILE. One reading per line: name, minimum, maximum.
+#   temp_ps, temp_pl       temperatures in degrees C (default -40 .. 125)
+#   ps.<rail>, pl.<rail>   voltages in V; the rail names are the ones the
+#                          sysmon step prints
+# A rail without a line is printed but not checked.
+#
+# The voltage lines below are commented out on purpose: they are the
+# recommended operating ranges of Zynq UltraScale+ RFSoC devices with 0.85 V
+# cores, taken as a starting point. Check each against the data sheet of the
+# fitted part (speed grade: some run VCCINT at 0.72 V) and against the board
+# schematic before enabling it. Leave some margin for the SYSMON's own
+# measurement error.
+
+temp_ps   -40  100
+temp_pl   -40  100
+
+# PS rails, as measured by the PS SYSMON
+#ps.vcc_psintlp   0.808  0.892
+#ps.vcc_psintfp   0.808  0.892
+#ps.vcc_psaux     1.710  1.890
+#ps.vcco_psddr    1.140  1.260     # DDR4 at 1.2 V
+#ps.ps_mgtravcc   0.825  0.876
+#ps.ps_mgtravtt   1.746  1.854
+
+# PL rails, as measured by the PL SYSMON
+#pl.vccint        0.825  0.876
+#pl.vccaux        1.746  1.854
+#pl.vccbram       0.825  0.876
+#pl.vcc_psintlp   0.808  0.892
+#pl.vcc_psintfp   0.808  0.892
+#pl.vcc_psaux     1.710  1.890

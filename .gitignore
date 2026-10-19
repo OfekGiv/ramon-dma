@@ -16,3 +16,4 @@ Module.symvers
 /ramon-api/files/ramon_selftest
 /ramon-tools/files/ramon_cli
 /ramon-tools/files/ramon_test
+/ramon-tools/files/ramon_accept

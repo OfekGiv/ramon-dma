@@ -1,4 +1,4 @@
-# ramon_cli and ramon_test, linked against libramon.a.
+# ramon_cli, ramon_test and ramon_accept, linked against libramon.a.
 #
 # Target build (ramon-tools.bb):
 #   make RAMON_UAPI_INC=${STAGING_INCDIR}/ramon RAMON_API_INC=${STAGING_INCDIR}/ramon \
@@ -17,8 +17,10 @@ override LDLIBS  += -lramon -lpthread
 COMMON    = tools_common.o
 CLI_OBJS  = cli_main.o cli_core.o cli_spw.o cli_spfi.o cli_misc.o linenoise.o
 TEST_OBJS = test_main.o test_core.o test_spw.o test_spfi.o test_soak.o
+ACCEPT_OBJS = accept_main.o accept_board.o accept_ddr4.o accept_spw.o accept_spfi.o \
+	      accept_nn.o
 
-all: ramon_cli ramon_test
+all: ramon_cli ramon_test ramon_accept
 
 ramon_cli: $(CLI_OBJS) $(COMMON)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
@@ -26,15 +28,19 @@ ramon_cli: $(CLI_OBJS) $(COMMON)
 ramon_test: $(TEST_OBJS) $(COMMON)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+ramon_accept: $(ACCEPT_OBJS) $(COMMON)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 # vendored upstream code: its own warning level
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(filter-out -Wpedantic -Wshadow,$(CFLAGS)) -Wno-unused-parameter -c -o $@ $<
 
-$(CLI_OBJS) $(TEST_OBJS) $(COMMON): tools_common.h
+$(CLI_OBJS) $(TEST_OBJS) $(ACCEPT_OBJS) $(COMMON): tools_common.h
 $(CLI_OBJS): cli.h
 $(TEST_OBJS): test.h
+$(ACCEPT_OBJS): accept.h
 
 clean:
-	rm -f *.o ramon_cli ramon_test
+	rm -f *.o ramon_cli ramon_test ramon_accept
 
 .PHONY: all clean
