@@ -7,7 +7,7 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
 # Must equal RAMON_API_VERSION in ramon_version.h.
-PV = "0.1.0"
+PV = "0.4.0"
 
 # ramon_dma_uapi.h comes from the module recipe's sysroot install.
 DEPENDS = "ramon-dma"

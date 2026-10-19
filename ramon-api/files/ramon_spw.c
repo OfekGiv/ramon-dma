@@ -4,6 +4,11 @@
 
 #define SPW_LINK_MASK		0x07u
 #define SPW_LINK_SYNCED		0x05u
+#define SPW_ENABLE_ON		1u
+/* the update's end packet: an 8-byte prefix and a 4096-byte chunk, as the old sw_update_end_t */
+#define SPW_SWUP_MAX_PAYLOAD	(8 + RAMON_SPW_SWUP_CHUNK)
+/* a received packet: header + payload + footer */
+#define SPW_RX_MAX_BYTES	(RAMON_SPW_HDR_BYTES + RAMON_SPW_MAX_PAYLOAD + RAMON_SPW_FOOTER_BYTES)
 #define SPW_RX_WAIT_MS		1000	/* RX thread wait period; bounds how long a stop takes */
 #define SPW_RX_XFER_MS		3000
 #define SPW_ERR_BACKOFF_MS	100
@@ -173,6 +178,9 @@ int ramon_spw_init(ramon_ctx *c, const struct ramon_spw_config *cfg, struct ramo
 			ret = ramon__fail(st, RAMON_EL_SYS, ENOMEM, 0, 0, "out of memory");
 			goto err;
 		}
+		ret = ramon_spw_enable(c, nn, st);
+		if (ret)
+			goto err;
 		s->present = 1;
 	}
 	w->slot = calloc(d.tx_slots, sizeof(*w->slot));
@@ -230,12 +238,25 @@ int ramon_spw_link_status(ramon_ctx *c, uint32_t nn, uint32_t *raw, struct ramon
 	return (v & SPW_LINK_MASK) == SPW_LINK_SYNCED;
 }
 
+int ramon_spw_enable(ramon_ctx *c, uint32_t nn, struct ramon_status *st)
+{
+	int ret = spw_check(c, nn, 0, st);
+
+	if (!ret)
+		ret = ramon_reg_write(c, c->spw.nn[nn].win, RAMON_SPW_REG_ENABLE, SPW_ENABLE_ON, st);
+	return ret;
+}
+
 int ramon_spw_sync(ramon_ctx *c, uint32_t nn, uint32_t *tries, struct ramon_status *st)
 {
 	const struct ramon_spw_config *cfg = &c->spw.cfg;
 	uint32_t i, v = 0;
 	int ret;
 
+	/* a disabled core never syncs, however often it is reset */
+	ret = ramon_spw_enable(c, nn, st);
+	if (ret)
+		return ret;
 	for (i = 0; i < cfg->sync_tries; i++) {
 		ret = ramon_spw_link_status(c, nn, &v, st);
 		if (ret < 0)
@@ -284,11 +305,10 @@ int ramon_spw_loopback(ramon_ctx *c, uint32_t nn, int enable, struct ramon_statu
 	ret = ramon__ioctl(c, RAMON_IOC_SPW_LOOPBACK, &l, &l.st, st);
 	if (ret || cur == !!enable)
 		return ret;
-	/* the driver reset the link */
-	if (enable) {
-		ramon__sleep_ms(c->spw.cfg.sync_sleep_ms);
-		return 0;
-	}
+	/*
+	 * The driver reset the link; the new setting takes effect as it syncs
+	 * again, in loopback with itself (the old flow: "loopback 1", then spwinit).
+	 */
 	return ramon_spw_sync(c, nn, NULL, st);
 }
 
@@ -438,6 +458,12 @@ int ramon_spw_send(ramon_ctx *c, uint32_t nn, const struct ramon_spw_msg *m,
 		return ret;
 	for (i = 0; i < n_iov; i++)
 		payload += iov[i].len;
+	if (payload > (m->flags & RAMON__SPW_MSG_SWUP ? SPW_SWUP_MAX_PAYLOAD : RAMON_SPW_MAX_PAYLOAD)) {
+		STAT_INC(s, tx_too_large);
+		return ramon__fail(st, RAMON_EL_TOO_LARGE, 0, payload, RAMON_SPW_MAX_PAYLOAD,
+				   "spw%u: payload of %llu bytes is above the SPW maximum of %u; packet dropped, not sent",
+				   nn, (unsigned long long)payload, RAMON_SPW_MAX_PAYLOAD);
+	}
 	if (payload + RAMON_SPW_HDR_BYTES > w->cfg.tx_slot_bytes)
 		return ramon__fail(st, RAMON_EL_TOO_LARGE, 0, payload, w->cfg.tx_slot_bytes,
 				   "payload of %llu bytes + header > tx_slot_bytes %u",
@@ -468,6 +494,13 @@ int ramon_spw_send_buf(ramon_ctx *c, uint32_t nn, const ramon_buf *pkt, uint64_t
 	if (len < RAMON_SPW_HDR_BYTES)
 		return ramon__fail(st, RAMON_EL_INVAL, 0, len, 0, "packet of %u bytes has no header",
 				   len);
+	if (len - RAMON_SPW_HDR_BYTES > RAMON_SPW_MAX_PAYLOAD) {
+		STAT_INC(s, tx_too_large);
+		return ramon__fail(st, RAMON_EL_TOO_LARGE, 0, len - RAMON_SPW_HDR_BYTES,
+				   RAMON_SPW_MAX_PAYLOAD,
+				   "spw%u: payload of %u bytes is above the SPW maximum of %u; packet dropped, not sent",
+				   nn, len - RAMON_SPW_HDR_BYTES, RAMON_SPW_MAX_PAYLOAD);
+	}
 	ret = ramon_axi_xfer1(c, s->tx_chan, pkt, off, len, timeout_ms, st);
 	spw_tx_account(s, ret, len);
 	return ret;
@@ -578,6 +611,14 @@ static void spw_deliver(struct ramon_ctx *c, struct spw_nn *s, uint32_t size)
 
 	if (spw_consume(c, s, size, &data, &tmp, NULL))
 		return;
+	if (size > SPW_RX_MAX_BYTES) {
+		/* taken off the FPGA (the next size belongs to the next packet), then dropped */
+		STAT_INC(s, rx_too_large);
+		ramon__log(c, RAMON_LOG_WARN,
+			   "spw%u: dropped a received packet of %u bytes: payload above the SPW maximum of %u",
+			   s->nn, size, RAMON_SPW_MAX_PAYLOAD);
+		goto out;
+	}
 	spw_parse_account(c, s, data, size, &rx);
 	pthread_mutex_lock(&s->lock);
 	if (w->armed && !w->done && spw_wanted(c, w->any, &w->want, &rx)) {
@@ -785,6 +826,20 @@ static int spw_recv_one(struct ramon_ctx *c, struct spw_nn *s, void *buf, uint32
 	ret = spw_consume(c, s, w.size, &data, &tmp, st);
 	if (ret)
 		return ret;
+	if (w.size > SPW_RX_MAX_BYTES) {
+		STAT_INC(s, rx_too_large);
+		ramon__log(c, RAMON_LOG_WARN,
+			   "spw%u: dropped a received packet of %u bytes: payload above the SPW maximum of %u",
+			   s->nn, w.size, RAMON_SPW_MAX_PAYLOAD);
+		/* drain just counts it; a receiver is told */
+		if (buf)
+			ret = ramon__fail(st, RAMON_EL_TOO_LARGE, 0, w.size, SPW_RX_MAX_BYTES,
+					  "spw%u: received a packet of %u bytes, above the SPW maximum of %u payload bytes; dropped",
+					  s->nn, w.size, RAMON_SPW_MAX_PAYLOAD);
+		if (tmp)
+			free(data);
+		return ret;
+	}
 	spw_parse_account(c, s, data, w.size, &tmp_rx);
 	if (!buf) {
 		STAT_INC(s, rx_dropped);
@@ -1097,6 +1152,8 @@ struct swup_end {
 	uint8_t data[RAMON_SPW_SWUP_CHUNK];
 } __attribute__((packed));
 
+_Static_assert(sizeof(struct swup_end) == SPW_SWUP_MAX_PAYLOAD, "SW update end packet size");
+
 const char *ramon_spw_swup_status_str(int phase, uint32_t status)
 {
 	static const char *const start[] = {
@@ -1126,6 +1183,7 @@ static int swup_step(struct ramon_ctx *c, uint32_t nn, uint32_t attr, const void
 	int ret;
 
 	spw_nn_msg(c, &m, RAMON_SPW_SWUP_APP, attr);
+	m.flags |= RAMON__SPW_MSG_SWUP;		/* 4100- and 4104-byte packets, as the old tool */
 	ret = spw_nn_request(c, nn, &m, pkt, len, RAMON_SPW_REPLY_MS, &reply, &rx, st);
 	if (ret) {
 		if (st && st->code == RAMON_EL_SPW_REPLY_TIMEOUT)

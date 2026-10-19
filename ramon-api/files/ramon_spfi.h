@@ -37,7 +37,8 @@ extern "C" {
 #define RAMON_SPFI_ST_EXIST		0x01
 #define RAMON_SPFI_ST_OPEN		0x02
 #define RAMON_SPFI_ST_CYCLIC		0x04
-#define RAMON_SPFI_CHAN_NN0		5	/* AXI write channel feeding NN0 */
+/* AXI write channel feeding each NN: the FPGA has one SPFI write channel, 4 (5 on the earlier design) */
+#define RAMON_SPFI_CHAN_NN0		4
 #define RAMON_SPFI_CHAN_NN1		4
 #define RAMON_SPFI_LINK_UP		0x88	/* low byte of register 0xCC */
 
@@ -86,7 +87,7 @@ _Static_assert(sizeof(struct ramon_spfi_table) == RAMON_SPFI_TABLE_BYTES, "SPFI 
 
 /* every 0 selects the default shown */
 struct ramon_spfi_config {
-	uint32_t chan[RAMON_NN_COUNT];	/* AXI write channel per NN: {5, 4} */
+	uint32_t chan[RAMON_NN_COUNT];	/* AXI write channel per NN: {4, 4} */
 	uint32_t nn_mask;		/* NNs to use: spfi_mask from GET_INFO */
 	uint32_t cmd_timeout_ms;	/* driver default */
 	uint32_t write_timeout_ms;	/* driver default */
@@ -109,6 +110,13 @@ int ramon_spfi_present(const ramon_ctx *c, uint32_t nn);
 
 /* 1 up, 0 down, < 0 error; works without init; raw (may be NULL) = register 0xCC */
 int ramon_spfi_link_up(ramon_ctx *c, uint32_t nn, uint32_t *raw, struct ramon_status *st);
+/*
+ * Polls the link for up to timeout_ms: 0 once it is up, RAMON_EL_SPFI_LINK_DOWN
+ * if not. On the current FPGA design the SPFI link comes up only after the SPW
+ * core of the same NN is enabled and its link synced (ramon_spw_sync).
+ */
+int ramon_spfi_wait_link(ramon_ctx *c, uint32_t nn, uint32_t timeout_ms, uint32_t *raw,
+			 struct ramon_status *st);
 
 /* short commands */
 struct ramon_spfi_args {
@@ -258,11 +266,12 @@ int ramon_spfi_diag(ramon_ctx *c, uint32_t nn, struct ramon_spfi_diag *d, struct
 size_t ramon_spfi_diag_format(const struct ramon_spfi_diag *d, char *buf, size_t len);
 
 /*
- * NN bring-up after power-up (the smoke tool's spfiprep): SPFI link check,
- * SPW link sync and DPS on the same NN index (initialises the SPW layer with
- * defaults if needed), INIT type 0, FORMAT if format != 0 (erases every
- * stream), then the stream table into t (may be NULL). st->msg names the
- * stage that failed.
+ * NN bring-up after power-up (the smoke tool's spfiprep): SPW link sync on the
+ * same NN index (initialises the SPW layer with defaults if needed; the sync
+ * enables the SPW core, which the SPFI link needs), SPFI link up (waited for),
+ * DPS, INIT type 0, FORMAT if format != 0 (erases every stream), then the
+ * stream table into t (may be NULL). With skip_spw_dps only the link is
+ * checked before INIT. st->msg names the stage that failed.
  */
 struct ramon_spfi_prep_opts {
 	int format;

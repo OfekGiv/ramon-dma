@@ -25,6 +25,9 @@
 
 #define ARRAY_SIZE(a)	(sizeof(a) / sizeof((a)[0]))
 
+/* ramon_spw_msg.flags, library only: an NN software update packet (4100/4104 bytes allowed) */
+#define RAMON__SPW_MSG_SWUP	0x80000000u
+
 /* ---- SPW ---- */
 
 enum spw_rx_state {

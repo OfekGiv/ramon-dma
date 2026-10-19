@@ -6,9 +6,9 @@
 #define RAMON_VERSION_H
 
 #define RAMON_API_VERSION_MAJOR		0
-#define RAMON_API_VERSION_MINOR		1
+#define RAMON_API_VERSION_MINOR		4
 #define RAMON_API_VERSION_PATCH		0
-#define RAMON_API_VERSION		"0.1.0"
+#define RAMON_API_VERSION		"0.4.0"
 
 /* The driver this library was developed against; ramon_open() warns on anything older. */
 #define RAMON_API_DRIVER_MIN_MAJOR	0

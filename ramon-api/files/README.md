@@ -131,7 +131,8 @@ node, unless you configure `RAMON_SPW_NO_CRC_CHECK`.
 | `axidmasg_alloc()`, `ps2ps_alloc()` (physical address) | `ramon_buf_alloc()` (handle and mapping; no physical addresses) |
 | `axidmasg_transfer()` | `ramon_axi_xfer()`, `ramon_axi_xfer1()` |
 | `ps2ps_copy()`, `ps2ps_copy_list()` | `ramon_zdma_copy1()`, `ramon_zdma_copy()` |
-| `spw_init()` | `ramon_spw_init()` + `ramon_spw_sync()` per NN |
+| `spw_send()` | `ramon_spw_send()`; payloads above `RAMON_SPW_MAX_PAYLOAD` (4096, the FPGA's limit) are refused with `RAMON_EL_TOO_LARGE`, and received packets above it are dropped with a warning (counters `tx_too_large`, `rx_too_large`) |
+| `spw_init()` | `ramon_spw_init()` + `ramon_spw_sync()` per NN; both enable the SPW core first (0x2C = 1, `ramon_spw_enable()`), which the FPGA requires before the link can sync |
 | `spw_open()` + callback | `ramon_spw_rx_start()` (one callback per NN; it sees every packet and can filter on `app_type`) |
 | `spw_send()` | `ramon_spw_send()` (the payload is a gather list) |
 | `spw_enable_loopback()` | `ramon_spw_loopback()` (per NN) |

@@ -38,6 +38,13 @@ extern "C" {
 #define RAMON_SPW_NODE_DEFAULT		68	/* our node id on the ramon board */
 #define RAMON_SPW_NN_NODE_DEFAULT	0x41	/* the NN's node id */
 #define RAMON_SPW_BUF_DEFAULT		0x100000
+/*
+ * The largest SPW payload the FPGA takes (after the 40-byte header). Larger
+ * packets are refused when sent (RAMON_EL_TOO_LARGE) and dropped, with a
+ * warning, when received. Only the NN software update keeps the old tool's
+ * 4100- and 4104-byte packets.
+ */
+#define RAMON_SPW_MAX_PAYLOAD		4096
 
 /* NN services */
 #define RAMON_SPW_NN_PROTOCOL		9
@@ -92,6 +99,7 @@ _Static_assert(sizeof(struct ramon_spw_footer) == RAMON_SPW_FOOTER_BYTES, "SPW f
 
 /* header fields of an outgoing message; src is the configured node id */
 #define RAMON_SPW_MSG_KEEP_ID	0x1u	/* send packet_id as given (default: a per-context counter) */
+/* bit 31 of ramon_spw_msg.flags is reserved for the library */
 struct ramon_spw_msg {
 	uint8_t  dst;
 	uint8_t  protocol_id;
@@ -173,6 +181,12 @@ void ramon_spw_get_config(const ramon_ctx *c, struct ramon_spw_config *cfg);
 int ramon_spw_present(const ramon_ctx *c, uint32_t nn);
 
 /* Links. These work without ramon_spw_init(). */
+/*
+ * Enables the SPW core of NN nn (writes 1 to RAMON_SPW_REG_ENABLE, 0x2C).
+ * The link cannot sync before this. ramon_spw_init() does it for every NN
+ * it sets up, and ramon_spw_sync() before its first reset.
+ */
+int ramon_spw_enable(ramon_ctx *c, uint32_t nn, struct ramon_status *st);
 /* 1 synced ((reg 0x28 & 7) == 5), 0 not synced, < 0 error; raw may be NULL */
 int ramon_spw_link_status(ramon_ctx *c, uint32_t nn, uint32_t *raw, struct ramon_status *st);
 /*
@@ -181,9 +195,9 @@ int ramon_spw_link_status(ramon_ctx *c, uint32_t nn, uint32_t *raw, struct ramon
  */
 int ramon_spw_sync(ramon_ctx *c, uint32_t nn, uint32_t *tries, struct ramon_status *st);
 /*
- * FPGA loopback on NN nn. A change resets the link: after disabling, the link
- * is re-synced (the result of that sync is returned); after enabling, the
- * call waits for the reset to settle.
+ * FPGA loopback on NN nn. A change resets the link, which is then synced
+ * again (ramon_spw_sync), in loopback with itself when enabling, as the old
+ * "loopback 1" followed by spwinit; the result of that sync is returned.
  */
 int ramon_spw_loopback(ramon_ctx *c, uint32_t nn, int enable, struct ramon_status *st);
 int ramon_spw_loopback_get(ramon_ctx *c, uint32_t nn, int *enabled, struct ramon_status *st);
@@ -305,6 +319,8 @@ struct ramon_spw_stats {
 	uint64_t rx_not_for_us;
 	uint64_t rx_footer_errors;
 	uint64_t rx_oversize;		/* larger than the RX buffer (a temporary buffer was used) */
+	uint64_t rx_too_large;		/* payload above RAMON_SPW_MAX_PAYLOAD: dropped */
+	uint64_t tx_too_large;		/* payload above RAMON_SPW_MAX_PAYLOAD: not sent */
 	uint64_t rx_consume_failures;	/* the RX transfer after a size failed: that packet is lost */
 	uint64_t rx_dropped;		/* no callback, or not what a mode-B request waited for */
 	uint64_t rx_wait_errors;

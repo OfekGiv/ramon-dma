@@ -246,6 +246,7 @@ int ramon_regwin_find(ramon_ctx *c, const char *name, uint32_t *index, struct ra
 #define RAMON_SPW_REG_TX_FSM		0x20
 #define RAMON_SPW_REG_RX_FSM		0x24
 #define RAMON_SPW_REG_LINK		0x28
+#define RAMON_SPW_REG_ENABLE		0x2C	/* write 1 to enable the core; the link syncs only then */
 
 /* SPFI registers (byte offsets in the spfi<n> window) */
 #define RAMON_SPFI_REG_LOOPBACK		0x2C	/* word 11 */

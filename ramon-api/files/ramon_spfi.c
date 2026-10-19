@@ -9,6 +9,8 @@
 #define SPFI_ALERT_WAIT_MS	1000	/* alert thread wait period; bounds how long a stop takes */
 #define SPFI_ERR_BACKOFF_MS	100
 #define SPFI_RETRY_DELAY_MS	2
+#define SPFI_LINK_WAIT_MS	2000	/* the SPFI link, after the SPW core enable and sync */
+#define SPFI_LINK_POLL_MS	10
 
 /* ---- configuration and lifecycle ---- */
 
@@ -101,8 +103,8 @@ int ramon_spfi_init(ramon_ctx *c, const struct ramon_spfi_config *cfg, struct ra
 		ret = ramon_chan_info(c, d.chan[nn], &ci, st);
 		if (!ret && (ci.type != RAMON_CHAN_AXI || ci.dir != RAMON_DIR_MEM_TO_DEV))
 			ret = ramon__fail(st, RAMON_EL_INVAL, 0, nn, d.chan[nn],
-					  "spfi%u: channel %u is not an AXI MEM_TO_DEV channel", nn,
-					  d.chan[nn]);
+					  "spfi%u: channel %u is not an AXI MEM_TO_DEV channel; set the write channel (--spfi-chans)",
+					  nn, d.chan[nn]);
 		if (ret) {
 			pthread_mutex_unlock(&c->lock);
 			return ret;
@@ -200,6 +202,31 @@ int ramon_spfi_link_up(ramon_ctx *c, uint32_t nn, uint32_t *raw, struct ramon_st
 	if (raw)
 		*raw = v;
 	return (v & SPFI_LINK_MASK) == RAMON_SPFI_LINK_UP;
+}
+
+int ramon_spfi_wait_link(ramon_ctx *c, uint32_t nn, uint32_t timeout_ms, uint32_t *raw,
+			 struct ramon_status *st)
+{
+	uint32_t v = 0, waited = 0;
+	int up;
+
+	for (;;) {
+		up = ramon_spfi_link_up(c, nn, &v, st);
+		if (up < 0)
+			return up;
+		if (up || waited >= timeout_ms)
+			break;
+		ramon__sleep_ms(SPFI_LINK_POLL_MS);
+		waited += SPFI_LINK_POLL_MS;
+	}
+	if (raw)
+		*raw = v;
+	if (!up)
+		return ramon__fail(st, RAMON_EL_SPFI_LINK_DOWN, 0, v, RAMON_SPFI_LINK_UP,
+				   "spfi%u: link down after %u ms: 0xCC = 0x%x, low byte not 0x%x", nn,
+				   waited, v, RAMON_SPFI_LINK_UP);
+	ramon_status_clear(st);
+	return 0;
 }
 
 /* ---- short commands ---- */
@@ -995,13 +1022,7 @@ int ramon_spfi_prep(ramon_ctx *c, uint32_t nn, const struct ramon_spfi_prep_opts
 	ret = spfi_check(c, nn, st);
 	if (ret)
 		return prep_stage(st, "setup", ret);
-	ret = ramon_spfi_link_up(c, nn, &raw, st);
-	if (ret < 0)
-		return prep_stage(st, "link", ret);
-	if (!ret)
-		return ramon__fail(st, RAMON_EL_SPFI_LINK_DOWN, 0, raw, RAMON_SPFI_LINK_UP,
-				   "link: spfi%u 0xCC = 0x%x, low byte is not 0x%x", nn, raw,
-				   RAMON_SPFI_LINK_UP);
+	/* SPW first: its core enable and link sync bring the SPFI link up */
 	if (!o->skip_spw_dps) {
 		if (!ramon_spw_is_inited(c)) {
 			ret = ramon_spw_init(c, NULL, st);
@@ -1011,6 +1032,11 @@ int ramon_spfi_prep(ramon_ctx *c, uint32_t nn, const struct ramon_spfi_prep_opts
 		ret = ramon_spw_sync(c, nn, NULL, st);
 		if (ret)
 			return prep_stage(st, "spw-sync", ret);
+	}
+	ret = ramon_spfi_wait_link(c, nn, SPFI_LINK_WAIT_MS, &raw, st);
+	if (ret)
+		return prep_stage(st, "link", ret);
+	if (!o->skip_spw_dps) {
 		ret = ramon_spw_nn_dps(c, nn, 0, st);
 		if (ret)
 			return prep_stage(st, "dps", ret);
