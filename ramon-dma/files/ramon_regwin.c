@@ -123,7 +123,7 @@ static void ramon_regwin_spfi(struct ramon_dev *rd, const struct ramon_of_hw *hw
 	u32 nn;
 
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
-		if (!hw->spfi_ok) {
+		if (!(hw->spfi_mask & BIT(nn))) {
 			ramon_win_name(rd, RAMON_WIN_SPFI0 + nn, RAMON_WIN_NAME_SPFI "%u", nn);
 			continue;
 		}

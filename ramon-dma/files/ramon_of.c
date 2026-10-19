@@ -209,13 +209,19 @@ static void ramon_of_spfi_mems(struct device *dev, struct ramon_of_hw *hw)
 	};
 	u32 i;
 
+	/* only the NNs the SPFI node describes; the others have no labels to look up */
 	for (i = 0; i < RAMON_NN_COUNT; i++) {
+		if (!(hw->spfi_mask & BIT(i)))
+			continue;
 		hw->spfi_rx_mem_ok[i] = !ramon_of_label(dev, rx_mem[i], &hw->spfi_rx_mem[i]);
 		hw->spfi_tx_offs_ok[i] = !ramon_of_label(dev, tx_offs[i], &hw->spfi_tx_offs[i]);
 	}
 }
 
-/* SPFI: both NNs come from the first "xlnx,nanrec-spfi-wr-1.0" node, reg[nn] and interrupts[nn] */
+/*
+ * SPFI: the first "xlnx,nanrec-spfi-wr-1.0" node; NN nn is reg[nn] and
+ * interrupts[nn]. A node with one reg entry describes NN0 only.
+ */
 static void ramon_of_spfi(struct device *dev, struct ramon_of_hw *hw)
 {
 	struct device_node *np;
@@ -227,25 +233,23 @@ static void ramon_of_spfi(struct device *dev, struct ramon_of_hw *hw)
 		return;
 	}
 	for (i = 0; i < RAMON_NN_COUNT; i++) {
-		if (of_address_to_resource(np, i, &hw->spfi[i])) {
-			dev_warn(dev, "spfi: node %pOF has %u reg entries, need %u; SPFI disabled\n",
-				 np, i, RAMON_NN_COUNT);
+		if (of_address_to_resource(np, i, &hw->spfi[i]))
 			break;
-		}
-	}
-	hw->spfi_ok = i == RAMON_NN_COUNT;
-	for (i = 0; hw->spfi_ok && i < RAMON_NN_COUNT; i++) {
+		hw->spfi_mask |= BIT(i);
 		hw->spfi_irq[i] = irq_of_parse_and_map(np, i);
-		if (!hw->spfi_irq[i]) {
-			dev_warn(dev, "spfi: node %pOF has %u interrupts, need %u; SPFI commands disabled\n",
-				 np, i, RAMON_NN_COUNT);
-			break;
-		}
+		if (hw->spfi_irq[i])
+			hw->spfi_irq_mask |= BIT(i);
+		else
+			dev_warn(dev, "spfi: node %pOF has no interrupt %u; SPFI%u commands disabled\n",
+				 np, i, i);
 	}
-	hw->spfi_irq_ok = hw->spfi_ok && i == RAMON_NN_COUNT;
+	if (!hw->spfi_mask)
+		dev_warn(dev, "spfi: node %pOF has no reg entry; SPFI disabled\n", np);
+	else if (i < RAMON_NN_COUNT)
+		dev_info(dev, "spfi: node %pOF has %u reg entr%s; SPFI%u and above absent\n", np, i,
+			 i == 1 ? "y" : "ies", i);
 	of_node_put(np);
-	if (hw->spfi_ok)
-		ramon_of_spfi_mems(dev, hw);
+	ramon_of_spfi_mems(dev, hw);
 }
 
 static void ramon_of_regdev(struct device *dev, struct device_node *np, u32 i,

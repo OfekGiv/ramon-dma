@@ -807,7 +807,7 @@ void ramon_spfi_probe(struct ramon_dev *rd, const struct ramon_of_hw *hw)
 				 ramon_param_spfi_mask());
 			continue;
 		}
-		if (!hw->spfi_irq_ok || (win->flags & RAMON_REGWIN_ABSENT))
+		if (!(hw->spfi_irq_mask & BIT(nn)) || (win->flags & RAMON_REGWIN_ABSENT))
 			continue;
 		/* REG_IO on this window then takes the same lock as the IRQ */
 		sp->regs = win->base;

@@ -41,7 +41,7 @@
 /* The minor number tracks the implementation step while the rewrite is in progress. */
 #define RAMON_DRV_MAJOR		0
 #define RAMON_DRV_MINOR		8
-#define RAMON_DRV_PATCH		8
+#define RAMON_DRV_PATCH		9
 #define RAMON_DRV_VERSION	__stringify(RAMON_DRV_MAJOR) "." \
 				__stringify(RAMON_DRV_MINOR) "." \
 				__stringify(RAMON_DRV_PATCH)
@@ -237,9 +237,9 @@ struct ramon_of_hw {
 	u32 spw_mask;			/* bit nn: spw[nn] valid */
 	struct resource spw[RAMON_NN_COUNT];
 	int spw_irq[RAMON_NN_COUNT];	/* 0: none */
-	bool spfi_ok;			/* both reg entries */
+	u32 spfi_mask;			/* bit nn: reg[nn] of the SPFI node found */
 	struct resource spfi[RAMON_NN_COUNT];
-	bool spfi_irq_ok;		/* both interrupts */
+	u32 spfi_irq_mask;		/* bit nn: interrupts[nn] found */
 	int spfi_irq[RAMON_NN_COUNT];
 	bool spfi_rx_mem_ok[RAMON_NN_COUNT];
 	struct resource spfi_rx_mem[RAMON_NN_COUNT];
