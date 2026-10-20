@@ -41,7 +41,7 @@
 /* The minor number tracks the implementation step while the rewrite is in progress. */
 #define RAMON_DRV_MAJOR		0
 #define RAMON_DRV_MINOR		8
-#define RAMON_DRV_PATCH		9
+#define RAMON_DRV_PATCH		10
 #define RAMON_DRV_VERSION	__stringify(RAMON_DRV_MAJOR) "." \
 				__stringify(RAMON_DRV_MINOR) "." \
 				__stringify(RAMON_DRV_PATCH)
@@ -143,6 +143,14 @@ struct ramon_spfi {
 	DECLARE_KFIFO(alerts, struct ramon_spfi_alert, RAMON_SPFI_ALERT_FIFO_DEPTH);
 	wait_queue_head_t alert_wq;
 	u32 alert_gen;			/* bumped by SPFI_CANCEL_ALERT, under @lock */
+	/*
+	 * Per stream, under @lock: pages [0, flushed_end) are known flushed and
+	 * pages [0, written_end) were written through this driver (0: nothing
+	 * known). SPFI_READ FLUSHes first when it asks for a page at or past
+	 * flushed_end.
+	 */
+	u32 flushed_end[RAMON_SPFI_STREAMS];
+	u32 written_end[RAMON_SPFI_STREAMS];
 };
 
 /* A bounded MMIO window for REG_IO; RAMON_REGWIN_ABSENT means base == NULL. */

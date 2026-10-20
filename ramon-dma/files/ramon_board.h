@@ -102,6 +102,8 @@ enum ramon_spfi_word {
 #define RAMON_SPFI_IRQ_VC1RX		BIT(3)	/* read data (0x98) or 0xD0 completion */
 #define RAMON_SPFI_READ_SETUP_US	10	/* delay before READ_STREAM (old driver) */
 #define RAMON_SPFI_ALERT_FIFO_DEPTH	16	/* power of two (kfifo) */
+#define RAMON_SPFI_STREAMS		198	/* stream ids 0..197 on the NN */
+#define RAMON_SPFI_FLUSHED_ALL		U32_MAX	/* flushed_end: whatever the stream holds */
 #define RAMON_SPFI_MASK_DEFAULT		0x1	/* only NN0's SPFI is wired on this board */
 #define RAMON_SPFI_MASK_ALL		(BIT(RAMON_NN_COUNT) - 1)
 

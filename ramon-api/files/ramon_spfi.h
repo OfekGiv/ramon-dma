@@ -192,7 +192,10 @@ int ramon_spfi_write_buf(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first
 /* from ordinary memory through the NN's bounce buffer; len a multiple of 16 KiB */
 int ramon_spfi_write_mem(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first_page,
 			 const void *data, size_t len, uint32_t timeout_ms, struct ramon_status *st);
-/* pages[0..n-1] (1..8192) into dst at dst_off; dst must hold n * 16 KiB there */
+/*
+ * pages[0..n-1] (1..8192) into dst at dst_off; dst must hold n * 16 KiB there.
+ * The driver FLUSHes the stream first if a page is past what it has flushed.
+ */
 int ramon_spfi_read(ramon_ctx *c, uint32_t nn, uint32_t sid, const uint32_t *pages, uint32_t n,
 		    const ramon_buf *dst, uint64_t dst_off, uint32_t timeout_ms, uint32_t *rx_status,
 		    struct ramon_status *st);

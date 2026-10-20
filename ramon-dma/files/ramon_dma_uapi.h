@@ -298,7 +298,11 @@ struct ramon_spfi_write {
 	struct ramon_status st;
 };
 
-/* 13: READ_STREAM of n_offsets * 16 KiB into (dst_handle, dst_off) */
+/*
+ * 13: READ_STREAM of n_offsets * 16 KiB into (dst_handle, dst_off). If a
+ * requested page is past what the stream is known to have flushed, the driver
+ * FLUSHes the stream first (the trailer's msg then says so); stream_id 0..197.
+ */
 struct ramon_spfi_read {
 	__u32 nn;			/* in */
 	__u32 stream_id;		/* in */

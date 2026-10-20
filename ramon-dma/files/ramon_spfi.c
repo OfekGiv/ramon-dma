@@ -9,6 +9,11 @@
  * commands across their wait, because there is one pending-command slot per
  * NN. CLOSE and FLUSH also take write_lock: their VC1TX ack is the same
  * interrupt that completes a DATA_WRITE.
+ *
+ * Flush tracking: the driver knows what each stream has flushed (FLUSH runs
+ * under write_lock, so every DATA_WRITE before it is covered), and SPFI_READ
+ * FLUSHes a stream first when a requested page is past that. The automatic
+ * FLUSH runs before read_lock is taken, so the lock order is unchanged.
  */
 #define pr_fmt(fmt) "ramon_dma: " fmt
 
@@ -19,10 +24,12 @@
 #include <linux/io.h>
 #include <linux/jiffies.h>
 #include <linux/kfifo.h>
+#include <linux/limits.h>
 #include <linux/nospec.h>
 #include <linux/overflow.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 
@@ -269,6 +276,56 @@ static void ramon_spfi_results(struct ramon_spfi *sp, struct ramon_spfi_cmd *p)
 	p->rx_status = ramon_spfi_rd(sp, RAMON_SPFI_RX_STATUS);
 }
 
+/* ---- per-stream flush tracking; @sp->lock held ---- */
+
+static void ramon_spfi_track_reset(struct ramon_spfi *sp, u32 sid)
+{
+	if (sid < RAMON_SPFI_STREAMS) {
+		sid = array_index_nospec(sid, RAMON_SPFI_STREAMS);
+		sp->flushed_end[sid] = 0;
+		sp->written_end[sid] = 0;
+	}
+}
+
+static void ramon_spfi_track_reset_all(struct ramon_spfi *sp)
+{
+	memset(sp->flushed_end, 0, sizeof(sp->flushed_end));
+	memset(sp->written_end, 0, sizeof(sp->written_end));
+}
+
+/* after a short command; acked: the NN answered it with rx_err_code 0 */
+static void ramon_spfi_track_cmd(struct ramon_spfi *sp, const struct ramon_spfi_cmd *p, bool acked)
+{
+	u32 sid = p->stream_id;
+
+	if (sid < RAMON_SPFI_STREAMS)
+		sid = array_index_nospec(sid, RAMON_SPFI_STREAMS);
+	switch (p->opcode) {
+	case RAMON_SPFI_OP_FLUSH_STREAM:
+		/* everything written before the FLUSH; written earlier than this driver: all */
+		if (acked && sid < RAMON_SPFI_STREAMS)
+			sp->flushed_end[sid] = sp->written_end[sid] ? sp->written_end[sid] :
+					       RAMON_SPFI_FLUSHED_ALL;
+		break;
+	case RAMON_SPFI_OP_CLOSE_STREAM_FOR_WRITE:
+		/* a closed stream is complete */
+		if (acked && sid < RAMON_SPFI_STREAMS)
+			sp->flushed_end[sid] = RAMON_SPFI_FLUSHED_ALL;
+		break;
+	case RAMON_SPFI_OP_OPEN_STREAM_FOR_WRITE:
+	case RAMON_SPFI_OP_DELETE_STREAM:
+		ramon_spfi_track_reset(sp, sid);
+		break;
+	case RAMON_SPFI_OP_FORMAT:
+	case RAMON_SPFI_OP_INIT:
+	case RAMON_SPFI_OP_PLATFORM_RESET:
+		ramon_spfi_track_reset_all(sp);
+		break;
+	default:
+		break;
+	}
+}
+
 /* send, then (if asked) wait for the answer; short_lock held */
 static int ramon_spfi_cmd_run(struct ramon_spfi *sp, const struct ramon_spfi_op *op,
 			      struct ramon_spfi_cmd *p, struct ramon_status *st)
@@ -350,10 +407,54 @@ int ramon_ioc_spfi_cmd(struct ramon_file *rf, void *arg, struct ramon_status *st
 	ret = ramon_spfi_lock(sp, &sp->short_lock, "short command", st);
 	if (!ret) {
 		ret = ramon_spfi_cmd_run(sp, op, p, st);
+		/*
+		 * Resets apply even unanswered or failed (forgetting is safe); a
+		 * FLUSH or CLOSE counts only when the NN answered it without an
+		 * error code.
+		 */
+		spin_lock_irq(&sp->lock);
+		ramon_spfi_track_cmd(sp, p, !ret && p->wait_ack && !p->rx_err_code);
+		spin_unlock_irq(&sp->lock);
 		mutex_unlock(&sp->short_lock);
 	}
 	if (op->vc1tx_ack)
 		mutex_unlock(&sp->write_lock);
+	return ret;
+}
+
+/*
+ * The automatic FLUSH before a READ_STREAM: takes write_lock and short_lock
+ * itself (the caller holds no SPFI mutex). *rx_err: the NN's error code.
+ */
+static int ramon_spfi_flush_stream(struct ramon_spfi *sp, u32 sid, u32 timeout_ms, u32 *rx_err,
+				   struct ramon_status *st)
+{
+	const struct ramon_spfi_op *op = ramon_spfi_op(RAMON_SPFI_OP_FLUSH_STREAM);
+	struct ramon_spfi_cmd c = {
+		.nn = sp->nn,
+		.opcode = RAMON_SPFI_OP_FLUSH_STREAM,
+		.wait_ack = 1,
+		.timeout_ms = timeout_ms,
+		.stream_id = sid,
+	};
+	int ret;
+
+	*rx_err = 0;
+	ret = ramon_spfi_lock(sp, &sp->write_lock, "write", st);
+	if (ret)
+		return ret;
+	ret = ramon_spfi_lock(sp, &sp->short_lock, "short command", st);
+	if (!ret) {
+		ret = ramon_spfi_cmd_run(sp, op, &c, st);
+		if (!ret) {
+			spin_lock_irq(&sp->lock);
+			ramon_spfi_track_cmd(sp, &c, !c.rx_err_code);
+			spin_unlock_irq(&sp->lock);
+			*rx_err = c.rx_err_code;
+		}
+		mutex_unlock(&sp->short_lock);
+	}
+	mutex_unlock(&sp->write_lock);
 	return ret;
 }
 
@@ -408,6 +509,7 @@ int ramon_ioc_spfi_write(struct ramon_file *rf, void *arg, struct ramon_status *
 	u32 timeout_ms = ramon_timeout_ms(p->timeout_ms, RAMON_TMO_SPFI_CMD_MS);
 	struct ramon_axi_job job;
 	struct ramon_spfi *sp;
+	u32 sid = 0;
 	int ret;
 
 	p->rx_status = 0;
@@ -427,7 +529,25 @@ int ramon_ioc_spfi_write(struct ramon_file *rf, void *arg, struct ramon_status *
 	ret = ramon_spfi_lock(sp, &sp->write_lock, "write", st);
 	if (ret)
 		goto out;
+	/* pages from tx_offset on are no longer known flushed, even if the write fails */
+	if (p->stream_id < RAMON_SPFI_STREAMS) {
+		sid = array_index_nospec(p->stream_id, RAMON_SPFI_STREAMS);
+		spin_lock_irq(&sp->lock);
+		if (sp->flushed_end[sid] > p->tx_offset)
+			sp->flushed_end[sid] = p->tx_offset;
+		spin_unlock_irq(&sp->lock);
+	}
 	ret = ramon_spfi_write_run(sp, p, &job, timeout_ms, st);
+	if (!ret && p->stream_id < RAMON_SPFI_STREAMS) {
+		/* below RAMON_SPFI_FLUSHED_ALL, which means "whatever the stream holds" */
+		u32 end = (u32)min_t(u64, (u64)p->tx_offset + p->tx_num_offset,
+				     RAMON_SPFI_FLUSHED_ALL - 1);
+
+		spin_lock_irq(&sp->lock);
+		if (end > sp->written_end[sid])
+			sp->written_end[sid] = end;
+		spin_unlock_irq(&sp->lock);
+	}
 	mutex_unlock(&sp->write_lock);
 out:
 	ramon_axi_job_release(&job);
@@ -523,14 +643,19 @@ int ramon_ioc_spfi_read(struct ramon_file *rf, void *arg, struct ramon_status *s
 	u32 timeout_ms = ramon_timeout_ms(p->timeout_ms, RAMON_TMO_SPFI_CMD_MS);
 	struct ramon_buf *buf, *stale = NULL;
 	struct ramon_spfi *sp;
-	bool issued = false;
-	u32 *offsets;
+	bool issued = false, flushed = false;
+	u32 *offsets, i, rx_err = 0;
+	u64 need = 0, known;
 	int ret;
 
 	p->rx_status = 0;
 	ret = ramon_spfi_get(rf->rd, p->nn, &sp, st);
 	if (ret)
 		return ret;
+	if (p->stream_id >= RAMON_SPFI_STREAMS)
+		return ramon_fail(st, RAMON_E_INVAL_ARG, p->stream_id, RAMON_SPFI_STREAMS,
+				  "spfi%u read: stream id %u not in 0..%u", p->nn, p->stream_id,
+				  RAMON_SPFI_STREAMS - 1);
 	if (!sp->tx_offs)
 		return ramon_fail(st, RAMON_E_NOT_PRESENT, p->nn, 0,
 				  "spfi%u: TX read-offset table not found in the DT", p->nn);
@@ -551,6 +676,25 @@ int ramon_ioc_spfi_read(struct ramon_file *rf, void *arg, struct ramon_status *s
 				 "spfi%u read: cannot copy %u offsets from 0x%llx (%ld)",
 				 p->nn, p->n_offsets, p->offsets, PTR_ERR(offsets));
 		goto out_buf;
+	}
+	/* a page the stream has not flushed yet: FLUSH it first (no SPFI mutex held here) */
+	for (i = 0; i < p->n_offsets; i++)
+		need = max_t(u64, need, (u64)offsets[i] + 1);
+	spin_lock_irq(&sp->lock);
+	known = sp->flushed_end[array_index_nospec(p->stream_id, RAMON_SPFI_STREAMS)];
+	spin_unlock_irq(&sp->lock);
+	if (need > known) {
+		ret = ramon_spfi_flush_stream(sp, p->stream_id, timeout_ms, &rx_err, st);
+		if (ret) {
+			char why[sizeof(st->msg)];
+
+			strscpy(why, st->msg, sizeof(why));
+			ret = ramon_fail(st, st->code, p->stream_id, need - 1,
+					 "spfi%u read: FLUSH of stream %u before it failed: %s",
+					 p->nn, p->stream_id, why);
+			goto out;
+		}
+		flushed = true;
 	}
 	ret = ramon_spfi_lock(sp, &sp->read_lock, "read", st);
 	if (ret)
@@ -573,6 +717,9 @@ int ramon_ioc_spfi_read(struct ramon_file *rf, void *arg, struct ramon_status *s
 	mutex_unlock(&sp->read_lock);
 	if (stale)
 		ramon_buf_put(stale);
+	if (!ret && flushed)
+		ramon_note(st, "spfi%u: stream %u FLUSHed first (page %llu past flushed end %llu)%s",
+			   p->nn, p->stream_id, need - 1, known, rx_err ? ", FLUSH rx_err_code" : "");
 out:
 	kfree(offsets);
 out_buf:
