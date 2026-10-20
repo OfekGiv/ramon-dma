@@ -206,6 +206,10 @@ CRCs, stream tables) lives in userspace; the kernel only moves the bytes.
   success. Cancels release only waiters that started before them.
 - AXI lists longer than the xilinx_dma descriptor pool (5000 on this kernel) fail with
   `RAMON_E_BAD_COUNT` instead of silently.
+- `SPFI_READ` FLUSHes the stream first when a requested page is past what the stream is known to
+  have flushed. The driver tracks this per stream: a FLUSH covers every write before it, a write
+  makes its pages unflushed, CLOSE counts as flushed, OPEN/DELETE forget the stream and
+  FORMAT/INIT/PLATFORM_RESET forget every stream. The read's status message notes the FLUSH.
 - A timed-out `SPFI_READ` keeps its destination buffer alive until a later read completes, since
   the FPGA may still write into it. The old driver let that memory be reused.
 - DMA channels are halted before release, so the next owner never inherits a running engine.

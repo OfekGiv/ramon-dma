@@ -1436,3 +1436,113 @@ petalinux-build -c ramon-api && petalinux-build -c ramon-tools && petalinux-buil
 ramon_accept spfi-link                                  # after a fresh boot
 ramon_accept --spfi-format spfi-prep spfi-stream
 ```
+
+## Acceptance batch 4: mixed SPW + SPFI load (tools 0.5.0)
+
+Two new steps (user's tests #1 and #2), all users at once:
+
+| Step | Users |
+|---|---|
+| `mixed-write` | SPW messages every 1 s, 1 s, 0.1 s; SPFI writes of 12 pages / 1 s, 2 / 1 s, 4096 / 0.1 s, each to its own stream |
+| `mixed-rw` | the same SPW users; SPFI writes of 12 / 1 s, 2 / 1 s, 2048 / 0.1 s; SPFI reads of 2048 / 0.1 s from a fourth stream |
+
+Choices made here (please confirm):
+
+- **SPW messages** go to our own node (68) and come back through the NN, as `spw-nn-loop`, so
+  each one is checked; 4096-byte payload (the maximum) by default, `--mixed-spw-bytes`.
+- **Schedule:** fixed slots from a common start; an operation still running at its next slot is
+  a missed deadline, the missed slots are skipped (no catch-up burst). Missed deadlines fail the
+  step; `--mixed-late-ok` reports them only.
+- **Length:** `--mixed-seconds`, default 60 s per test.
+- **Reader:** stream d is written once (2048 stamped pages), then read every 0.1 s; each read checks
+  every page's stamp and one whole page (a rotating one), the last read is checked completely.
+- **Load:** test #1's 4096-page writer alone is 640 MiB/s; test #2 is 320 MiB/s written plus 320
+  MiB/s read. Each user reports average and longest operation time, so a missed deadline shows how
+  far off it was.
+
+```sh
+petalinux-build -c ramon-tools           # 0.5.0
+ramon_accept --mixed-seconds 10 --mixed-late-ok mixed-write mixed-rw    # first look
+ramon_accept mixed-write mixed-rw                                       # 60 s each
+```
+
+Checked here: against the fake device (which serializes every call, so its timings are not the
+board's) both steps run; faults are reported: missed deadlines (fail without `--mixed-late-ok`),
+dropped SPW messages (per user), wrong and corrupted SPFI pages, a failing writer (it stops, the
+others run on, every stream is still deleted), too few free streams. ThreadSanitizer found a race
+on the RX thread's last-arrival time (fixed); ThreadSanitizer, AddressSanitizer and UBSan are
+clean.
+
+### Tools 0.5.1: interim reports in the mixed tests
+
+- `--mixed-report-minutes N` (default 1, 0 = off): while `mixed-write` / `mixed-rw` run, a line
+  per user every N minutes: operations and missed deadlines so far and since the last report, the
+  longest operation and the throughput in that interval, SPW messages back; a user that stopped on
+  an error shows "STOPPED (error)". Only reports that fall before the end are printed, so the
+  default 60-second run looks as before.
+- Long runs: `--mixed-seconds` accepts up to 24 h. The writers keep appending to their streams, so
+  a multi-hour run fills the NN's storage (test #1 writes about 2.2 TB per hour, test #2 about
+  1.1 TB); the write that fails then is reported as such.
+- Checked here: a 150-second `mixed-rw` prints reports at 1 and 2 minutes; 60 s and
+  `--mixed-report-minutes 0` print none. ThreadSanitizer with reports found a race on the byte
+  counters (updated outside the user's lock; fixed) and is clean now, also with a writer that stops
+  on an error mid-run.
+
+```sh
+ramon_accept --mixed-seconds 14400 --mixed-report-minutes 10 mixed-rw | tee /tmp/mixed-4h.log
+```
+
+### Board finding: run spfi-prep with --spfi-format first
+
+- `ramon_accept --mixed-seconds 10 --mixed-late-ok mixed-write mixed-rw` failed at once: "stream
+  table: RAMON_E_SPFI_CMD_TIMEOUT". The NN answers stream commands (GET_ALL_STREAM_STATUS first)
+  only after the bring-up with FORMAT; `ramon_accept --spfi-format spfi-prep` first fixed it.
+- Decision (user): the SPFI and mixed steps keep relying on `spfi-prep`; they do no bring-up of
+  their own. Run `ramon_accept --spfi-format spfi-prep` once after power-up, before them.
+
+### Driver 0.8.10: SPFI_READ flushes the stream first when needed
+
+- **User request:** the driver tracks each stream's flushed position; a read that asks for pages
+  past it FLUSHes the stream first, so the pages read are valid.
+- **Design.** Per NN and stream (ids 0..197), under the SPFI spinlock: `flushed_end` (pages
+  `[0, flushed_end)` known flushed) and `written_end` (pages written through this driver).
+  - SPFI_WRITE of `[tx_offset, tx_offset + n)`: `flushed_end` drops to `tx_offset` before the
+    write (also if it fails); `written_end` grows when it succeeds.
+  - FLUSH answered with `rx_err_code` 0 (SPFI_CMD or automatic): `flushed_end = written_end`, or
+    "everything" for a stream nothing was written to since the driver loaded. FLUSH runs under
+    `write_lock`, so no write is in flight and every earlier one is covered. FLUSH's own
+    `rx_offset` is not used: its meaning was never measured.
+  - CLOSE answered with 0: everything flushed (**assumption**: closing completes the stream).
+  - OPEN, DELETE: that stream forgotten; FORMAT, INIT, PLATFORM_RESET: every stream forgotten.
+    These apply even when the command fails or is not waited for (forgetting is safe).
+  - SPFI_READ: if `max(offsets) + 1 > flushed_end`, FLUSH that stream first (taking `write_lock`
+    and `short_lock` before `read_lock`, so the lock order is unchanged), then read. A failed FLUSH
+    fails the read ("FLUSH of stream N before it failed: ..."); a FLUSH acked with an error code
+    does not. On success the status message says "stream N FLUSHed first (page P past flushed end
+    E)". A stream id above 197 is refused.
+- No ABI change: libramon works unchanged (header comments only). `ramon_cli` 0.5.2 prints a
+  driver note on success as `note: ...` (it printed only `ok:`), so the automatic FLUSH, and the
+  NN error codes the driver already noted, are visible.
+- **Not compiled here** (no kernel tree). New symbols are all in `ramon_dma.ksyms` already.
+- **Questions:** does the NN answer FLUSH on a closed stream? (After INIT the driver knows nothing,
+  so the first read of an existing closed stream FLUSHes it; a timeout would fail that read.) Is
+  CLOSE a complete flush?
+
+```sh
+petalinux-build -c ramon-dma        # 0.8.10
+ramon_cli spfiprep 0 format yes
+ramon_cli -f - <<'EOT'
+spfiopens 10 0 0
+spfigsend 10 8
+spfircv 10 0 8
+spfircv 10 0 8
+spficlose 10
+spfidel 10
+EOT
+dmesg | tail                        # nothing new expected
+ramon_accept spfi-stream            # flushes explicitly: still passes
+```
+
+The first `spfircv` (no FLUSH after `spfigsend`) should print the driver's note "stream 10
+FLUSHed first"; the second one should not (the stream is flushed by then). The old flow needed
+`spfiflush 10` between them.
