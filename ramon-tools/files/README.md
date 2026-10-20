@@ -158,7 +158,7 @@ that does not open fails only the steps that need it.
 | `spw-nn-loop` | `loopback 0`, `spwsend ... +68 100` | FPGA loopback off: packets to our own node (68) go out, the NN routes them back; every packet comes back once, intact and in order; packets/s and MiB/s |
 | `spw-fpga-loop` | `loopback 1`, `spwsend` | the same traffic through the FPGA loopback |
 | `spfi-link` | `spfidrvinit`, `spfireg +204` | SPFI link up: low byte of `0xCC` is `0x88`; IP versions printed |
-| `spfi-prep` | `spwdps 0`, `spfiinit 0`, `spfifmt`, `spfiginfo 1` | SPW DPS answered, INIT answered, FORMAT (only with `--spfi-format`), stream table read, room for the tests (2 free ids, 2 more streams can open) |
+| `spfi-prep` | `spwdps 0`, `spfiinit 0`, `spfifmt`, `spfiginfo 1` | SPW DPS answered, INIT answered, FORMAT (with `--spfi-format`), stream table read, room for the tests (2 free ids, 2 more streams can open) |
 | `spfi-stream` | stream #2: `spfitest +2 +150 +1000 1` | 150 pages x 1000 written, flushed, read back, every page verified |
 | `spfi-perf` | streams #3, #5 (`verify 0`) | 150 x 1000 and 5000 x 100: write and read MiB/s |
 | `spfi-large` | stream #4 | 5000 pages x 100, verified |
@@ -166,6 +166,8 @@ that does not open fails only the steps that need it.
 | `spfi-rxtx` | `spfirxtx`, streams #17-#20 | 100 x 5000 pages written while 80 x 5000 are read, and the reverse; reads verified, MiB/s |
 | `spfi-long` | stream #13 | 5000 x 200, throughput (current measurements); only with `--spfi-long` |
 | `spfi-soak` | `spfirxtx`, streams #21-#24 | the two 20-minute concurrent runs (750 and 7000 cycles), reads verified, cycles over 1 s counted; only with `--spfi-soak` |
+| `mixed-write` | test #1 (new) | 3 SPW users (a message every 1 s, 1 s, 0.1 s) and 3 SPFI writers (12 pages every 1 s, 2 every 1 s, 4096 every 0.1 s) at once: every message back intact, no error, no missed deadline |
+| `mixed-rw` | test #2 (new) | the same SPW users, SPFI writers of 12, 2 and 2048 pages, and a reader of 2048 pages every 0.1 s: also every page read intact |
 | `nn-version` | `nnswver` | each tested NN answers with its 4KBL, RSBL, image and FW versions; the image version contains `--nn-expect` if given |
 | `nn-config` | `nnconf` | the JSON configuration (at most 4096 bytes) is acknowledged; only with `--nn-config` |
 | `nn-update` | `nnupdate` | the NN accepts every packet of the software package; only with `--nn-update`; power-cycle afterwards |
@@ -213,14 +215,30 @@ they found.
 **SPFI.** A page (the old "offset") is 16 KiB. Every SPFI test opens its own
 streams on free ids and deletes them afterwards, so tests do not depend on each
 other or on the NN's old streams; the NN allows at most 8 open streams.
-`spfi-prep` FORMATs the NN only with `--spfi-format` (it erases every stream,
-as `spfifmt` in the delivery script). Verified tests stamp every page with its
+Run `spfi-prep --spfi-format` first after power-up: the NN answers stream
+commands only after the bring-up (SPW DPS, INIT) with FORMAT, and the other
+SPFI and mixed steps do not do it themselves. FORMAT erases every stream on the
+NN, as `spfifmt` in the delivery script. Verified tests stamp every page with its
 stream, run and page number, so a read that returns another run's or another
 page's data fails, not only corrupted data. `--spfi-scale PCT` runs PCT% of
 the runs and cycles (for a single-cycle concurrent test, of its writes and
 reads) for a quick check. The concurrent tests report each cycle's time against
 the delivery script's 1 s; cycles over 1 s are counted, not failed. NNs: every
 NN whose SPFI link is up, or `--spfi-nn` (SPFI1 is masked by the driver).
+
+**Mixed load.** Every user of `mixed-write` and `mixed-rw` is a thread on a
+fixed schedule from a common start, for `--mixed-seconds` (default 60). An
+operation still running when its next slot comes is a missed deadline; missed
+slots are skipped, not caught up. Missed deadlines fail the step unless
+`--mixed-late-ok`. SPW messages (`--mixed-spw-bytes`, default 4096) go to our
+own node and the NN sends them back; each is checked. The reader checks every
+page's stamp and one whole page per read, and its last read completely. Each
+user prints operations done, deadlines missed, average and longest operation
+time and its throughput. Test #1's 4096-page writer alone needs 640 MiB/s.
+For long runs, `--mixed-report-minutes N` (default 1, 0 = off) prints a line
+per user every N minutes while the test runs: totals so far and, for that
+interval, the change, the longest operation and the throughput; only reports
+before the end are printed, so a 60-second run shows none.
 
 **NN services.** `--nn-config` and `--nn-update` take `FILE` (every tested
 NN) or `NN=FILE` (that NN; it overrides `FILE`), and can be repeated, so

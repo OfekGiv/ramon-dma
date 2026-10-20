@@ -4,7 +4,8 @@
  *
  * spfi-link    link up: low byte of 0xCC is 0x88 (was spfidrvinit, spfireg +204)
  * spfi-prep    SPW link + DPS, INIT 0, FORMAT with --spfi-format, stream table
- *              (was spwdps 0, spfiinit 0, spfifmt, spfiginfo 1)
+ *              (was spwdps 0, spfiinit 0, spfifmt, spfiginfo 1); run it first,
+ *              the NN answers stream commands only after it
  * spfi-stream  150 pages x 1000, verified (stream #2)
  * spfi-perf    150 x 1000 and 5000 x 100, throughput only (#3, #5)
  * spfi-large   5000 x 100, verified (#4)
@@ -43,7 +44,7 @@ struct stamp {
 
 /* ---- setup ---- */
 
-static uint32_t spfi_setup(void)
+uint32_t a_spfi_setup(void)
 {
 	struct ramon_spfi_config fc;
 	struct ramon_status st;
@@ -98,7 +99,7 @@ static uint32_t scaled(uint32_t n)
 }
 
 /* n free stream ids on NN nn; reports and fails when there are fewer */
-static int free_ids(uint32_t nn, uint32_t *ids, unsigned n)
+int a_spfi_free_ids(uint32_t nn, uint32_t *ids, unsigned n)
 {
 	struct ramon_spfi_table *t = malloc(sizeof(*t));
 	struct ramon_status st;
@@ -124,20 +125,14 @@ static int free_ids(uint32_t nn, uint32_t *ids, unsigned n)
 
 /* ---- pages: a fixed pattern plus a stamp per page ---- */
 
-struct pages {
-	ramon_buf b;		/* DMA buffer */
-	uint8_t *ref;		/* the pattern in ordinary memory, for comparing */
-	uint32_t n;
-};
-
-static void pages_free(struct pages *p)
+void a_pages_free(struct a_pages *p)
 {
 	ramon_buf_free(&p->b, NULL);
 	free(p->ref);
 	memset(p, 0, sizeof(*p));
 }
 
-static int pages_alloc(struct pages *p, uint32_t n, int with_ref)
+int a_pages_alloc(struct a_pages *p, uint32_t n, int with_ref)
 {
 	struct ramon_status st;
 	size_t bytes = (size_t)n * PAGE;
@@ -150,7 +145,7 @@ static int pages_alloc(struct pages *p, uint32_t n, int with_ref)
 		p->ref = malloc(bytes);
 		if (!p->ref) {
 			tc_fail("out of memory for %zu bytes", bytes);
-			pages_free(p);
+			a_pages_free(p);
 			return -1;
 		}
 		tc_fill(p->ref, bytes, FILL_SEED);
@@ -159,7 +154,7 @@ static int pages_alloc(struct pages *p, uint32_t n, int with_ref)
 	return 0;
 }
 
-static void stamp_pages(struct pages *p, uint32_t n, uint32_t sid, uint32_t run)
+void a_stamp_pages(struct a_pages *p, uint32_t n, uint32_t sid, uint32_t run)
 {
 	struct stamp s = { STAMP_MAGIC, sid, run, 0 };
 	uint32_t i;
@@ -174,7 +169,7 @@ static void stamp_pages(struct pages *p, uint32_t n, uint32_t sid, uint32_t run)
  * Compares n pages of got (a read of run `run` of stream sid) with the
  * pattern of ref; returns the number of bad pages and prints the first few.
  */
-static uint32_t check_pages(const struct pages *got, const struct pages *ref, uint32_t n,
+uint32_t a_check_pages(const struct a_pages *got, const struct a_pages *ref, uint32_t n,
 			    uint32_t sid, uint32_t run, uint32_t *reported)
 {
 	struct stamp want = { STAMP_MAGIC, sid, run, 0 }, have;
@@ -213,7 +208,7 @@ static int stream_run(uint32_t nn, uint32_t pages, uint32_t runs, int verify,
 {
 	struct ramon_spfi_stream s;
 	struct ramon_status st;
-	struct pages src, dst;
+	struct a_pages src, dst;
 	uint64_t t0 = tc_now_ns(), t, wns = 0, rns = 0, bytes = (uint64_t)pages * PAGE;
 	uint32_t sid, r, bad, reported = 0, wruns = 0, rruns = 0;
 	int ret = -1;
@@ -221,15 +216,15 @@ static int stream_run(uint32_t nn, uint32_t pages, uint32_t runs, int verify,
 	memset(res, 0, sizeof(*res));
 	memset(&s, 0, sizeof(s));
 	memset(&dst, 0, sizeof(dst));
-	if (free_ids(nn, &sid, 1) || pages_alloc(&src, pages, verify))
+	if (a_spfi_free_ids(nn, &sid, 1) || a_pages_alloc(&src, pages, verify))
 		return -1;
-	if (pages_alloc(&dst, pages, 0))
+	if (a_pages_alloc(&dst, pages, 0))
 		goto out;
 	if (a_check(ramon_spfi_stream_open(A.c, nn, sid, pages * runs, &s, &st), "OPEN", &st))
 		goto out;
 	for (r = 0; r < runs; r++) {
 		if (verify)
-			stamp_pages(&src, pages, sid, r);
+			a_stamp_pages(&src, pages, sid, r);
 		t = tc_now_ns();
 		if (a_check(ramon_spfi_stream_append(A.c, &s, &src.b, 0, pages, 0, &st), "write", &st))
 			goto close;
@@ -246,7 +241,7 @@ static int stream_run(uint32_t nn, uint32_t pages, uint32_t runs, int verify,
 		rns += tc_now_ns() - t;
 		rruns++;
 		if (verify) {
-			bad = check_pages(&dst, &src, pages, sid, r, &reported);
+			bad = a_check_pages(&dst, &src, pages, sid, r, &reported);
 			res->bad_pages += bad;
 			res->bad_runs += bad != 0;
 		}
@@ -259,8 +254,8 @@ out:
 	res->w_mibps = wns ? bytes * wruns / MIB / (wns / 1e9) : 0;
 	res->r_mibps = rns ? bytes * rruns / MIB / (rns / 1e9) : 0;
 	res->secs = tc_ms_since(t0) / 1000;
-	pages_free(&src);
-	pages_free(&dst);
+	a_pages_free(&src);
+	a_pages_free(&dst);
 	return ret;
 }
 
@@ -278,7 +273,7 @@ static void run_stream_jobs(const struct stream_job *jobs, unsigned n)
 	uint32_t use, nn, runs;
 	unsigned i;
 
-	use = spfi_setup();
+	use = a_spfi_setup();
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
 		if (!(use & (1u << nn)))
 			continue;
@@ -352,7 +347,7 @@ struct rxtx_result {
 static int rxtx_run(uint32_t nn, const struct rxtx_job *j, uint32_t cycles, struct rxtx_result *res)
 {
 	struct ramon_spfi_stream ws, rs;
-	struct pages wsrc, rdst[2], ref;
+	struct a_pages wsrc, rdst[2], ref;
 	struct ramon_status st;
 	struct writer w;
 	pthread_t th;
@@ -367,13 +362,13 @@ static int rxtx_run(uint32_t nn, const struct rxtx_job *j, uint32_t cycles, stru
 	memset(rdst, 0, sizeof(rdst));
 	memset(&ref, 0, sizeof(ref));
 	res->min_slack = 1e9;
-	if (free_ids(nn, ids, 2) || pages_alloc(&ref, rpages, 1) || pages_alloc(&wsrc, max2(j->wp), 0))
+	if (a_spfi_free_ids(nn, ids, 2) || a_pages_alloc(&ref, rpages, 1) || a_pages_alloc(&wsrc, max2(j->wp), 0))
 		goto out;
 	for (k = 0; k < 2; k++)
-		if (j->rp[k] && pages_alloc(&rdst[k], j->rp[k], 0))
+		if (j->rp[k] && a_pages_alloc(&rdst[k], j->rp[k], 0))
 			goto out;
 	/* the read stream: rpages pages written once and flushed */
-	stamp_pages(&ref, rpages, ids[1], 0);
+	a_stamp_pages(&ref, rpages, ids[1], 0);
 	if (a_check(ramon_spfi_stream_open(A.c, nn, ids[1], rpages, &rs, &st), "OPEN read stream", &st) ||
 	    a_check(ramon_spfi_stream_append(A.c, &rs, &ref.b, 0, rpages, 0, &st), "fill read stream",
 		    &st) ||
@@ -423,7 +418,7 @@ static int rxtx_run(uint32_t nn, const struct rxtx_job *j, uint32_t cycles, stru
 		/* the last read of each size, outside the timed part */
 		for (k = 0; k < 2; k++)
 			if (j->rp[k] && j->rn[k])
-				res->bad_pages += check_pages(&rdst[k], &ref, j->rp[k], ids[1], 0, &reported);
+				res->bad_pages += a_check_pages(&rdst[k], &ref, j->rp[k], ids[1], 0, &reported);
 		if (cycles <= 10 || (c + 1) % step == 0)
 			tc_info("spfi%u:   cycle %u/%u: %.0f ms (slack %.0f ms), write %.1f, read %.1f MiB/s",
 				nn, c + 1, cycles, cyc / 1e6, CYCLE_MS - cyc / 1e6,
@@ -438,10 +433,10 @@ close:
 out:
 	res->w_mibps = wns ? (double)wbytes * res->cycles_done / MIB / (wns / 1e9) : 0;
 	res->r_mibps = rns ? (double)rbytes / MIB / (rns / 1e9) : 0;
-	pages_free(&ref);
-	pages_free(&wsrc);
-	pages_free(&rdst[0]);
-	pages_free(&rdst[1]);
+	a_pages_free(&ref);
+	a_pages_free(&wsrc);
+	a_pages_free(&rdst[0]);
+	a_pages_free(&rdst[1]);
 	return ret;
 }
 
@@ -453,7 +448,7 @@ static void run_rxtx_jobs(const struct rxtx_job *jobs, unsigned n)
 	uint32_t use, nn, cycles;
 	unsigned i;
 
-	use = spfi_setup();
+	use = a_spfi_setup();
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
 		if (!(use & (1u << nn)))
 			continue;
@@ -503,7 +498,7 @@ static void step_spfi_link(void)
 	uint32_t nn, use, raw, v[3], i;
 	int up;
 
-	use = spfi_setup();
+	use = a_spfi_setup();
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
 		if (!ramon_spfi_present(A.c, nn))
 			continue;
@@ -534,7 +529,7 @@ static void step_spfi_prep(void)
 	char sum[160] = "";
 	size_t used = 0;
 
-	use = spfi_setup();
+	use = a_spfi_setup();
 	if (!use) {
 		a_summary("no SPFI link up");
 		return;

@@ -37,7 +37,7 @@ static struct result *cur;
 
 /* nn last: nn-update needs a power cycle afterwards */
 static const struct step *const groups[] = { accept_board, accept_ddr4, accept_spw, accept_spfi,
-					     accept_nn };
+					     accept_mixed, accept_nn };
 
 void a_summary(const char *fmt, ...)
 {
@@ -64,7 +64,8 @@ static void list_steps(void)
 
 	for (g = 0; g < ARRAY_SIZE(groups); g++)
 		for (s = groups[g]; s->name; s++)
-			printf("  %-14s %s (was %s)\n", s->name, s->help, s->legacy);
+			printf("  %-14s %s%s%s%s\n", s->name, s->help, s->legacy ? " (was " : "",
+			       s->legacy ? s->legacy : "", s->legacy ? ")" : "");
 }
 
 static const struct step *find_step(const char *name)
@@ -126,6 +127,10 @@ static void usage(FILE *f)
 		"      --spfi-scale PCT    run PCT%% of the SPFI runs and cycles, for a quick check (default 100)\n"
 		"      --spfi-long         also run spfi-long (5000 x 200, current measurements)\n"
 		"      --spfi-soak         also run spfi-soak (the two 20-minute concurrent runs)\n"
+		"      --mixed-seconds N   length of mixed-write and mixed-rw (default 60)\n"
+		"      --mixed-spw-bytes N payload of their SPW messages (default and maximum 4096)\n"
+		"      --mixed-late-ok     missed deadlines in the mixed tests are reported, not failed\n"
+		"      --mixed-report-minutes N  a line per mixed-test user every N minutes (default 1, 0 = off)\n"
 		"      --fail-fast         stop at the first failing step\n"
 		"  -l, --list              list the steps\n"
 		"  -V, --version           print the versions\n",
@@ -190,7 +195,8 @@ int main(int argc, char **argv)
 	enum { O_RSTOP = 1, O_LIMITS, O_LABEL, O_BASE, O_SIZE, O_MB, O_DT, O_MEM, O_FAIL_FAST,
 	       O_SPW_NN, O_SPW_NODE, O_SPW_APP, O_SPW_SIZES, O_SPW_COUNT, O_SPW_SECONDS, O_SPW_WINDOW,
 	       O_NN_EXPECT, O_NN_CONFIG, O_NN_UPDATE, O_NN_SW_TYPE, O_SPW_SYNC,
-	       O_SPFI_NN, O_SPFI_FORMAT, O_SPFI_SCALE, O_SPFI_LONG, O_SPFI_SOAK, O_SPFI_CHANS };
+	       O_SPFI_NN, O_SPFI_FORMAT, O_SPFI_SCALE, O_SPFI_LONG, O_SPFI_SOAK, O_SPFI_CHANS,
+	       O_MIXED_SECONDS, O_MIXED_BYTES, O_MIXED_LATE_OK, O_MIXED_REPORT };
 	static const struct option opts[] = {
 		{ "dev", required_argument, NULL, 'd' },
 		{ "rstop-version", required_argument, NULL, O_RSTOP },
@@ -216,6 +222,10 @@ int main(int argc, char **argv)
 		{ "spfi-long", no_argument, NULL, O_SPFI_LONG },
 		{ "spfi-soak", no_argument, NULL, O_SPFI_SOAK },
 		{ "spfi-chans", required_argument, NULL, O_SPFI_CHANS },
+		{ "mixed-seconds", required_argument, NULL, O_MIXED_SECONDS },
+		{ "mixed-spw-bytes", required_argument, NULL, O_MIXED_BYTES },
+		{ "mixed-late-ok", no_argument, NULL, O_MIXED_LATE_OK },
+		{ "mixed-report-minutes", required_argument, NULL, O_MIXED_REPORT },
 		{ "nn-expect", required_argument, NULL, O_NN_EXPECT },
 		{ "nn-config", required_argument, NULL, O_NN_CONFIG },
 		{ "nn-update", required_argument, NULL, O_NN_UPDATE },
@@ -248,6 +258,9 @@ int main(int argc, char **argv)
 	A.o.spfi_scale = 100;
 	A.o.spfi_chan[0] = RAMON_SPFI_CHAN_NN0;
 	A.o.spfi_chan[1] = RAMON_SPFI_CHAN_NN1;
+	A.o.mixed_seconds = 60;
+	A.o.mixed_spw_bytes = RAMON_SPW_MAX_PAYLOAD;
+	A.o.mixed_report_min = 1;
 	while ((opt = getopt_long(argc, argv, "d:lVh", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
@@ -302,6 +315,7 @@ int main(int argc, char **argv)
 		case O_SPFI_FORMAT:
 			A.o.spfi_format = 1;
 			break;
+
 		case O_SPFI_SCALE:
 			if (tc_parse_u32(optarg, &v32) || !v32 || v32 > 100) {
 				fprintf(stderr, "ramon_accept: --spfi-scale wants 1..100\n");
@@ -314,6 +328,31 @@ int main(int argc, char **argv)
 			break;
 		case O_SPFI_SOAK:
 			A.o.spfi_soak = 1;
+			break;
+		case O_MIXED_SECONDS:
+			if (tc_parse_u32(optarg, &v32) || !v32 || v32 > 86400) {
+				fprintf(stderr, "ramon_accept: --mixed-seconds wants 1..86400\n");
+				return 2;
+			}
+			A.o.mixed_seconds = v32;
+			break;
+		case O_MIXED_BYTES:
+			if (tc_parse_u32(optarg, &v32) || v32 > RAMON_SPW_MAX_PAYLOAD) {
+				fprintf(stderr, "ramon_accept: --mixed-spw-bytes wants 0..%u (the SPW maximum)\n",
+					RAMON_SPW_MAX_PAYLOAD);
+				return 2;
+			}
+			A.o.mixed_spw_bytes = v32;
+			break;
+		case O_MIXED_LATE_OK:
+			A.o.mixed_late_ok = 1;
+			break;
+		case O_MIXED_REPORT:
+			if (tc_parse_u32(optarg, &v32) || v32 > 1440) {
+				fprintf(stderr, "ramon_accept: --mixed-report-minutes wants 0..1440\n");
+				return 2;
+			}
+			A.o.mixed_report_min = v32;
 			break;
 		case O_SPFI_CHANS:
 			if (tc_parse_pair(optarg, A.o.spfi_chan)) {

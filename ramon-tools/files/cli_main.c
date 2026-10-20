@@ -384,6 +384,9 @@ static int run_line(struct cli *cl, char *line)
 	if (!ret)
 		ret = k->fn(cl, argc, argv);
 	if (!ret) {
+		/* a driver note on success, e.g. an automatic FLUSH or an NN error code */
+		if (cl->st.msg[0] && !cl->st.code)
+			printf("      note: %.*s\n", (int)sizeof(cl->st.msg), cl->st.msg);
 		if (!quit_requested)
 			printf("ok: %s\n", k->name);
 	} else if (ret == -EINTR || cli_interrupted) {

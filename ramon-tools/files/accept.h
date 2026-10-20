@@ -49,6 +49,10 @@ struct accept_opts {
 	uint32_t spfi_scale;		/* --spfi-scale: percent of the runs and cycles, 1..100 */
 	int spfi_long;			/* --spfi-long */
 	int spfi_soak;			/* --spfi-soak */
+	uint32_t mixed_seconds;		/* --mixed-seconds: length of each mixed test */
+	uint32_t mixed_spw_bytes;	/* --mixed-spw-bytes: payload of the SPW messages */
+	int mixed_late_ok;		/* --mixed-late-ok: missed deadlines are reported, not failed */
+	uint32_t mixed_report_min;	/* --mixed-report-minutes: interim report period, 0 = none */
 	int fail_fast;
 };
 
@@ -67,7 +71,7 @@ struct step {
 	const char *name;
 	void (*fn)(void);
 	unsigned needs;
-	const char *legacy;		/* the dmaapi_testv2 command it replaces */
+	const char *legacy;		/* the dmaapi_testv2 command it replaces, or NULL */
 	const char *help;
 	/* NULL: in every default run; else only when it returns true (the step's option is given) */
 	int (*wanted)(void);
@@ -80,10 +84,30 @@ int a_check(int ret, const char *what, const struct ramon_status *st);
 /* SPW layer up and links synced once; returns the NNs to test (accept_spw.c) */
 uint32_t a_spw_setup(void);
 
+/* SPFI helpers shared by accept_spfi.c and accept_mixed.c */
+/* SPW and SPFI set up, links waited for; returns the SPFI NNs to test */
+uint32_t a_spfi_setup(void);
+/* n free stream ids on NN nn, with room to open them; reports and fails otherwise */
+int a_spfi_free_ids(uint32_t nn, uint32_t *ids, unsigned n);
+
+/* n pages of 16 KiB: a fixed pattern, and a 16-byte stamp per page */
+struct a_pages {
+	ramon_buf b;		/* DMA buffer */
+	uint8_t *ref;		/* the pattern in ordinary memory, for comparing */
+	uint32_t n;
+};
+int a_pages_alloc(struct a_pages *p, uint32_t n, int with_ref);
+void a_pages_free(struct a_pages *p);
+void a_stamp_pages(struct a_pages *p, uint32_t n, uint32_t sid, uint32_t run);
+/* bad pages of a read of run `run` of stream sid; prints the first few */
+uint32_t a_check_pages(const struct a_pages *got, const struct a_pages *ref, uint32_t n,
+		       uint32_t sid, uint32_t run, uint32_t *reported);
+
 extern const struct step accept_board[];	/* accept_board.c */
 extern const struct step accept_ddr4[];		/* accept_ddr4.c */
 extern const struct step accept_spw[];		/* accept_spw.c */
 extern const struct step accept_nn[];		/* accept_nn.c */
 extern const struct step accept_spfi[];		/* accept_spfi.c */
+extern const struct step accept_mixed[];	/* accept_mixed.c */
 
 #endif /* ACCEPT_H */
