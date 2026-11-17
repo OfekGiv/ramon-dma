@@ -1524,9 +1524,8 @@ ramon_accept --mixed-seconds 14400 --mixed-report-minutes 10 mixed-rw | tee /tmp
   driver note on success as `note: ...` (it printed only `ok:`), so the automatic FLUSH, and the
   NN error codes the driver already noted, are visible.
 - **Not compiled here** (no kernel tree). New symbols are all in `ramon_dma.ksyms` already.
-- **Questions:** does the NN answer FLUSH on a closed stream? (After INIT the driver knows nothing,
-  so the first read of an existing closed stream FLUSHes it; a timeout would fail that read.) Is
-  CLOSE a complete flush?
+- **Questions** (answered by the user, see 0.8.11): does the NN answer FLUSH on a closed stream?
+  Is CLOSE a complete flush?
 
 ```sh
 petalinux-build -c ramon-dma        # 0.8.10
@@ -1546,3 +1545,80 @@ ramon_accept spfi-stream            # flushes explicitly: still passes
 The first `spfircv` (no FLUSH after `spfigsend`) should print the driver's note "stream 10
 FLUSHed first"; the second one should not (the stream is flushed by then). The old flow needed
 `spfiflush 10` between them.
+
+### Driver 0.8.11: never FLUSH a closed stream
+
+- **User input:** a closed stream is fully flushed; a closed stream cannot be flushed; any answer
+  from the NN to CLOSE means the stream was flushed.
+- **Problem in 0.8.10:** after a driver load, INIT, FORMAT or PLATFORM_RESET the driver knew
+  nothing, so the first read of an existing (closed) stream sent a FLUSH the NN cannot do.
+- **Design.** Each stream also has a state, under the SPFI spinlock (`track[]`):
+  | Event | State |
+  |---|---|
+  | OPEN answered with `rx_err_code` 0 | open, nothing written or flushed |
+  | SPFI_WRITE succeeded | open (only an open stream takes data; covers streams opened before the driver loaded) |
+  | CLOSE answered, any `rx_err_code` | closed, fully flushed |
+  | DELETE, or OPEN failed / unanswered / answered with an error | unknown |
+  | FORMAT, INIT, PLATFORM_RESET, driver load | every stream unknown |
+  - SPFI_READ FLUSHes first only when the stream is **open**, `max(offsets) + 1 > flushed_end`,
+    and `written_end > flushed_end` (a write through the driver left pages unflushed). Closed
+    and unknown streams are read without a FLUSH; reading never-written pages of an open stream
+    does not FLUSH either.
+  - FLUSH tracking is unchanged: counts only when answered with `rx_err_code` 0.
+- No ABI change. **Not compiled here**; no new kernel symbols (ksyms unchanged).
+
+```sh
+petalinux-build -c ramon-dma        # 0.8.11
+ramon_cli -f - <<'EOT'
+spfiopens 10 0 0
+spfigsend 10 8
+spfircv 10 0 8
+spficlose 10
+spfircv 10 0 8
+spfidel 10
+EOT
+```
+
+The first `spfircv` notes "stream 10 FLUSHed first"; the one after `spficlose` must not (and
+must not time out). After `rmmod`/`insmod`, reading an existing closed stream must not FLUSH.
+
+### Driver 0.8.12: security gaps G1-G3 closed (smoke 0.8.20, tools 0.5.3)
+
+The security report (driver 0.8.8) left three gaps open; this closes them.
+
+- **G1, SPFI command block driver-only.** `REG_IO` refuses writes to SPFI words 0..10
+  (`0x00`..`0x28`: command, parameters, `RD_BURST_ADDR`) with `RAMON_E_REGWIN_PROTECTED` (197,
+  `EPERM`). Before, a caller could write any address into words 9-10 and 0x18 into word 0, and
+  the FPGA wrote 16 KiB per offset there; word 0 alone reused the last address the driver set,
+  possibly a freed buffer. Only the driver writes these words in normal operation (SPFI_CMD,
+  SPFI_WRITE, SPFI_READ); userspace only reads 16-18, 50, 51 and writes word 11 (loopback, old
+  `spfi_loopback()`), which stays writable. Reads are unchanged. `struct ramon_regwin` gained
+  `wr_protect_end`; `REGWIN_INFO` flags the SPFI windows `RAMON_REGWIN_CMD_PROTECTED` (0x4).
+  The `reg-access` (AXI-stream switches) and SPW windows hold no DMA addresses and stay writable.
+- **G2, addresses only with CAP_SYS_RAWIO.** `BUF_INFO.dma_addr`, `REGWIN_INFO.phys` and
+  `CHAN_INFO.phys` (AXI and ZDMA) are 0 unless the opener had `CAP_SYS_RAWIO`, checked once in
+  `open()` so a passed fd does not widen it. Window names keep their DT unit address: register
+  blocks are public in `/proc/device-tree`; buffer DMA addresses were the sensitive part.
+- **G3, access policy.** The node stays root-only (0600), by decision; no udev rule.
+- ABI stays 1 (one new error code, one flag). New kernel import: **`capable`**, added to
+  `linux-xlnx/ramon_dma.ksyms`. If modpost reports it undefined on the hardened image, rebuild
+  and reflash the kernel with the updated whitelist; the non-hardened image needs nothing.
+- **Not compiled here** (no kernel tree). ramon_smoke 0.8.20 and tools 0.5.3 build on the host
+  with `-Werror`.
+- ramon_smoke `--errors` (driver 0.8.12 or later): SPFI words 9 and 0 refused, word 9 read and a
+  write-back of word 11 allowed, the CMD_PROTECTED flag; then the parent (root) must see non-zero
+  addresses and a child that drops `CAP_SYS_RAWIO` (raw capset) and reopens the device must see 0.
+  The BUF_INFO checks in smoke and ramon_test accept 0 when not privileged. ramon_cli and
+  ramon_test print `cmd-protected` in the window list.
+
+```sh
+petalinux-build -c ramon-dma         # 0.8.12
+petalinux-build -c ramon-smoke       # 0.8.20
+petalinux-build -c ramon-tools       # 0.5.3
+ramon_smoke --errors              # REGWIN_PROTECTED and the CAP_SYS_RAWIO checks pass
+ramon_cli spfireg 0x24 1          # refused: RAMON_E_REGWIN_PROTECTED
+ramon_cli spfireg 0xCC            # read still works (link 0x88)
+ramon_cli spfireg 0x2C 0          # word 11 (loopback) still writable
+ramon_cli regwins                 # spfi0 shows cmd-protected; phys shown as root
+ramon_accept --spfi-format spfi-prep spfi-link spfi-stream   # SPFI unaffected
+```

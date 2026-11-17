@@ -147,11 +147,16 @@ ratelimited.
 - 3: `rtc` (read-only)
 - 4–7: `ttc0`..`ttc3` (read-only)
 - 8–9: `spw0@…`, `spw1@…`
-- 10–11: `spfi0@…`, `spfi1@…`
+- 10–11: `spfi0@…`, `spfi1@…` (words 0–10, the command block, are written only by the driver:
+  `CMD_PROTECTED`)
 - 12 and up: the `reg-access` devices by their DT names
 
 A name also matches its part before `@` (`"spw0"`). Windows missing on the board are listed as
 `ABSENT`, so indices never move.
+
+`BUF_INFO`, `REGWIN_INFO` and `CHAN_INFO` report physical addresses only when the process that
+opened the fd had `CAP_SYS_RAWIO` (root does); otherwise those fields are 0. `/dev/ramon_dma`
+stays root-only (mode 0600).
 
 ## Using the NN
 
@@ -206,16 +211,24 @@ CRCs, stream tables) lives in userspace; the kernel only moves the bytes.
   success. Cancels release only waiters that started before them.
 - AXI lists longer than the xilinx_dma descriptor pool (5000 on this kernel) fail with
   `RAMON_E_BAD_COUNT` instead of silently.
-- `SPFI_READ` FLUSHes the stream first when a requested page is past what the stream is known to
-  have flushed. The driver tracks this per stream: a FLUSH covers every write before it, a write
-  makes its pages unflushed, CLOSE counts as flushed, OPEN/DELETE forget the stream and
-  FORMAT/INIT/PLATFORM_RESET forget every stream. The read's status message notes the FLUSH.
+- `SPFI_READ` FLUSHes an open stream first when a requested page is past what the stream is known
+  to have flushed and a write left pages unflushed. The driver tracks this per stream: OPEN or a
+  successful write marks it open, a FLUSH covers every write before it, a write makes its pages
+  unflushed, and any answer to CLOSE marks it closed and fully flushed (the NN cannot flush a
+  closed stream, so it never gets one). DELETE forgets the stream and FORMAT/INIT/PLATFORM_RESET
+  forget every stream; a stream the driver knows nothing about is never flushed. The read's status
+  message notes the FLUSH.
 - A timed-out `SPFI_READ` keeps its destination buffer alive until a later read completes, since
   the FPGA may still write into it. The old driver let that memory be reused.
 - DMA channels are halted before release, so the next owner never inherits a running engine.
   After a timeout resets an axi_dma IP, the IP's other channel is re-acquired so its interrupts
   work again.
 - Register access is bounds- and alignment-checked; the old driver used user offsets unchecked.
+- `REG_IO` refuses writes to SPFI words 0–10 (`0x00`–`0x28`: command, parameters, READ_STREAM
+  destination address) with `RAMON_E_REGWIN_PROTECTED` (`EPERM`); reads stay allowed and word 11
+  (loopback) and above stay writable. Written by hand, these let a caller make the FPGA write to
+  any physical address. Use `SPFI_CMD`, `SPFI_WRITE` and `SPFI_READ`.
+- Physical addresses are reported only to an opener with `CAP_SYS_RAWIO` (see "ABI in short").
 
 ## Testing
 
