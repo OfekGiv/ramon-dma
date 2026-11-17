@@ -193,9 +193,10 @@ static int cmd_regwins(struct cli *cl, int argc, char **argv)
 		if (ret)
 			return ret;
 		ri.name[RAMON_NAME_LEN - 1] = 0;
-		printf("      %2u %-24s phys 0x%010llx size 0x%-5x%s%s\n", i, ri.name,
+		printf("      %2u %-24s phys 0x%010llx size 0x%-5x%s%s%s\n", i, ri.name,
 		       (unsigned long long)ri.phys, ri.size,
 		       ri.flags & RAMON_REGWIN_RO ? " read-only" : "",
+		       ri.flags & RAMON_REGWIN_CMD_PROTECTED ? " cmd-protected" : "",
 		       ri.flags & RAMON_REGWIN_ABSENT ? " absent" : "");
 	}
 	return 0;

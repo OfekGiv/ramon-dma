@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define MIB		(1024u * 1024u)
 #define CMA_SLACK_KB	2048
@@ -64,8 +65,9 @@ static void test_buffers(void)
 		if (bad >= 0)
 			tc_fail("%llu-byte buffer reads back wrong at byte %ld",
 				(unsigned long long)b.size, bad);
+		/* the driver reports the address only to an opener with CAP_SYS_RAWIO */
 		if (!t_check(ramon_buf_dma_addr(&b, &dma, &st), "BUF_INFO", &st) &&
-		    (!dma || dma % page))
+		    ((!dma && !geteuid()) || dma % page))
 			tc_fail("dma address 0x%llx", (unsigned long long)dma);
 		t_check(ramon_buf_free(&b, &st), "ramon_buf_free", &st);
 	}
@@ -192,8 +194,9 @@ static void test_regwin(void)
 		if ((ri.flags & RAMON_REGWIN_ABSENT) && (ri.size || ri.phys))
 			tc_fail("absent window %u has size 0x%x phys 0x%llx", i, ri.size,
 				(unsigned long long)ri.phys);
-		tc_info("%2u %-24s 0x%010llx size 0x%x%s%s", i, ri.name, (unsigned long long)ri.phys,
+		tc_info("%2u %-24s 0x%010llx size 0x%x%s%s%s", i, ri.name, (unsigned long long)ri.phys,
 			ri.size, ri.flags & RAMON_REGWIN_RO ? " RO" : "",
+			ri.flags & RAMON_REGWIN_CMD_PROTECTED ? " cmd-protected" : "",
 			ri.flags & RAMON_REGWIN_ABSENT ? " absent" : "");
 	}
 }
