@@ -95,6 +95,11 @@ enum ramon_spfi_word {
 	RAMON_SPFI_IRQ_VECTOR_INT	= 63,	/* pending vector, read first */
 };
 
+/*
+ * Words 0..10 (command, its parameters, the READ_STREAM destination address)
+ * are written only by the driver: REG_IO refuses writes below this offset.
+ */
+#define RAMON_SPFI_CMD_BLOCK_END	RAMON_SPFI_REG(RAMON_SPFI_TX_RD_BURST_ADDR_HI + 1)
 #define RAMON_SPFI_SRC_LOGICAL_ADDR_VAL	1
 #define RAMON_SPFI_IRQ_VC0TX		BIT(0)	/* command accepted: ignored */
 #define RAMON_SPFI_IRQ_VC1TX		BIT(1)	/* data-write / close / flush ack */
@@ -104,6 +109,10 @@ enum ramon_spfi_word {
 #define RAMON_SPFI_ALERT_FIFO_DEPTH	16	/* power of two (kfifo) */
 #define RAMON_SPFI_STREAMS		198	/* stream ids 0..197 on the NN */
 #define RAMON_SPFI_FLUSHED_ALL		U32_MAX	/* flushed_end: whatever the stream holds */
+/* ramon_spfi.track[]: what the driver knows about a stream */
+#define RAMON_SPFI_TRACK_UNKNOWN	0	/* after load, DELETE, FORMAT, INIT, PLATFORM_RESET */
+#define RAMON_SPFI_TRACK_OPEN		1	/* OPEN answered, or a DATA_WRITE succeeded */
+#define RAMON_SPFI_TRACK_CLOSED		2	/* CLOSE answered: complete, cannot be flushed */
 #define RAMON_SPFI_MASK_DEFAULT		0x1	/* only NN0's SPFI is wired on this board */
 #define RAMON_SPFI_MASK_ALL		(BIT(RAMON_NN_COUNT) - 1)
 

@@ -3,7 +3,9 @@
  * Bounded register windows for REG_IO: RS-TOP, the PS SYSMON/RTC/TTC blocks,
  * the SPW and SPFI register blocks and the DT "reg-access" devices. Every
  * window is mapped once at probe (devm, released after remove() has drained
- * the gate) and keeps its index even when absent on this board.
+ * the gate) and keeps its index even when absent on this board. The SPFI
+ * command block (words 0..10) is written only by the driver: with it, REG_IO
+ * could aim a READ_STREAM at any physical address.
  */
 #define pr_fmt(fmt) "ramon_dma: " fmt
 
@@ -45,8 +47,9 @@ static void ramon_win_map(struct ramon_dev *rd, struct ramon_regwin *win, phys_a
 	win->phys = phys;
 	win->size = size;
 	win->flags = flags;
-	dev_info(dev, "regwin %u %s: %pa size 0x%x%s\n", idx, win->name, &phys, size,
-		 flags & RAMON_REGWIN_RO ? " read-only" : "");
+	dev_info(dev, "regwin %u %s: %pa size 0x%x%s%s\n", idx, win->name, &phys, size,
+		 flags & RAMON_REGWIN_RO ? " read-only" : "",
+		 flags & RAMON_REGWIN_CMD_PROTECTED ? " command block driver-only" : "");
 }
 
 static u32 ramon_res_size(const struct resource *res)
@@ -54,14 +57,19 @@ static u32 ramon_res_size(const struct resource *res)
 	return min_t(resource_size_t, resource_size(res), U32_MAX);
 }
 
-/* SPW/SPFI blocks are mapped with the fixed window size the old driver used. */
+/*
+ * SPW/SPFI blocks are mapped with the fixed window size the old driver used;
+ * REG_IO refuses writes below @protect_end.
+ */
 static void ramon_win_map_block(struct ramon_dev *rd, struct ramon_regwin *win,
-				const struct resource *res, u32 size)
+				const struct resource *res, u32 size, u32 protect_end)
 {
 	if (ramon_res_size(res) < size)
 		dev_warn(&rd->pdev->dev, "regwin %s: DT reg size 0x%x < register window 0x%x\n",
 			 win->name, ramon_res_size(res), size);
-	ramon_win_map(rd, win, res->start, size, 0);
+	ramon_win_map(rd, win, res->start, size,
+		      protect_end ? RAMON_REGWIN_CMD_PROTECTED : 0);
+	win->wr_protect_end = protect_end;
 }
 
 static void ramon_regwin_rstop(struct ramon_dev *rd, const struct ramon_of_hw *hw)
@@ -113,7 +121,7 @@ static void ramon_regwin_spw(struct ramon_dev *rd, const struct ramon_of_hw *hw)
 		}
 		win = ramon_win_name(rd, RAMON_WIN_SPW0 + nn, RAMON_WIN_NAME_SPW "%u@%llx",
 				     nn, (u64)hw->spw[nn].start);
-		ramon_win_map_block(rd, win, &hw->spw[nn], RAMON_SPW_WIN_SIZE);
+		ramon_win_map_block(rd, win, &hw->spw[nn], RAMON_SPW_WIN_SIZE, 0);
 	}
 }
 
@@ -129,7 +137,8 @@ static void ramon_regwin_spfi(struct ramon_dev *rd, const struct ramon_of_hw *hw
 		}
 		win = ramon_win_name(rd, RAMON_WIN_SPFI0 + nn, RAMON_WIN_NAME_SPFI "%u@%llx",
 				     nn, (u64)hw->spfi[nn].start);
-		ramon_win_map_block(rd, win, &hw->spfi[nn], RAMON_SPFI_WIN_SIZE);
+		ramon_win_map_block(rd, win, &hw->spfi[nn], RAMON_SPFI_WIN_SIZE,
+				    RAMON_SPFI_CMD_BLOCK_END);
 	}
 }
 
@@ -204,7 +213,7 @@ int ramon_ioc_regwin_info(struct ramon_file *rf, void *arg, struct ramon_status 
 	if (ret)
 		return ret;
 	p->size = win->size;
-	p->phys = win->phys;
+	p->phys = rf->see_phys ? win->phys : 0;
 	p->flags = win->flags;
 	memcpy(p->name, win->name, sizeof(p->name));
 	return 0;
@@ -263,6 +272,11 @@ int ramon_ioc_reg_io(struct ramon_file *rf, void *arg, struct ramon_status *st)
 		return ramon_fail(st, RAMON_E_REGWIN_READ_ONLY, p->offset, p->value,
 				  "regwin %s: read-only, write of 0x%x at 0x%x refused",
 				  win->name, p->value, p->offset);
+	if (p->op == RAMON_REG_OP_WRITE && p->offset < win->wr_protect_end)
+		return ramon_fail(st, RAMON_E_REGWIN_PROTECTED, p->offset, p->value,
+				  "regwin %s: write of 0x%x at 0x%x (word %u) refused: words 0..%u are the SPFI command block, written only by the driver (use SPFI_CMD, SPFI_WRITE, SPFI_READ)",
+				  win->name, p->value, p->offset, p->offset / 4,
+				  win->wr_protect_end / 4 - 1);
 	ramon_reg_access(win, p);
 	return 0;
 }

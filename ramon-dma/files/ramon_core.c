@@ -5,6 +5,7 @@
 #define pr_fmt(fmt) "ramon_dma: " fmt
 
 #include <linux/build_bug.h>
+#include <linux/capability.h>
 #include <linux/compat.h>
 #include <linux/device.h>
 #include <linux/fs.h>
@@ -399,6 +400,8 @@ static int ramon_open(struct inode *inode, struct file *file)
 		return -ENOMEM;
 	mutex_init(&rf->lock);
 	idr_init(&rf->bufs);
+	/* the opener's rights, so a passed fd does not widen them */
+	rf->see_phys = capable(CAP_SYS_RAWIO);
 	ramon_dev_get(rd);
 	rf->rd = rd;
 	file->private_data = rf;

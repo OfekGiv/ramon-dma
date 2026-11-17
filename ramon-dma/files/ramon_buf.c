@@ -167,7 +167,7 @@ int ramon_ioc_buf_info(struct ramon_file *rf, void *arg, struct ramon_status *st
 		return ramon_fail(st, RAMON_E_NO_SUCH_HANDLE, p->handle, 0,
 				  "buf %u: no such handle on this fd", p->handle);
 	p->size = buf->size;
-	p->dma_addr = buf->dma;
+	p->dma_addr = rf->see_phys ? buf->dma : 0;
 	ramon_buf_put(buf);
 	return 0;
 }

@@ -120,7 +120,8 @@
 	X(REGWIN_BAD_NAME,	193, ENOENT,	"no such register window name") \
 	X(REGWIN_OFFSET_RANGE,	194, ERANGE,	"register offset outside the window") \
 	X(REGWIN_UNALIGNED,	195, EINVAL,	"register offset not 4-aligned") \
-	X(REGWIN_READ_ONLY,	196, EROFS,	"register window is read-only")
+	X(REGWIN_READ_ONLY,	196, EROFS,	"register window is read-only") \
+	X(REGWIN_PROTECTED,	197, EPERM,	"register written only by the driver")
 
 #define RAMON_ERR_ENUM(name, code, err, desc)	RAMON_E_##name = code,
 enum ramon_err {
@@ -172,7 +173,7 @@ struct ramon_chan_info {
 	__u32 type;			/* out: enum ramon_chan_type */
 	__u32 dir;			/* out: enum ramon_chan_dir */
 	__u32 device_id;		/* out: DT "xlnx,device-id" (AXI) */
-	__u64 phys;			/* out: DMA IP register base (AXI) */
+	__u64 phys;			/* out: DMA IP register base (AXI); 0 without CAP_SYS_RAWIO */
 	char  name[RAMON_NAME_LEN];	/* out: DT dma-names entry / dma_chan_name */
 	struct ramon_status st;
 };
@@ -193,7 +194,7 @@ struct ramon_buf_free {
 	struct ramon_status st;
 };
 
-/* 5: debug only; dma_addr is never accepted as input anywhere */
+/* 5: debug only; dma_addr is never accepted as input anywhere, 0 without CAP_SYS_RAWIO */
 struct ramon_buf_info {
 	__u32 handle;			/* in */
 	__u32 pad;
@@ -299,9 +300,11 @@ struct ramon_spfi_write {
 };
 
 /*
- * 13: READ_STREAM of n_offsets * 16 KiB into (dst_handle, dst_off). If a
- * requested page is past what the stream is known to have flushed, the driver
- * FLUSHes the stream first (the trailer's msg then says so); stream_id 0..197.
+ * 13: READ_STREAM of n_offsets * 16 KiB into (dst_handle, dst_off). If the
+ * stream is open and a requested page is past what it is known to have
+ * flushed while a write left pages unflushed, the driver FLUSHes the stream
+ * first (the trailer's msg then says so). A closed stream is complete and is
+ * never flushed. stream_id 0..197.
  */
 struct ramon_spfi_read {
 	__u32 nn;			/* in */
@@ -357,6 +360,7 @@ struct ramon_spfi_tx_offs_write {
 
 #define RAMON_REGWIN_RO		0x1u	/* writes rejected */
 #define RAMON_REGWIN_ABSENT	0x2u	/* not on this board; size == 0 */
+#define RAMON_REGWIN_CMD_PROTECTED 0x4u	/* SPFI: writes to words 0..10 rejected */
 
 /*
  * Register window indices, stable across boards: a window missing on a board
@@ -380,7 +384,7 @@ enum ramon_win_index {
 struct ramon_regwin_info {
 	__u32 index;			/* in */
 	__u32 size;			/* out: bytes */
-	__u64 phys;			/* out */
+	__u64 phys;			/* out; 0 without CAP_SYS_RAWIO */
 	__u32 flags;			/* out: RAMON_REGWIN_* */
 	__u32 pad;
 	char  name[RAMON_NAME_LEN];	/* out, e.g. "rs_top", "spw0@a0020000" */

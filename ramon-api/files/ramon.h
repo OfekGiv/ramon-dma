@@ -177,7 +177,7 @@ int ramon_buf_map(ramon_buf *b, struct ramon_status *st);
 void ramon_buf_unmap(ramon_buf *b);
 /* munmap + BUF_FREE, then zeroes *b. A zeroed ramon_buf is accepted and ignored. */
 int ramon_buf_free(ramon_buf *b, struct ramon_status *st);
-/* debug only: the bus address the DMA engines use */
+/* debug only: the bus address the DMA engines use; 0 unless the opener has CAP_SYS_RAWIO */
 int ramon_buf_dma_addr(const ramon_buf *b, uint64_t *dma_addr, struct ramon_status *st);
 uint64_t ramon_max_buf_bytes(const ramon_ctx *c);
 

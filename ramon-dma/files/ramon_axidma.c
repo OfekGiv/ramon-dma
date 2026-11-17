@@ -321,13 +321,18 @@ int ramon_ioc_chan_info(struct ramon_file *rf, void *arg, struct ramon_status *s
 	struct ramon_dev *rd = rf->rd;
 	struct ramon_axichan *ch;
 
-	if (p->index >= rd->n_axi)
-		return ramon_zdma_chan_info(rd, p, st);
+	if (p->index >= rd->n_axi) {
+		int ret = ramon_zdma_chan_info(rd, p, st);
+
+		if (!ret && !rf->see_phys)
+			p->phys = 0;
+		return ret;
+	}
 	ch = &rd->axi[array_index_nospec(p->index, rd->n_axi)];
 	p->type = RAMON_CHAN_AXI;
 	p->dir = ch->dir == DMA_MEM_TO_DEV ? RAMON_DIR_MEM_TO_DEV : RAMON_DIR_DEV_TO_MEM;
 	p->device_id = ch->device_id;
-	p->phys = ch->phys;
+	p->phys = rf->see_phys ? ch->phys : 0;
 	strscpy(p->name, ch->name ? ch->name : "", sizeof(p->name));
 	return 0;
 }

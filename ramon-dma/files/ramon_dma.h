@@ -41,7 +41,7 @@
 /* The minor number tracks the implementation step while the rewrite is in progress. */
 #define RAMON_DRV_MAJOR		0
 #define RAMON_DRV_MINOR		8
-#define RAMON_DRV_PATCH		10
+#define RAMON_DRV_PATCH		12
 #define RAMON_DRV_VERSION	__stringify(RAMON_DRV_MAJOR) "." \
 				__stringify(RAMON_DRV_MINOR) "." \
 				__stringify(RAMON_DRV_PATCH)
@@ -144,11 +144,12 @@ struct ramon_spfi {
 	wait_queue_head_t alert_wq;
 	u32 alert_gen;			/* bumped by SPFI_CANCEL_ALERT, under @lock */
 	/*
-	 * Per stream, under @lock: pages [0, flushed_end) are known flushed and
-	 * pages [0, written_end) were written through this driver (0: nothing
-	 * known). SPFI_READ FLUSHes first when it asks for a page at or past
-	 * flushed_end.
+	 * Per stream, under @lock: what the driver knows (RAMON_SPFI_TRACK_*),
+	 * pages [0, flushed_end) known flushed, pages [0, written_end) written
+	 * through this driver. SPFI_READ FLUSHes an open stream first when it
+	 * asks for a page at or past flushed_end that a write left unflushed.
 	 */
+	u8 track[RAMON_SPFI_STREAMS];
 	u32 flushed_end[RAMON_SPFI_STREAMS];
 	u32 written_end[RAMON_SPFI_STREAMS];
 };
@@ -160,6 +161,7 @@ struct ramon_regwin {
 	u32 size;
 	phys_addr_t phys;
 	u32 flags;			/* RAMON_REGWIN_* */
+	u32 wr_protect_end;		/* REG_IO refuses writes to [0, wr_protect_end) */
 	spinlock_t *lock;		/* taken around REG_IO if set (SPFI windows) */
 };
 
@@ -189,6 +191,7 @@ struct ramon_file {
 	struct ramon_dev *rd;
 	struct mutex lock;		/* guards bufs only */
 	struct idr bufs;
+	bool see_phys;			/* opener had CAP_SYS_RAWIO: *_INFO report addresses */
 };
 
 /*
