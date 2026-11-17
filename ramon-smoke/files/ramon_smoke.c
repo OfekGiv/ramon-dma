@@ -58,14 +58,17 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <linux/capability.h>
+
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.19"
+#define SMOKE_VERSION		"0.8.20"
 
 #define INFO_THREADS		8
 #define INFO_ITERATIONS		20000
@@ -118,6 +121,7 @@ static int failures;
 static size_t page_size;
 static unsigned int page_shift;
 static unsigned int drv_step;	/* 0.<step>.0 of the loaded driver */
+static unsigned int drv_patch;	/* 0.<step>.<patch> */
 static unsigned char code_seen[256];	/* RAMON_E_* codes a check has produced */
 static int targc;			/* arguments after the test name */
 static char *targv[8];
@@ -130,6 +134,24 @@ static uint32_t targ_u32(int i, uint32_t def)
 static void seen(uint32_t code)
 {
 	code_seen[code & 0xff] = 1;
+}
+
+/* the loaded driver is 0.<step>.<patch> or later (a 1.x driver always is) */
+static int drv_has(unsigned int step, unsigned int patch)
+{
+	return drv_step > step || (drv_step == step && drv_patch >= patch);
+}
+
+/* 1 if this process has CAP_SYS_RAWIO in its effective set (raw capget, no libcap) */
+static int have_rawio(void)
+{
+	struct __user_cap_header_struct h = { _LINUX_CAPABILITY_VERSION_3, 0 };
+	struct __user_cap_data_struct d[_LINUX_CAPABILITY_U32S_3];
+
+	memset(d, 0, sizeof(d));
+	if (syscall(SYS_capget, &h, d))
+		return 0;
+	return !!(d[CAP_TO_INDEX(CAP_SYS_RAWIO)].effective & CAP_TO_MASK(CAP_SYS_RAWIO));
 }
 
 /* ---- reporting ---- */
@@ -434,8 +456,10 @@ static void buf_roundtrip(uint64_t size)
 
 	memset(&bi, 0, sizeof(bi));
 	bi.handle = h;
+	/* the driver reports dma_addr only to an opener with CAP_SYS_RAWIO (0.8.12) */
 	if (!must(RAMON_IOC_BUF_INFO, &bi, &bi.st, "BUF_INFO") &&
-	    (bi.size != actual || !bi.dma_addr || bi.dma_addr & (page_size - 1)))
+	    (bi.size != actual || (!bi.dma_addr && have_rawio()) ||
+	     bi.dma_addr & (page_size - 1)))
 		fail("BUF_INFO handle %u: size %" PRIu64 " dma 0x%" PRIx64, h,
 		     (uint64_t)bi.size, (uint64_t)bi.dma_addr);
 
@@ -3097,6 +3121,123 @@ static void errors_regwin(uint32_t n)
 	}
 	if (i == n)
 		printf("      every window is present: NOT_PRESENT not exercised\n");
+
+	/* the SPFI command block (words 0..10) is written only by the driver (0.8.12) */
+	if (drv_has(8, 12) && win_present(RAMON_WIN_SPFI0)) {
+		uint32_t v = 0;
+
+		expect_reg_fail("spfi0", 0, RAMON_REG_OP_WRITE, 0x24,
+				"REG_IO write to SPFI word 9 (READ_STREAM address)", EPERM,
+				RAMON_E_REGWIN_PROTECTED, "word 9");
+		expect_reg_fail("spfi0", 0, RAMON_REG_OP_WRITE, 0x0,
+				"REG_IO write to SPFI word 0 (command)", EPERM,
+				RAMON_E_REGWIN_PROTECTED, "word 0");
+		if (!reg_read("spfi0", 0, 0x24, &v))
+			pass("REG_IO read of SPFI word 9 still allowed (0x%x)", v);
+		/* word 11 (loopback) stays writable: write back what it holds */
+		if (!reg_read("spfi0", 0, 0x2C, &v) &&
+		    !reg_io("spfi0", 0, RAMON_REG_OP_WRITE, 0x2C, &v))
+			pass("REG_IO write of SPFI word 11 (loopback) still allowed");
+		if (!regwin_info(RAMON_WIN_SPFI0, &ri) && !(ri.flags & RAMON_REGWIN_CMD_PROTECTED))
+			fail("spfi0: REGWIN_INFO flags 0x%x lack CMD_PROTECTED", ri.flags);
+	}
+}
+
+/*
+ * Addresses, as one opener sees them: the DMA address of a fresh buffer, the
+ * first present window's phys and channel 0's phys. 0 when there is none.
+ */
+struct phys_seen {
+	uint64_t dma, win, chan;
+};
+
+static void phys_probe(const struct ramon_get_info *gi, struct phys_seen *ps)
+{
+	struct ramon_regwin_info ri;
+	struct ramon_buf_info bi;
+	struct ramon_chan_info ci;
+	uint32_t h, i;
+
+	memset(ps, 0, sizeof(*ps));
+	if (!buf_alloc(page_size, &h, NULL)) {
+		memset(&bi, 0, sizeof(bi));
+		bi.handle = h;
+		if (!must(RAMON_IOC_BUF_INFO, &bi, &bi.st, "BUF_INFO"))
+			ps->dma = bi.dma_addr;
+		buf_free(h);
+	}
+	for (i = 0; i < gi->n_regwin; i++)
+		if (!regwin_info(i, &ri) && !(ri.flags & RAMON_REGWIN_ABSENT)) {
+			ps->win = ri.phys;
+			break;
+		}
+	if (gi->n_axi_chan && !chan_info(0, &ci))
+		ps->chan = ci.phys;
+}
+
+/*
+ * G2: without CAP_SYS_RAWIO, BUF_INFO, REGWIN_INFO and CHAN_INFO report no
+ * physical addresses (0.8.12). A child drops the capability from its
+ * effective set, then opens the device itself: the driver checks the opener.
+ */
+static void errors_phys(const struct ramon_get_info *gi)
+{
+	struct __user_cap_header_struct h = { _LINUX_CAPABILITY_VERSION_3, 0 };
+	struct __user_cap_data_struct d[_LINUX_CAPABILITY_U32S_3];
+	struct phys_seen ps;
+	int status;
+	pid_t pid;
+
+	if (!drv_has(8, 12))
+		return;
+	if (have_rawio()) {
+		phys_probe(gi, &ps);
+		if (!ps.dma || !ps.win || (gi->n_axi_chan && !ps.chan))
+			fail("with CAP_SYS_RAWIO: dma 0x%" PRIx64 " window 0x%" PRIx64
+			     " chan 0x%" PRIx64 ", all expected non-zero", ps.dma, ps.win, ps.chan);
+		else
+			pass("with CAP_SYS_RAWIO: buffer, window and channel addresses reported");
+	}
+	fflush(stdout);
+	pid = fork();
+	if (pid < 0) {
+		fail("fork: %s", strerror(errno));
+		return;
+	}
+	if (!pid) {
+		memset(d, 0, sizeof(d));
+		if (syscall(SYS_capget, &h, d)) {
+			printf("      capget: %s\n", strerror(errno));
+			_exit(2);
+		}
+		d[CAP_TO_INDEX(CAP_SYS_RAWIO)].effective &= ~CAP_TO_MASK(CAP_SYS_RAWIO);
+		if (syscall(SYS_capset, &h, d)) {
+			printf("      capset: %s\n", strerror(errno));
+			_exit(2);
+		}
+		close(fd);
+		fd = open(dev_path, O_RDWR);
+		if (fd < 0) {
+			printf("      open %s without CAP_SYS_RAWIO: %s\n", dev_path, strerror(errno));
+			_exit(2);
+		}
+		phys_probe(gi, &ps);
+		if (ps.dma || ps.win || ps.chan) {
+			fail("without CAP_SYS_RAWIO: dma 0x%" PRIx64 " window 0x%" PRIx64
+			     " chan 0x%" PRIx64 ", all expected 0", ps.dma, ps.win, ps.chan);
+			fflush(stdout);
+			_exit(1);
+		}
+		pass("without CAP_SYS_RAWIO: no buffer, window or channel addresses reported");
+		fflush(stdout);
+		_exit(failures ? 1 : 0);
+	}
+	if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status))
+		fail("unprivileged child did not exit normally");
+	else if (WEXITSTATUS(status) == 2)
+		printf("      unprivileged check skipped (see above)\n");
+	else if (WEXITSTATUS(status))
+		fail("unprivileged child reported failures");
 }
 
 static void expect_axi_fail(uint32_t chan, uint32_t n, uint64_t items, uint32_t timeout_ms,
@@ -3552,6 +3693,7 @@ static void test_errors(void)
 		return;
 	errors_buf_ioctls(gi.max_buf_bytes);
 	errors_mmap();
+	errors_phys(&gi);
 	if (drv_step >= 3)
 		errors_regwin(gi.n_regwin);
 	if (drv_step >= 4)
@@ -3623,6 +3765,7 @@ static unsigned int driver_step(void)
 		return 0;
 	printf("ramon_smoke %s (abi %u), driver %u.%u.%u (abi %u)\n", SMOKE_VERSION,
 	       RAMON_ABI_VERSION, gi.drv_major, gi.drv_minor, gi.drv_patch, gi.abi_version);
+	drv_patch = gi.drv_patch;
 	return gi.drv_major ? ~0u : gi.drv_minor;
 }
 
