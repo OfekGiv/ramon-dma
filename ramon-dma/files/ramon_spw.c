@@ -29,8 +29,8 @@ static irqreturn_t ramon_spw_irq(int irq, void *data)
 	u32 size;
 
 	spin_lock(&spw->lock);
-	writel(RAMON_SPW_RX_IRQ_ACK_VAL, spw->regs + RAMON_SPW_RX_IRQ_ACK);
-	size = readl(spw->regs + RAMON_SPW_RX_PKT_SIZE);
+	writel(RAMON_SPW_RX_IRQ_ACK_VAL, spw->regs + RAMON_SPW_REG_RX_IRQ_ACK);
+	size = readl(spw->regs + RAMON_SPW_REG_RX_PKT_SIZE);
 	if (!kfifo_put(&spw->rx_sizes, size))
 		atomic64_inc(&stats->spw_overrun[spw->nn]);
 	spin_unlock(&spw->lock);
@@ -40,8 +40,8 @@ static irqreturn_t ramon_spw_irq(int irq, void *data)
 }
 
 /* @nn validated, instance present: returns it, else fails the ioctl */
-static int ramon_spw_get(struct ramon_dev *rd, u32 nn, bool need_irq, struct ramon_spw **spwp,
-			 struct ramon_status *st)
+static int ramon_spw_lookup(struct ramon_dev *rd, u32 nn, bool need_irq, struct ramon_spw **spwp,
+			    struct ramon_status *st)
 {
 	struct ramon_spw *spw;
 
@@ -55,7 +55,7 @@ static int ramon_spw_get(struct ramon_dev *rd, u32 nn, bool need_irq, struct ram
 	if (need_irq && !spw->irq)
 		return ramon_fail(st, RAMON_E_NOT_PRESENT, nn, 0,
 				  "spw%u (%s): no RX interrupt (see probe log)",
-				  nn, spw->node_name);
+				  nn, spw->win_name);
 	*spwp = spw;
 	return 0;
 }
@@ -78,30 +78,31 @@ int ramon_ioc_spw_wait_rx(struct ramon_file *rf, void *arg, struct ramon_status 
 	struct ramon_spw *spw;
 	u32 timeout_ms, gen, size = 0;
 	bool got = false;
-	long left;
+	long time_left;
 	int ret;
 
-	ret = ramon_spw_get(rf->rd, p->nn, true, &spw, st);
+	ret = ramon_spw_lookup(rf->rd, p->nn, true, &spw, st);
 	if (ret)
 		return ret;
-	timeout_ms = ramon_timeout_ms(p->timeout_ms, RAMON_TMO_SPW_MS);
+	timeout_ms = ramon_timeout_ms(p->timeout_ms, RAMON_TIMEOUT_SPW_MS);
 
 	spin_lock_irq(&spw->lock);
 	gen = spw->cancel_gen;
 	spin_unlock_irq(&spw->lock);
 
-	left = wait_event_interruptible_timeout(spw->wq, ramon_spw_ready(spw, gen, &size, &got),
-						msecs_to_jiffies(timeout_ms));
+	time_left = wait_event_interruptible_timeout(spw->wq,
+						     ramon_spw_ready(spw, gen, &size, &got),
+						     msecs_to_jiffies(timeout_ms));
 	if (got) {
 		p->size = size;
 		return 0;
 	}
 	if (READ_ONCE(rf->rd->dead))
 		return ramon_fail(st, RAMON_E_REMOVED, p->nn, 0, "spw%u: device removed", p->nn);
-	if (left > 0)
+	if (time_left > 0)
 		return ramon_fail(st, RAMON_E_SPW_CANCELLED, p->nn, 0,
 				  "spw%u: wait cancelled by SPW_CANCEL", p->nn);
-	if (left < 0)
+	if (time_left < 0)
 		return ramon_fail(st, RAMON_E_INTERRUPTED, p->nn, 0,
 				  "spw%u: wait interrupted by a signal", p->nn);
 	/* routine for a polling reader: no log */
@@ -115,7 +116,7 @@ int ramon_ioc_spw_cancel(struct ramon_file *rf, void *arg, struct ramon_status *
 	struct ramon_spw *spw;
 	int ret;
 
-	ret = ramon_spw_get(rf->rd, p->nn, true, &spw, st);
+	ret = ramon_spw_lookup(rf->rd, p->nn, true, &spw, st);
 	if (ret)
 		return ret;
 	spin_lock_irq(&spw->lock);
@@ -135,13 +136,13 @@ int ramon_ioc_spw_loopback(struct ramon_file *rf, void *arg, struct ramon_status
 	if (p->enable > 1)
 		return ramon_fail(st, RAMON_E_INVAL_ARG, p->nn, p->enable,
 				  "spw%u: loopback enable %u is neither 0 nor 1", p->nn, p->enable);
-	ret = ramon_spw_get(rf->rd, p->nn, false, &spw, st);
+	ret = ramon_spw_lookup(rf->rd, p->nn, false, &spw, st);
 	if (ret)
 		return ret;
 	spin_lock_irq(&spw->lock);
-	if (readl(spw->regs + RAMON_SPW_LOOPBACK_ENABLE) != p->enable) {
-		writel(p->enable, spw->regs + RAMON_SPW_LOOPBACK_ENABLE);
-		writel(RAMON_SPW_RESET_VAL, spw->regs + RAMON_SPW_RESET);
+	if (readl(spw->regs + RAMON_SPW_REG_LOOPBACK) != p->enable) {
+		writel(p->enable, spw->regs + RAMON_SPW_REG_LOOPBACK);
+		writel(RAMON_SPW_RESET_VAL, spw->regs + RAMON_SPW_REG_RESET);
 	}
 	spin_unlock_irq(&spw->lock);
 	return 0;
@@ -158,7 +159,7 @@ static void ramon_spw_probe_one(struct ramon_dev *rd, u32 nn, int irq)
 
 	spw->rd = rd;
 	spw->nn = nn;
-	spw->node_name = win->name;
+	spw->win_name = win->name;
 	spin_lock_init(&spw->lock);
 	INIT_KFIFO(spw->rx_sizes);
 	init_waitqueue_head(&spw->wq);
@@ -170,11 +171,11 @@ static void ramon_spw_probe_one(struct ramon_dev *rd, u32 nn, int irq)
 	ret = devm_request_irq(dev, irq, ramon_spw_irq, 0, ramon_spw_irq_names[nn], spw);
 	if (ret) {
 		dev_warn(dev, "spw%u (%s): request_irq(%d) failed: %d; SPW_WAIT_RX unavailable\n",
-			 nn, spw->node_name, irq, ret);
+			 nn, spw->win_name, irq, ret);
 		return;
 	}
 	spw->irq = irq;
-	dev_info(dev, "spw%u %s: irq %d\n", nn, spw->node_name, irq);
+	dev_info(dev, "spw%u %s: irq %d\n", nn, spw->win_name, irq);
 }
 
 /* after ramon_regwin_probe(): the SPW registers come from its spw<nn> windows */

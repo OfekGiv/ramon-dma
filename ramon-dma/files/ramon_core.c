@@ -56,7 +56,7 @@ static const struct ramon_err_entry ramon_errs[] = {
 };
 
 /* Failure paths only, so a linear scan is fine. A bad code is a driver bug. */
-static const struct ramon_err_entry *ramon_err_lookup(u32 code)
+static const struct ramon_err_entry *ramon_err_entry_lookup(u32 code)
 {
 	unsigned int i;
 
@@ -64,7 +64,7 @@ static const struct ramon_err_entry *ramon_err_lookup(u32 code)
 		if (ramon_errs[i].code == code && code != RAMON_E_OK)
 			return &ramon_errs[i];
 	WARN_ONCE(1, "ramon_dma: failure with invalid code %u\n", code);
-	return ramon_err_lookup(RAMON_E_INVAL_ARG);
+	return ramon_err_entry_lookup(RAMON_E_INVAL_ARG);
 }
 
 /**
@@ -81,7 +81,7 @@ static const struct ramon_err_entry *ramon_err_lookup(u32 code)
  */
 int ramon_fail(struct ramon_status *st, u32 code, u64 arg0, u64 arg1, const char *fmt, ...)
 {
-	const struct ramon_err_entry *e = ramon_err_lookup(code);
+	const struct ramon_err_entry *e = ramon_err_entry_lookup(code);
 	va_list ap;
 
 	st->code = e->code;
@@ -104,7 +104,7 @@ int ramon_fail(struct ramon_status *st, u32 code, u64 arg0, u64 arg1, const char
  */
 int ramon_fail_dbg(struct ramon_dev *rd, u32 code, const char *fmt, ...)
 {
-	const struct ramon_err_entry *e = ramon_err_lookup(code);
+	const struct ramon_err_entry *e = ramon_err_entry_lookup(code);
 	struct va_format vaf;
 	va_list ap;
 
@@ -145,10 +145,10 @@ u32 ramon_param_spfi_mask(void)
 	return spfi_mask;
 }
 
-/* ioctl timeouts: 0 selects @def, anything above RAMON_TIMEOUT_MAX_MS is clamped */
-u32 ramon_timeout_ms(u32 requested, u32 def)
+/* ioctl timeouts: 0 selects @default_ms, anything above RAMON_TIMEOUT_MAX_MS is clamped */
+u32 ramon_timeout_ms(u32 requested_ms, u32 default_ms)
 {
-	return requested ? min_t(u32, requested, RAMON_TIMEOUT_MAX_MS) : def;
+	return requested_ms ? min_t(u32, requested_ms, RAMON_TIMEOUT_MAX_MS) : default_ms;
 }
 
 /* ---- ioctl handlers owned by the core ---- */
@@ -157,31 +157,31 @@ static int ramon_ioc_get_info(struct ramon_file *rf, void *arg, struct ramon_sta
 {
 	struct ramon_get_info *p = arg;
 	struct ramon_dev *rd = rf->rd;
-	u32 i;
+	u32 nn;
 
 	p->abi_version = RAMON_ABI_VERSION;
 	p->drv_major = RAMON_DRV_MAJOR;
 	p->drv_minor = RAMON_DRV_MINOR;
 	p->drv_patch = RAMON_DRV_PATCH;
 	p->n_axi_chan = rd->n_axi;
-	p->n_zdma_chan = rd->zdma.n;
+	p->n_zdma_chan = rd->zdma.n_chan;
 	p->n_regwin = rd->n_win;
 	p->spw_mask = 0;
 	p->spfi_mask = 0;
-	for (i = 0; i < RAMON_NN_COUNT; i++) {
-		if (rd->spw[i].regs)
-			p->spw_mask |= BIT(i);
-		if (rd->spfi[i].regs)
-			p->spfi_mask |= BIT(i);
+	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
+		if (rd->spw[nn].regs)
+			p->spw_mask |= BIT(nn);
+		if (rd->spfi[nn].regs)
+			p->spfi_mask |= BIT(nn);
 	}
 	p->page_size = PAGE_SIZE;
 	p->max_buf_bytes = ramon_max_buf_bytes();
 	return 0;
 }
 
-static u64 ramon_stat(atomic64_t *v, bool reset)
+static u64 ramon_stat_read(atomic64_t *counter, bool reset)
 {
-	return reset ? atomic64_xchg(v, 0) : atomic64_read(v);
+	return reset ? atomic64_xchg(counter, 0) : atomic64_read(counter);
 }
 
 static int ramon_ioc_get_stats(struct ramon_file *rf, void *arg, struct ramon_status *st)
@@ -189,21 +189,22 @@ static int ramon_ioc_get_stats(struct ramon_file *rf, void *arg, struct ramon_st
 	struct ramon_get_stats *p = arg;
 	struct ramon_stats *s = &rf->rd->stats;
 	bool reset = p->reset;
-	u32 nn, v;
+	u32 nn, vec;
 
-	p->axi_tx = ramon_stat(&s->axi_tx, reset);
-	p->axi_rx = ramon_stat(&s->axi_rx, reset);
-	p->axi_timeouts = ramon_stat(&s->axi_timeouts, reset);
-	p->zdma_ops = ramon_stat(&s->zdma_ops, reset);
-	p->zdma_timeouts = ramon_stat(&s->zdma_timeouts, reset);
+	p->axi_tx = ramon_stat_read(&s->axi_tx, reset);
+	p->axi_rx = ramon_stat_read(&s->axi_rx, reset);
+	p->axi_timeouts = ramon_stat_read(&s->axi_timeouts, reset);
+	p->zdma_ops = ramon_stat_read(&s->zdma_ops, reset);
+	p->zdma_timeouts = ramon_stat_read(&s->zdma_timeouts, reset);
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
-		p->spw_rx[nn] = ramon_stat(&s->spw_rx[nn], reset);
-		p->spw_overrun[nn] = ramon_stat(&s->spw_overrun[nn], reset);
-		for (v = 0; v < RAMON_SPFI_IRQ_VECTORS; v++)
-			p->spfi_irq_hist[nn][v] = ramon_stat(&s->spfi_irq_hist[nn][v], reset);
-		p->spfi_alert_overrun[nn] = ramon_stat(&s->spfi_alert_overrun[nn], reset);
-		p->spfi_unexpected[nn] = ramon_stat(&s->spfi_unexpected[nn], reset);
-		p->spfi_timeouts[nn] = ramon_stat(&s->spfi_timeouts[nn], reset);
+		p->spw_rx[nn] = ramon_stat_read(&s->spw_rx[nn], reset);
+		p->spw_overrun[nn] = ramon_stat_read(&s->spw_overrun[nn], reset);
+		for (vec = 0; vec < RAMON_SPFI_IRQ_VECTORS; vec++)
+			p->spfi_irq_hist[nn][vec] = ramon_stat_read(&s->spfi_irq_hist[nn][vec],
+								    reset);
+		p->spfi_alert_overrun[nn] = ramon_stat_read(&s->spfi_alert_overrun[nn], reset);
+		p->spfi_unexpected[nn] = ramon_stat_read(&s->spfi_unexpected[nn], reset);
+		p->spfi_timeouts[nn] = ramon_stat_read(&s->spfi_timeouts[nn], reset);
 	}
 	return 0;
 }
@@ -211,7 +212,7 @@ static int ramon_ioc_get_stats(struct ramon_file *rf, void *arg, struct ramon_st
 /* ---- dispatcher ---- */
 
 /* Large enough for any ioctl struct; the dispatcher copies the exact size. */
-union ramon_ioc_buf {
+union ramon_ioc_arg {
 	struct ramon_get_info get_info;
 	struct ramon_chan_info chan_info;
 	struct ramon_buf_alloc buf_alloc;
@@ -319,7 +320,7 @@ static long ramon_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct ramon_dev *rd = rf->rd;
 	void __user *uarg = (void __user *)arg;
 	const struct ramon_ioctl_desc *d;
-	union ramon_ioc_buf buf;
+	union ramon_ioc_arg karg;
 	struct ramon_status *st;
 	unsigned int nr = _IOC_NR(cmd);
 	int idx, ret;
@@ -330,9 +331,9 @@ static long ramon_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (!d->handler || cmd != _IOC(_IOC_READ | _IOC_WRITE, RAMON_IOC_MAGIC, nr, d->size))
 		return -ENOTTY;
 
-	if (copy_from_user(&buf, uarg, d->size))
+	if (copy_from_user(&karg, uarg, d->size))
 		return -EFAULT;
-	st = (struct ramon_status *)((u8 *)&buf + d->status_offset);
+	st = (struct ramon_status *)((u8 *)&karg + d->status_offset);
 	memset(st, 0, sizeof(*st));
 
 	idx = srcu_read_lock(&rd->gate);
@@ -340,7 +341,7 @@ static long ramon_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		ret = ramon_fail(st, RAMON_E_REMOVED, 0, 0, "%s: device was removed",
 				 dev_name(&rd->pdev->dev));
 	else
-		ret = d->handler(rf, &buf, st);
+		ret = d->handler(rf, &karg, st);
 	srcu_read_unlock(&rd->gate, idx);
 
 	if (ret) {
@@ -349,13 +350,13 @@ static long ramon_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			ret = ramon_fail(st, RAMON_E_INVAL_ARG, ret, 0,
 					 "internal: %s returned %d without status", d->name, ret);
 		dev_dbg(&rd->pdev->dev, "%s: %s (%d): %s\n",
-			d->name, ramon_err_lookup(st->code)->name, ret, st->msg);
+			d->name, ramon_err_entry_lookup(st->code)->name, ret, st->msg);
 	} else {
 		st->code = RAMON_E_OK;
 		st->err = 0;
 	}
 
-	if (copy_to_user(uarg, &buf, d->size))
+	if (copy_to_user(uarg, &karg, d->size))
 		return -EFAULT;
 	return ret;
 }
@@ -401,7 +402,7 @@ static int ramon_open(struct inode *inode, struct file *file)
 	mutex_init(&rf->lock);
 	idr_init(&rf->bufs);
 	/* the opener's rights, so a passed fd does not widen them */
-	rf->see_phys = capable(CAP_SYS_RAWIO);
+	rf->can_see_phys = capable(CAP_SYS_RAWIO);
 	ramon_dev_get(rd);
 	rf->rd = rd;
 	file->private_data = rf;
@@ -431,7 +432,7 @@ static const struct file_operations ramon_fops = {
 
 /* ---- platform driver ---- */
 
-/* register windows, then SPW on top of them; DT discovery happens once here */
+/* register windows, then SPW and SPFI on top of them; DT discovery happens once here */
 static int ramon_probe_blocks(struct ramon_dev *rd)
 {
 	struct ramon_of_hw *hw;

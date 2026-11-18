@@ -12,8 +12,9 @@
  *   pointer while remove() waits.
  * - ramon_file.lock: protects only the handle idr; never held across a wait,
  *   a DMA or a user copy.
- * - ramon_axichan.lock: one per channel; never two at once.
- * - SPFI: write_lock / read_lock -> cmd_lock -> spfi.lock (spinlock, IRQ).
+ * - ramon_axi_chan.lock: one per channel; never two at once.
+ * - SPFI: data_write_lock / read_stream_lock -> short_lock -> cmd_lock ->
+ *   spfi.lock (spinlock, IRQ).
  * - IRQ handlers touch only spinlocked state, kfifos and atomics.
  */
 #ifndef RAMON_DMA_H
@@ -41,7 +42,7 @@
 /* The minor number tracks the implementation step while the rewrite is in progress. */
 #define RAMON_DRV_MAJOR		0
 #define RAMON_DRV_MINOR		8
-#define RAMON_DRV_PATCH		12
+#define RAMON_DRV_PATCH		13
 #define RAMON_DRV_VERSION	__stringify(RAMON_DRV_MAJOR) "." \
 				__stringify(RAMON_DRV_MINOR) "." \
 				__stringify(RAMON_DRV_PATCH)
@@ -67,7 +68,7 @@ struct ramon_stats {
  * One AXI DMA channel from the "dmas" list; index == DT position. @chan is
  * replaced (under @lock) when the channel is re-acquired after a reset.
  */
-struct ramon_axichan {
+struct ramon_axi_chan {
 	struct dma_chan *chan;
 	enum dma_transfer_direction dir;
 	u32 device_id;			/* child "xlnx,device-id" */
@@ -77,7 +78,7 @@ struct ramon_axichan {
 	struct mutex lock;		/* serializes transfers on this channel */
 	struct completion done;		/* completed by the dmaengine callback */
 	u32 align_mask;			/* dma address alignment the engine needs, minus 1 */
-	atomic_t rearm;			/* another channel's terminate reset this IP */
+	atomic_t needs_rearm;		/* another channel's terminate reset this IP */
 };
 
 struct ramon_zdma_chan {
@@ -89,7 +90,7 @@ struct ramon_zdma_chan {
 /* Pool of DMA_MEMCPY channels; @lock is never held across a copy. */
 struct ramon_zdma {
 	struct ramon_zdma_chan *ch;
-	u32 n;
+	u32 n_chan;
 	spinlock_t lock;		/* guards free_mask */
 	unsigned long free_mask;
 	wait_queue_head_t wq;
@@ -101,7 +102,7 @@ struct ramon_spw {
 	u32 nn;
 	void __iomem *regs;		/* NULL: instance absent */
 	int irq;
-	const char *node_name;		/* regwin name, "spw0@a0020000" */
+	const char *win_name;		/* regwin name, "spw0@a0020000" */
 	spinlock_t lock;		/* regs, rx_sizes, cancel_gen; taken in IRQ */
 	DECLARE_KFIFO(rx_sizes, u32, RAMON_SPW_RX_FIFO_DEPTH);
 	wait_queue_head_t wq;
@@ -116,23 +117,27 @@ struct ramon_spfi_alert {
 	u32 rx_status;
 };
 
-/* One SPFI instance. Lock order: write_lock / read_lock -> cmd_lock -> lock. */
+/*
+ * One SPFI instance. Lock order: data_write_lock / read_stream_lock ->
+ * short_lock -> cmd_lock -> lock.
+ */
 struct ramon_spfi {
 	struct ramon_dev *rd;
 	u32 nn;
 	void __iomem *regs;		/* NULL: instance absent */
 	int irq;
-	const char *node_name;
+	const char *win_name;
 	void __iomem *tx_offs;		/* TX read-offset table, mapped at probe */
 	u32 tx_offs_size;
-	phys_addr_t rx_mem;		/* RX message table, mapped per MEM_READ */
+	phys_addr_t rx_mem_phys;	/* RX message table, mapped per MEM_READ */
 	u32 rx_mem_size;
 	spinlock_t lock;		/* regs and every field below; taken in IRQ */
 	struct mutex cmd_lock;		/* TX register programming only, never across a wait */
-	struct mutex write_lock;	/* one DATA_WRITE at a time */
-	struct mutex read_lock;		/* one READ_STREAM / TX offset table user at a time */
+	struct mutex data_write_lock;	/* one DATA_WRITE at a time */
+	struct mutex read_stream_lock;	/* one READ_STREAM / TX offset table user at a time */
 	struct mutex short_lock;	/* one short command in flight, across its wait */
-	struct ramon_buf *read_stale;	/* dst of a READ_STREAM that never completed; read_lock */
+	/* dst of a READ_STREAM that never completed; read_stream_lock */
+	struct ramon_buf *stale_read_buf;
 	bool cmd_pending;
 	u32 cmd_rx_opcode;
 	struct completion cmd_done;
@@ -149,7 +154,7 @@ struct ramon_spfi {
 	 * through this driver. SPFI_READ FLUSHes an open stream first when it
 	 * asks for a page at or past flushed_end that a write left unflushed.
 	 */
-	u8 track[RAMON_SPFI_STREAMS];
+	u8 track_state[RAMON_SPFI_STREAMS];
 	u32 flushed_end[RAMON_SPFI_STREAMS];
 	u32 written_end[RAMON_SPFI_STREAMS];
 };
@@ -161,7 +166,7 @@ struct ramon_regwin {
 	u32 size;
 	phys_addr_t phys;
 	u32 flags;			/* RAMON_REGWIN_* */
-	u32 wr_protect_end;		/* REG_IO refuses writes to [0, wr_protect_end) */
+	u32 write_protect_end;		/* REG_IO refuses writes to [0, write_protect_end) */
 	spinlock_t *lock;		/* taken around REG_IO if set (SPFI windows) */
 };
 
@@ -176,7 +181,7 @@ struct ramon_dev {
 	struct kref kref;
 	struct srcu_struct gate;	/* see the locking summary */
 	bool dead;			/* set once by remove(); READ_ONCE/WRITE_ONCE */
-	struct ramon_axichan *axi;
+	struct ramon_axi_chan *axi;
 	u32 n_axi;
 	struct ramon_zdma zdma;
 	struct ramon_spw spw[RAMON_NN_COUNT];
@@ -191,7 +196,7 @@ struct ramon_file {
 	struct ramon_dev *rd;
 	struct mutex lock;		/* guards bufs only */
 	struct idr bufs;
-	bool see_phys;			/* opener had CAP_SYS_RAWIO: *_INFO report addresses */
+	bool can_see_phys;		/* opener had CAP_SYS_RAWIO: *_INFO report addresses */
 };
 
 /*
@@ -202,7 +207,7 @@ struct ramon_file {
 struct ramon_buf {
 	u32 handle;			/* written once under ramon_file.lock */
 	size_t size;			/* PAGE_ALIGNed */
-	void *cpu;
+	void *cpu_addr;
 	dma_addr_t dma;
 	struct kref kref;
 	struct ramon_dev *rd;
@@ -213,10 +218,10 @@ typedef int (*ramon_ioctl_fn)(struct ramon_file *rf, void *arg, struct ramon_sta
 /* An AXI transfer between prepare and release; see ramon_axidma.c. */
 struct ramon_axi_job {
 	u32 chan;
-	struct ramon_axichan *ch;
+	struct ramon_axi_chan *ch;
 	struct ramon_buf **bufs;	/* one reference per item */
 	struct scatterlist *sg;
-	u32 n_bufs;
+	u32 n_items;
 	u64 bytes;
 };
 
@@ -232,7 +237,7 @@ void ramon_dev_put(struct ramon_dev *rd);
 u64 ramon_max_buf_bytes(void);
 u32 ramon_param_zdma_channels(void);
 u32 ramon_param_spfi_mask(void);
-u32 ramon_timeout_ms(u32 requested, u32 def);
+u32 ramon_timeout_ms(u32 requested_ms, u32 default_ms);
 
 /* ramon_of.c */
 struct ramon_of_regdev {
@@ -243,24 +248,24 @@ struct ramon_of_regdev {
 
 /* Everything found by global DT search, gathered once at probe. */
 struct ramon_of_hw {
-	bool rstop_ok;
+	bool rstop_present;
 	struct resource rstop;
 	u32 spw_mask;			/* bit nn: spw[nn] valid */
 	struct resource spw[RAMON_NN_COUNT];
 	int spw_irq[RAMON_NN_COUNT];	/* 0: none */
-	u32 spfi_mask;			/* bit nn: reg[nn] of the SPFI node found */
+	u32 spfi_reg_mask;		/* bit nn: reg[nn] of the SPFI node found */
 	struct resource spfi[RAMON_NN_COUNT];
 	u32 spfi_irq_mask;		/* bit nn: interrupts[nn] found */
 	int spfi_irq[RAMON_NN_COUNT];
-	bool spfi_rx_mem_ok[RAMON_NN_COUNT];
+	bool spfi_rx_mem_present[RAMON_NN_COUNT];
 	struct resource spfi_rx_mem[RAMON_NN_COUNT];
-	bool spfi_tx_offs_ok[RAMON_NN_COUNT];
+	bool spfi_tx_offs_present[RAMON_NN_COUNT];
 	struct resource spfi_tx_offs[RAMON_NN_COUNT];
 	u32 n_regaccess;
 	struct ramon_of_regdev regaccess[RAMON_REGACCESS_MAX];
 };
 
-struct ramon_of_axichan {
+struct ramon_of_axi_chan {
 	const char *name;
 	u32 device_id;
 	enum dma_transfer_direction dir;
@@ -270,7 +275,7 @@ struct ramon_of_axichan {
 
 void ramon_of_discover(struct device *dev, struct ramon_of_hw *hw);
 int ramon_of_axi_count(struct device *dev);
-int ramon_of_axi(struct device *dev, u32 i, struct ramon_of_axichan *out);
+int ramon_of_parse_axi(struct device *dev, u32 chan, struct ramon_of_axi_chan *out);
 
 /* ramon_buf.c */
 int ramon_ioc_buf_alloc(struct ramon_file *rf, void *arg, struct ramon_status *st);
@@ -278,7 +283,7 @@ int ramon_ioc_buf_free(struct ramon_file *rf, void *arg, struct ramon_status *st
 int ramon_ioc_buf_info(struct ramon_file *rf, void *arg, struct ramon_status *st);
 int ramon_buf_mmap(struct file *file, struct vm_area_struct *vma);
 void ramon_buf_release_all(struct ramon_file *rf);
-int ramon_buf_ref(struct ramon_file *rf, u32 handle, u64 off, u64 len, const char *what, u32 i,
+int ramon_buf_ref(struct ramon_file *rf, u32 handle, u64 off, u64 len, const char *what, u32 index,
 		  u32 range_code, struct ramon_buf **bufp, struct ramon_status *st);
 void ramon_buf_put(struct ramon_buf *buf);
 
@@ -289,7 +294,7 @@ int ramon_ioc_reg_io(struct ramon_file *rf, void *arg, struct ramon_status *st);
 
 /* ramon_axidma.c */
 const char *ramon_dma_status_name(enum dma_status status);
-int ramon_axi_job_prepare(struct ramon_file *rf, u32 chan, u64 uitems, u32 n,
+int ramon_axi_job_prepare(struct ramon_file *rf, u32 chan, u64 uitems, u32 n_items,
 			  struct ramon_axi_job *job, struct ramon_status *st);
 int ramon_axi_job_run(struct ramon_dev *rd, struct ramon_axi_job *job, u32 timeout_ms,
 		      struct ramon_status *st);
@@ -302,8 +307,8 @@ void ramon_axidma_remove(struct ramon_dev *rd);
 
 /* ramon_zdma.c */
 int ramon_ioc_zdma_copy(struct ramon_file *rf, void *arg, struct ramon_status *st);
-int ramon_zdma_chan_info(struct ramon_dev *rd, struct ramon_chan_info *p,
-			 struct ramon_status *st);
+int ramon_zdma_fill_chan_info(struct ramon_dev *rd, struct ramon_chan_info *p,
+			      struct ramon_status *st);
 int ramon_zdma_probe(struct ramon_dev *rd);
 void ramon_zdma_wake(struct ramon_dev *rd);
 void ramon_zdma_remove(struct ramon_dev *rd);

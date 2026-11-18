@@ -56,10 +56,10 @@
 
 /* ---- SPW (byte offsets, one window per NN) ---- */
 #define RAMON_SPW_WIN_SIZE		0x1000
-#define RAMON_SPW_RX_PKT_SIZE		0x0C	/* read in the IRQ after the ack */
-#define RAMON_SPW_LOOPBACK_ENABLE	0x10
-#define RAMON_SPW_RX_IRQ_ACK		0x14	/* PL2PS_RX_INTERR, write 0 to ack */
-#define RAMON_SPW_RESET			0x1C	/* FPGA_SPW_RESET, write 1 */
+#define RAMON_SPW_REG_RX_PKT_SIZE	0x0C	/* read in the IRQ after the ack */
+#define RAMON_SPW_REG_LOOPBACK		0x10
+#define RAMON_SPW_REG_RX_IRQ_ACK	0x14	/* PL2PS_RX_INTERR, write 0 to ack */
+#define RAMON_SPW_REG_RESET		0x1C	/* FPGA_SPW_RESET, write 1 */
 #define RAMON_SPW_RX_IRQ_ACK_VAL	0
 #define RAMON_SPW_RESET_VAL		1
 #define RAMON_SPW_RX_FIFO_DEPTH		64	/* power of two (kfifo) */
@@ -96,10 +96,11 @@ enum ramon_spfi_word {
 };
 
 /*
- * Words 0..10 (command, its parameters, the READ_STREAM destination address)
- * are written only by the driver: REG_IO refuses writes below this offset.
+ * Size in bytes of the command block at offset 0: words 0..10 (command, its
+ * parameters, the READ_STREAM destination address), written only by the
+ * driver. REG_IO refuses writes inside it.
  */
-#define RAMON_SPFI_CMD_BLOCK_END	RAMON_SPFI_REG(RAMON_SPFI_TX_RD_BURST_ADDR_HI + 1)
+#define RAMON_SPFI_CMD_BLOCK_SIZE	RAMON_SPFI_REG(RAMON_SPFI_TX_RD_BURST_ADDR_HI + 1)
 #define RAMON_SPFI_SRC_LOGICAL_ADDR_VAL	1
 #define RAMON_SPFI_IRQ_VC0TX		BIT(0)	/* command accepted: ignored */
 #define RAMON_SPFI_IRQ_VC1TX		BIT(1)	/* data-write / close / flush ack */
@@ -109,7 +110,7 @@ enum ramon_spfi_word {
 #define RAMON_SPFI_ALERT_FIFO_DEPTH	16	/* power of two (kfifo) */
 #define RAMON_SPFI_STREAMS		198	/* stream ids 0..197 on the NN */
 #define RAMON_SPFI_FLUSHED_ALL		U32_MAX	/* flushed_end: whatever the stream holds */
-/* ramon_spfi.track[]: what the driver knows about a stream */
+/* ramon_spfi.track_state[]: what the driver knows about a stream */
 #define RAMON_SPFI_TRACK_UNKNOWN	0	/* after load, DELETE, FORMAT, INIT, PLATFORM_RESET */
 #define RAMON_SPFI_TRACK_OPEN		1	/* OPEN answered, or a DATA_WRITE succeeded */
 #define RAMON_SPFI_TRACK_CLOSED		2	/* CLOSE answered: complete, cannot be flushed */
@@ -117,14 +118,14 @@ enum ramon_spfi_word {
 #define RAMON_SPFI_MASK_ALL		(BIT(RAMON_NN_COUNT) - 1)
 
 /* ---- default timeouts in ms (0 in an ioctl selects these) ---- */
-#define RAMON_TMO_AXI_MS		2000
-#define RAMON_TMO_ZDMA_MS		3000
-#define RAMON_TMO_SPFI_CMD_MS		3000
-#define RAMON_TMO_SPFI_CMD_LONG_MS	10000	/* INIT, GRACEFUL_POWER_DOWN */
-#define RAMON_TMO_SPW_MS		1000
+#define RAMON_TIMEOUT_AXI_MS		2000
+#define RAMON_TIMEOUT_ZDMA_MS		3000
+#define RAMON_TIMEOUT_SPFI_CMD_MS	3000
+#define RAMON_TIMEOUT_SPFI_CMD_LONG_MS	10000	/* INIT, GRACEFUL_POWER_DOWN */
+#define RAMON_TIMEOUT_SPW_MS		1000
 
 /* ---- ZDMA ---- */
-#define RAMON_ZDMA_CHUNK		16	/* zynqmp_dma has 32 descriptors per channel */
+#define RAMON_ZDMA_CHUNK_ENTRIES	16	/* zynqmp_dma has 32 descriptors per channel */
 #define RAMON_ZDMA_CHANNELS_DEFAULT	4
 #define RAMON_ZDMA_CHANNELS_MAX		16
 

@@ -27,8 +27,8 @@
 
 /* one validated copy: buffer references and resolved addresses */
 struct ramon_zdma_op {
-	struct ramon_buf *src;
-	struct ramon_buf *dst;
+	struct ramon_buf *src_buf;
+	struct ramon_buf *dst_buf;
 	dma_addr_t src_dma;
 	dma_addr_t dst_dma;
 	size_t len;
@@ -43,7 +43,7 @@ static void ramon_zdma_done(void *arg)
 
 /* ---- channel pool ---- */
 
-static bool ramon_zdma_try_get(struct ramon_zdma *z, u32 *idx)
+static bool ramon_zdma_try_get_chan(struct ramon_zdma *z, u32 *idx)
 {
 	bool got = false;
 
@@ -68,7 +68,7 @@ static void ramon_zdma_put_chan(struct ramon_zdma *z, u32 idx)
 /* wait condition: a channel was taken, or the device is going away */
 static bool ramon_zdma_ready(struct ramon_dev *rd, u32 *idx, bool *got)
 {
-	*got = ramon_zdma_try_get(&rd->zdma, idx);
+	*got = ramon_zdma_try_get_chan(&rd->zdma, idx);
 	return *got || READ_ONCE(rd->dead);
 }
 
@@ -78,8 +78,8 @@ static int ramon_zdma_get_chan(struct ramon_dev *rd, u32 *idx, struct ramon_stat
 	bool got = false;
 
 	if (wait_event_killable(z->wq, ramon_zdma_ready(rd, idx, &got)))
-		return ramon_fail(st, RAMON_E_INTERRUPTED, z->n, 0,
-				  "zdma: killed while waiting for one of %u channels", z->n);
+		return ramon_fail(st, RAMON_E_INTERRUPTED, z->n_chan, 0,
+				  "zdma: killed while waiting for one of %u channels", z->n_chan);
 	if (READ_ONCE(rd->dead)) {
 		if (got)
 			ramon_zdma_put_chan(z, *idx);
@@ -93,24 +93,24 @@ static int ramon_zdma_get_chan(struct ramon_dev *rd, u32 *idx, struct ramon_stat
 static int ramon_zdma_resolve(struct ramon_file *rf, const struct ramon_copy *c, u32 i,
 			      struct ramon_zdma_op *op, struct ramon_status *st)
 {
-	struct dma_device *dev = rf->rd->zdma.ch[0].chan->device;
+	struct dma_device *dma_dev = rf->rd->zdma.ch[0].chan->device;
 	int ret;
 
 	ret = ramon_buf_ref(rf, c->src_handle, c->src_off, c->len, "zdma src", i,
-			    RAMON_E_BUF_RANGE, &op->src, st);
+			    RAMON_E_BUF_RANGE, &op->src_buf, st);
 	if (ret)
 		return ret;
 	ret = ramon_buf_ref(rf, c->dst_handle, c->dst_off, c->len, "zdma dst", i,
-			    RAMON_E_BUF_RANGE, &op->dst, st);
+			    RAMON_E_BUF_RANGE, &op->dst_buf, st);
 	if (ret)
 		return ret;
-	op->src_dma = op->src->dma + c->src_off;
-	op->dst_dma = op->dst->dma + c->dst_off;
+	op->src_dma = op->src_buf->dma + c->src_off;
+	op->dst_dma = op->dst_buf->dma + c->dst_off;
 	op->len = c->len;
-	if (!is_dma_copy_aligned(dev, op->src_dma, op->dst_dma, op->len))
+	if (!is_dma_copy_aligned(dma_dev, op->src_dma, op->dst_dma, op->len))
 		return ramon_fail(st, RAMON_E_NOT_ALIGNED, i, c->len,
 				  "zdma entry %u: src off 0x%llx, dst off 0x%llx, len 0x%llx not all %u-byte aligned",
-				  i, c->src_off, c->dst_off, c->len, 1U << dev->copy_align);
+				  i, c->src_off, c->dst_off, c->len, 1U << dma_dev->copy_align);
 	return 0;
 }
 
@@ -119,10 +119,10 @@ static void ramon_zdma_release_ops(struct ramon_zdma_op *ops, u32 n)
 	u32 i;
 
 	for (i = 0; i < n; i++) {
-		if (ops[i].src)
-			ramon_buf_put(ops[i].src);
-		if (ops[i].dst)
-			ramon_buf_put(ops[i].dst);
+		if (ops[i].src_buf)
+			ramon_buf_put(ops[i].src_buf);
+		if (ops[i].dst_buf)
+			ramon_buf_put(ops[i].dst_buf);
 	}
 	kvfree(ops);
 }
@@ -161,51 +161,52 @@ static int ramon_zdma_prepare(struct ramon_file *rf, const struct ramon_zdma_cop
 
 /* ---- running ---- */
 
-static int ramon_zdma_wait(struct ramon_dev *rd, struct ramon_zdma_chan *zc, dma_cookie_t last,
-			   u32 first, u32 cnt, u32 timeout_ms, struct ramon_status *st)
+static int ramon_zdma_wait(struct ramon_dev *rd, struct ramon_zdma_chan *zc,
+			   dma_cookie_t last_cookie, u32 first, u32 n_ops, u32 timeout_ms,
+			   struct ramon_status *st)
 {
 	enum dma_status status;
-	long left;
+	long time_left;
 
 	dma_async_issue_pending(zc->chan);
-	left = wait_for_completion_killable_timeout(&zc->done, msecs_to_jiffies(timeout_ms));
-	status = dmaengine_tx_status(zc->chan, last, NULL);
-	if (left > 0 && status == DMA_COMPLETE)
+	time_left = wait_for_completion_killable_timeout(&zc->done, msecs_to_jiffies(timeout_ms));
+	status = dmaengine_tx_status(zc->chan, last_cookie, NULL);
+	if (time_left > 0 && status == DMA_COMPLETE)
 		return 0;
 
 	dmaengine_terminate_sync(zc->chan);
-	if (left == 0) {
+	if (time_left == 0) {
 		atomic64_inc(&rd->stats.zdma_timeouts);
 		dev_warn_ratelimited(&rd->pdev->dev,
 				     "zdma %s: entries %u..%u not done after %u ms (%s); terminated\n",
-				     dma_chan_name(zc->chan), first, first + cnt - 1, timeout_ms,
+				     dma_chan_name(zc->chan), first, first + n_ops - 1, timeout_ms,
 				     ramon_dma_status_name(status));
 		return ramon_fail(st, RAMON_E_ZDMA_TIMEOUT, first, timeout_ms,
 				  "zdma %s: entries %u..%u not done after %u ms, dmaengine status %s, channel terminated",
-				  dma_chan_name(zc->chan), first, first + cnt - 1, timeout_ms,
+				  dma_chan_name(zc->chan), first, first + n_ops - 1, timeout_ms,
 				  ramon_dma_status_name(status));
 	}
-	if (left < 0)
+	if (time_left < 0)
 		return ramon_fail(st, RAMON_E_INTERRUPTED, first, 0,
 				  "zdma %s: killed during entries %u..%u, channel terminated",
-				  dma_chan_name(zc->chan), first, first + cnt - 1);
+				  dma_chan_name(zc->chan), first, first + n_ops - 1);
 	if (READ_ONCE(rd->dead))
 		return ramon_fail(st, RAMON_E_REMOVED, first, 0,
 				  "zdma: device removed during entries %u..%u",
-				  first, first + cnt - 1);
+				  first, first + n_ops - 1);
 	dev_warn_ratelimited(&rd->pdev->dev, "zdma %s: entries %u..%u ended %s; terminated\n",
-			     dma_chan_name(zc->chan), first, first + cnt - 1,
+			     dma_chan_name(zc->chan), first, first + n_ops - 1,
 			     ramon_dma_status_name(status));
 	return ramon_fail(st, RAMON_E_ZDMA_DMA_ERROR, first, status,
 			  "zdma %s: entries %u..%u ended with dmaengine status %s",
-			  dma_chan_name(zc->chan), first, first + cnt - 1,
+			  dma_chan_name(zc->chan), first, first + n_ops - 1,
 			  ramon_dma_status_name(status));
 }
 
 /* one chunk: prep + submit each entry, interrupt and callback on the last only */
-static int ramon_zdma_chunk(struct ramon_dev *rd, struct ramon_zdma_chan *zc,
-			    const struct ramon_zdma_op *ops, u32 first, u32 cnt, u32 timeout_ms,
-			    struct ramon_status *st)
+static int ramon_zdma_chunk_run(struct ramon_dev *rd, struct ramon_zdma_chan *zc,
+				const struct ramon_zdma_op *ops, u32 first, u32 n_ops,
+				u32 timeout_ms, struct ramon_status *st)
 {
 	struct dma_async_tx_descriptor *tx;
 	dma_cookie_t cookie = 0;
@@ -217,9 +218,9 @@ static int ramon_zdma_chunk(struct ramon_dev *rd, struct ramon_zdma_chan *zc,
 	if (READ_ONCE(rd->dead))
 		return ramon_fail(st, RAMON_E_REMOVED, first, 0, "zdma: device removed");
 
-	for (i = 0; i < cnt; i++) {
+	for (i = 0; i < n_ops; i++) {
 		const struct ramon_zdma_op *op = &ops[first + i];
-		bool last = i == cnt - 1;
+		bool last = i == n_ops - 1;
 
 		tx = dmaengine_prep_dma_memcpy(zc->chan, op->dst_dma, op->src_dma, op->len,
 					       DMA_CTRL_ACK | (last ? DMA_PREP_INTERRUPT : 0));
@@ -241,7 +242,7 @@ static int ramon_zdma_chunk(struct ramon_dev *rd, struct ramon_zdma_chan *zc,
 					  dma_chan_name(zc->chan), first + i, cookie);
 		}
 	}
-	return ramon_zdma_wait(rd, zc, cookie, first, cnt, timeout_ms, st);
+	return ramon_zdma_wait(rd, zc, cookie, first, n_ops, timeout_ms, st);
 }
 
 int ramon_ioc_zdma_copy(struct ramon_file *rf, void *arg, struct ramon_status *st)
@@ -249,11 +250,11 @@ int ramon_ioc_zdma_copy(struct ramon_file *rf, void *arg, struct ramon_status *s
 	struct ramon_zdma_copy *p = arg;
 	struct ramon_dev *rd = rf->rd;
 	struct ramon_zdma_op *ops;
-	u32 idx, first, cnt, timeout_ms;
+	u32 idx, first, n_ops, timeout_ms;
 	int ret;
 
 	p->done = 0;
-	if (!rd->zdma.n)
+	if (!rd->zdma.n_chan)
 		return ramon_fail(st, RAMON_E_ZDMA_NO_CHANNELS, 0, ramon_param_zdma_channels(),
 				  "zdma: no DMA_MEMCPY channel was acquired at probe (zdma_channels=%u)",
 				  ramon_param_zdma_channels());
@@ -267,13 +268,14 @@ int ramon_ioc_zdma_copy(struct ramon_file *rf, void *arg, struct ramon_status *s
 	if (ret)
 		goto out;
 
-	timeout_ms = ramon_timeout_ms(p->timeout_ms, RAMON_TMO_ZDMA_MS);
-	for (first = 0; first < p->n && !ret; first += cnt) {
-		cnt = min_t(u32, p->n - first, RAMON_ZDMA_CHUNK);
-		ret = ramon_zdma_chunk(rd, &rd->zdma.ch[idx], ops, first, cnt, timeout_ms, st);
+	timeout_ms = ramon_timeout_ms(p->timeout_ms, RAMON_TIMEOUT_ZDMA_MS);
+	for (first = 0; first < p->n && !ret; first += n_ops) {
+		n_ops = min_t(u32, p->n - first, RAMON_ZDMA_CHUNK_ENTRIES);
+		ret = ramon_zdma_chunk_run(rd, &rd->zdma.ch[idx], ops, first, n_ops,
+					   timeout_ms, st);
 		if (!ret) {
-			p->done += cnt;
-			atomic64_add(cnt, &rd->stats.zdma_ops);
+			p->done += n_ops;
+			atomic64_add(n_ops, &rd->stats.zdma_ops);
 		}
 	}
 	ramon_zdma_put_chan(&rd->zdma, idx);
@@ -283,17 +285,17 @@ out:
 }
 
 /* CHAN_INFO for indices past the AXI channels */
-int ramon_zdma_chan_info(struct ramon_dev *rd, struct ramon_chan_info *p,
-			 struct ramon_status *st)
+int ramon_zdma_fill_chan_info(struct ramon_dev *rd, struct ramon_chan_info *p,
+			      struct ramon_status *st)
 {
 	u32 i = p->index - rd->n_axi;
 	struct ramon_zdma_chan *zc;
 
-	if (i >= rd->zdma.n)
-		return ramon_fail(st, RAMON_E_AXI_BAD_CHAN, p->index, rd->n_axi + rd->zdma.n,
+	if (i >= rd->zdma.n_chan)
+		return ramon_fail(st, RAMON_E_AXI_BAD_CHAN, p->index, rd->n_axi + rd->zdma.n_chan,
 				  "chan index %u: only %u AXI + %u ZDMA channels",
-				  p->index, rd->n_axi, rd->zdma.n);
-	zc = &rd->zdma.ch[array_index_nospec(i, rd->zdma.n)];
+				  p->index, rd->n_axi, rd->zdma.n_chan);
+	zc = &rd->zdma.ch[array_index_nospec(i, rd->zdma.n_chan)];
 	p->type = RAMON_CHAN_ZDMA;
 	p->dir = RAMON_DIR_MEMCPY;
 	p->device_id = 0;
@@ -354,9 +356,9 @@ int ramon_zdma_probe(struct ramon_dev *rd)
 		dev_info(dev, "zdma ch%u: %s (%pOF), copy_align %u\n", i, dma_chan_name(zc->chan),
 			 zc->chan->device->dev->of_node, 1U << zc->chan->device->copy_align);
 	}
-	z->n = i;
-	z->free_mask = z->n ? GENMASK(z->n - 1, 0) : 0;
-	dev_info(dev, "zdma: %u of %u memcpy channels\n", z->n, want);
+	z->n_chan = i;
+	z->free_mask = z->n_chan ? GENMASK(z->n_chan - 1, 0) : 0;
+	dev_info(dev, "zdma: %u of %u memcpy channels\n", z->n_chan, want);
 	return 0;
 }
 
@@ -365,7 +367,7 @@ void ramon_zdma_wake(struct ramon_dev *rd)
 	u32 i;
 
 	wake_up_all(&rd->zdma.wq);
-	for (i = 0; i < rd->zdma.n; i++)
+	for (i = 0; i < rd->zdma.n_chan; i++)
 		complete_all(&rd->zdma.ch[i].done);
 }
 
@@ -373,7 +375,7 @@ void ramon_zdma_remove(struct ramon_dev *rd)
 {
 	u32 i;
 
-	for (i = 0; i < rd->zdma.n; i++) {
+	for (i = 0; i < rd->zdma.n_chan; i++) {
 		dmaengine_terminate_sync(rd->zdma.ch[i].chan);
 		dma_release_channel(rd->zdma.ch[i].chan);
 	}

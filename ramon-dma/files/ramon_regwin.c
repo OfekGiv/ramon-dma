@@ -20,7 +20,7 @@
 
 /* Names window @idx and marks it absent until ramon_win_map() succeeds. */
 __printf(3, 4)
-static struct ramon_regwin *ramon_win_name(struct ramon_dev *rd, u32 idx, const char *fmt, ...)
+static struct ramon_regwin *ramon_win_init(struct ramon_dev *rd, u32 idx, const char *fmt, ...)
 {
 	struct ramon_regwin *win = &rd->win[idx];
 	va_list ap;
@@ -59,27 +59,27 @@ static u32 ramon_res_size(const struct resource *res)
 
 /*
  * SPW/SPFI blocks are mapped with the fixed window size the old driver used;
- * REG_IO refuses writes below @protect_end.
+ * REG_IO refuses writes below @write_protect_end.
  */
 static void ramon_win_map_block(struct ramon_dev *rd, struct ramon_regwin *win,
-				const struct resource *res, u32 size, u32 protect_end)
+				const struct resource *res, u32 size, u32 write_protect_end)
 {
 	if (ramon_res_size(res) < size)
 		dev_warn(&rd->pdev->dev, "regwin %s: DT reg size 0x%x < register window 0x%x\n",
 			 win->name, ramon_res_size(res), size);
 	ramon_win_map(rd, win, res->start, size,
-		      protect_end ? RAMON_REGWIN_CMD_PROTECTED : 0);
-	win->wr_protect_end = protect_end;
+		      write_protect_end ? RAMON_REGWIN_CMD_PROTECTED : 0);
+	win->write_protect_end = write_protect_end;
 }
 
-static void ramon_regwin_rstop(struct ramon_dev *rd, const struct ramon_of_hw *hw)
+static void ramon_regwin_probe_rstop(struct ramon_dev *rd, const struct ramon_of_hw *hw)
 {
 	struct device *dev = &rd->pdev->dev;
 	struct ramon_regwin *win;
 	u32 size;
 
-	win = ramon_win_name(rd, RAMON_WIN_RS_TOP, RAMON_WIN_NAME_RS_TOP);
-	if (!hw->rstop_ok)
+	win = ramon_win_init(rd, RAMON_WIN_RS_TOP, RAMON_WIN_NAME_RS_TOP);
+	if (!hw->rstop_present)
 		return;
 	size = ramon_res_size(&hw->rstop);
 	if (size < RAMON_RSTOP_MIN_SIZE) {
@@ -92,64 +92,64 @@ static void ramon_regwin_rstop(struct ramon_dev *rd, const struct ramon_of_hw *h
 		writel(RAMON_RSTOP_TRST_SPI_EN_ON, win->base + RAMON_RSTOP_TRST_SPI_EN);
 }
 
-static void ramon_regwin_ps(struct ramon_dev *rd)
+static void ramon_regwin_probe_ps(struct ramon_dev *rd)
 {
 	u32 i;
 
-	ramon_win_map(rd, ramon_win_name(rd, RAMON_WIN_SYSMON_PS, RAMON_WIN_NAME_SYSMON_PS),
+	ramon_win_map(rd, ramon_win_init(rd, RAMON_WIN_SYSMON_PS, RAMON_WIN_NAME_SYSMON_PS),
 		      RAMON_SYSMON_PS_BASE, RAMON_SYSMON_SIZE, RAMON_REGWIN_RO);
-	ramon_win_map(rd, ramon_win_name(rd, RAMON_WIN_SYSMON_PL, RAMON_WIN_NAME_SYSMON_PL),
+	ramon_win_map(rd, ramon_win_init(rd, RAMON_WIN_SYSMON_PL, RAMON_WIN_NAME_SYSMON_PL),
 		      RAMON_SYSMON_PL_BASE, RAMON_SYSMON_SIZE, RAMON_REGWIN_RO);
-	ramon_win_map(rd, ramon_win_name(rd, RAMON_WIN_RTC, RAMON_WIN_NAME_RTC),
+	ramon_win_map(rd, ramon_win_init(rd, RAMON_WIN_RTC, RAMON_WIN_NAME_RTC),
 		      RAMON_RTC_BASE, RAMON_RTC_SIZE, RAMON_REGWIN_RO);
 	for (i = 0; i < RAMON_TTC_COUNT; i++)
 		ramon_win_map(rd,
-			      ramon_win_name(rd, RAMON_WIN_TTC0 + i, RAMON_WIN_NAME_TTC "%u", i),
+			      ramon_win_init(rd, RAMON_WIN_TTC0 + i, RAMON_WIN_NAME_TTC "%u", i),
 			      RAMON_TTC_BASE + i * RAMON_TTC_STRIDE, RAMON_TTC_SIZE,
 			      RAMON_REGWIN_RO);
 }
 
-static void ramon_regwin_spw(struct ramon_dev *rd, const struct ramon_of_hw *hw)
+static void ramon_regwin_probe_spw(struct ramon_dev *rd, const struct ramon_of_hw *hw)
 {
 	struct ramon_regwin *win;
 	u32 nn;
 
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
 		if (!(hw->spw_mask & BIT(nn))) {
-			ramon_win_name(rd, RAMON_WIN_SPW0 + nn, RAMON_WIN_NAME_SPW "%u", nn);
+			ramon_win_init(rd, RAMON_WIN_SPW0 + nn, RAMON_WIN_NAME_SPW "%u", nn);
 			continue;
 		}
-		win = ramon_win_name(rd, RAMON_WIN_SPW0 + nn, RAMON_WIN_NAME_SPW "%u@%llx",
+		win = ramon_win_init(rd, RAMON_WIN_SPW0 + nn, RAMON_WIN_NAME_SPW "%u@%llx",
 				     nn, (u64)hw->spw[nn].start);
 		ramon_win_map_block(rd, win, &hw->spw[nn], RAMON_SPW_WIN_SIZE, 0);
 	}
 }
 
-static void ramon_regwin_spfi(struct ramon_dev *rd, const struct ramon_of_hw *hw)
+static void ramon_regwin_probe_spfi(struct ramon_dev *rd, const struct ramon_of_hw *hw)
 {
 	struct ramon_regwin *win;
 	u32 nn;
 
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
-		if (!(hw->spfi_mask & BIT(nn))) {
-			ramon_win_name(rd, RAMON_WIN_SPFI0 + nn, RAMON_WIN_NAME_SPFI "%u", nn);
+		if (!(hw->spfi_reg_mask & BIT(nn))) {
+			ramon_win_init(rd, RAMON_WIN_SPFI0 + nn, RAMON_WIN_NAME_SPFI "%u", nn);
 			continue;
 		}
-		win = ramon_win_name(rd, RAMON_WIN_SPFI0 + nn, RAMON_WIN_NAME_SPFI "%u@%llx",
+		win = ramon_win_init(rd, RAMON_WIN_SPFI0 + nn, RAMON_WIN_NAME_SPFI "%u@%llx",
 				     nn, (u64)hw->spfi[nn].start);
 		ramon_win_map_block(rd, win, &hw->spfi[nn], RAMON_SPFI_WIN_SIZE,
-				    RAMON_SPFI_CMD_BLOCK_END);
+				    RAMON_SPFI_CMD_BLOCK_SIZE);
 	}
 }
 
-static void ramon_regwin_regaccess(struct ramon_dev *rd, const struct ramon_of_hw *hw)
+static void ramon_regwin_probe_regaccess(struct ramon_dev *rd, const struct ramon_of_hw *hw)
 {
 	const struct ramon_of_regdev *ra = hw->regaccess;
 	struct ramon_regwin *win;
 	u32 i;
 
 	for (i = 0; i < hw->n_regaccess; i++) {
-		win = ramon_win_name(rd, RAMON_WIN_FIXED + i, "%s", ra[i].name);
+		win = ramon_win_init(rd, RAMON_WIN_FIXED + i, "%s", ra[i].name);
 		if (ra[i].present)
 			ramon_win_map(rd, win, ra[i].res.start, ramon_res_size(&ra[i].res), 0);
 	}
@@ -158,23 +158,23 @@ static void ramon_regwin_regaccess(struct ramon_dev *rd, const struct ramon_of_h
 int ramon_regwin_probe(struct ramon_dev *rd, const struct ramon_of_hw *hw)
 {
 	struct device *dev = &rd->pdev->dev;
-	u32 n = RAMON_WIN_FIXED + hw->n_regaccess, i, absent = 0;
+	u32 n = RAMON_WIN_FIXED + hw->n_regaccess, i, n_absent = 0;
 
 	rd->win = devm_kcalloc(dev, n, sizeof(*rd->win), GFP_KERNEL);
 	if (!rd->win)
 		return -ENOMEM;
 	rd->n_win = n;
 
-	ramon_regwin_rstop(rd, hw);
-	ramon_regwin_ps(rd);
-	ramon_regwin_spw(rd, hw);
-	ramon_regwin_spfi(rd, hw);
-	ramon_regwin_regaccess(rd, hw);
+	ramon_regwin_probe_rstop(rd, hw);
+	ramon_regwin_probe_ps(rd);
+	ramon_regwin_probe_spw(rd, hw);
+	ramon_regwin_probe_spfi(rd, hw);
+	ramon_regwin_probe_regaccess(rd, hw);
 
 	for (i = 0; i < rd->n_win; i++)
 		if (rd->win[i].flags & RAMON_REGWIN_ABSENT)
-			absent++;
-	dev_info(dev, "%u register windows, %u absent\n", rd->n_win, absent);
+			n_absent++;
+	dev_info(dev, "%u register windows, %u absent\n", rd->n_win, n_absent);
 	return 0;
 }
 
@@ -213,7 +213,7 @@ int ramon_ioc_regwin_info(struct ramon_file *rf, void *arg, struct ramon_status 
 	if (ret)
 		return ret;
 	p->size = win->size;
-	p->phys = rf->see_phys ? win->phys : 0;
+	p->phys = rf->can_see_phys ? win->phys : 0;
 	p->flags = win->flags;
 	memcpy(p->name, win->name, sizeof(p->name));
 	return 0;
@@ -272,11 +272,11 @@ int ramon_ioc_reg_io(struct ramon_file *rf, void *arg, struct ramon_status *st)
 		return ramon_fail(st, RAMON_E_REGWIN_READ_ONLY, p->offset, p->value,
 				  "regwin %s: read-only, write of 0x%x at 0x%x refused",
 				  win->name, p->value, p->offset);
-	if (p->op == RAMON_REG_OP_WRITE && p->offset < win->wr_protect_end)
+	if (p->op == RAMON_REG_OP_WRITE && p->offset < win->write_protect_end)
 		return ramon_fail(st, RAMON_E_REGWIN_PROTECTED, p->offset, p->value,
 				  "regwin %s: write of 0x%x at 0x%x (word %u) refused: words 0..%u are the SPFI command block, written only by the driver (use SPFI_CMD, SPFI_WRITE, SPFI_READ)",
 				  win->name, p->value, p->offset, p->offset / 4,
-				  win->wr_protect_end / 4 - 1);
+				  win->write_protect_end / 4 - 1);
 	ramon_reg_access(win, p);
 	return 0;
 }

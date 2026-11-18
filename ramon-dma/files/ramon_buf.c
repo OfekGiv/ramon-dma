@@ -25,7 +25,7 @@ static void ramon_buf_release(struct kref *kref)
 	struct ramon_buf *buf = container_of(kref, struct ramon_buf, kref);
 	struct ramon_dev *rd = buf->rd;
 
-	dma_free_coherent(&rd->pdev->dev, buf->size, buf->cpu, buf->dma);
+	dma_free_coherent(&rd->pdev->dev, buf->size, buf->cpu_addr, buf->dma);
 	kfree(buf);
 	ramon_dev_put(rd);
 }
@@ -56,14 +56,14 @@ static struct ramon_buf *ramon_buf_get(struct ramon_file *rf, u32 handle)
  * @off: byte offset into the buffer
  * @len: byte count, > 0
  * @what: operand kind for the message ("axi item", "zdma src" ...)
- * @i: operand index for the message
+ * @index: operand index for the message
  * @range_code: failure code when the range is outside the buffer (normally RAMON_E_BUF_RANGE)
  * @bufp: set to the buffer, with a reference the caller must put
  * @st: status trailer
  *
  * Return: 0 or the negative errno from ramon_fail().
  */
-int ramon_buf_ref(struct ramon_file *rf, u32 handle, u64 off, u64 len, const char *what, u32 i,
+int ramon_buf_ref(struct ramon_file *rf, u32 handle, u64 off, u64 len, const char *what, u32 index,
 		  u32 range_code, struct ramon_buf **bufp, struct ramon_status *st)
 {
 	struct ramon_buf *buf;
@@ -71,18 +71,18 @@ int ramon_buf_ref(struct ramon_file *rf, u32 handle, u64 off, u64 len, const cha
 	u64 end;
 
 	if (!len)
-		return ramon_fail(st, RAMON_E_INVAL_ARG, i, handle, "%s %u: buf %u: len 0",
-				  what, i, handle);
+		return ramon_fail(st, RAMON_E_INVAL_ARG, index, handle, "%s %u: buf %u: len 0",
+				  what, index, handle);
 	buf = ramon_buf_get(rf, handle);
 	if (!buf)
-		return ramon_fail(st, RAMON_E_NO_SUCH_HANDLE, handle, i,
-				  "%s %u: buf %u: no such handle on this fd", what, i, handle);
+		return ramon_fail(st, RAMON_E_NO_SUCH_HANDLE, handle, index,
+				  "%s %u: buf %u: no such handle on this fd", what, index, handle);
 	size = buf->size;
 	if (check_add_overflow(off, len, &end) || end > size) {
 		ramon_buf_put(buf);
 		return ramon_fail(st, range_code, off, len,
 				  "%s %u: buf %u: offset 0x%llx + len 0x%llx > size 0x%zx",
-				  what, i, handle, off, len, size);
+				  what, index, handle, off, len, size);
 	}
 	*bufp = buf;
 	return 0;
@@ -92,15 +92,16 @@ int ramon_ioc_buf_alloc(struct ramon_file *rf, void *arg, struct ramon_status *s
 {
 	struct ramon_buf_alloc *p = arg;
 	struct ramon_dev *rd = rf->rd;
-	u64 max = ramon_max_buf_bytes();
+	u64 max_bytes = ramon_max_buf_bytes();
 	struct ramon_buf *buf;
 	int id;
 
 	if (!p->size)
-		return ramon_fail(st, RAMON_E_INVAL_ARG, 0, max, "buf alloc: size 0");
-	if (p->size > max)
-		return ramon_fail(st, RAMON_E_BUF_TOO_LARGE, p->size, max,
-				  "buf alloc: size 0x%llx > max_buf_mb limit 0x%llx", p->size, max);
+		return ramon_fail(st, RAMON_E_INVAL_ARG, 0, max_bytes, "buf alloc: size 0");
+	if (p->size > max_bytes)
+		return ramon_fail(st, RAMON_E_BUF_TOO_LARGE, p->size, max_bytes,
+				  "buf alloc: size 0x%llx > max_buf_mb limit 0x%llx",
+				  p->size, max_bytes);
 
 	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
 	if (!buf)
@@ -108,9 +109,9 @@ int ramon_ioc_buf_alloc(struct ramon_file *rf, void *arg, struct ramon_status *s
 				  "buf alloc: no memory for the buffer descriptor");
 	buf->size = PAGE_ALIGN(p->size);
 	/* dma_alloc_coherent() returns zeroed memory */
-	buf->cpu = dma_alloc_coherent(&rd->pdev->dev, buf->size, &buf->dma,
-				      GFP_KERNEL | __GFP_NOWARN);
-	if (!buf->cpu) {
+	buf->cpu_addr = dma_alloc_coherent(&rd->pdev->dev, buf->size, &buf->dma,
+					   GFP_KERNEL | __GFP_NOWARN);
+	if (!buf->cpu_addr) {
 		kfree(buf);
 		return ramon_fail(st, RAMON_E_BUF_ALLOC_FAILED, p->size, 0,
 				  "buf alloc: dma_alloc_coherent(0x%llx) failed, CMA exhausted or fragmented",
@@ -167,7 +168,7 @@ int ramon_ioc_buf_info(struct ramon_file *rf, void *arg, struct ramon_status *st
 		return ramon_fail(st, RAMON_E_NO_SUCH_HANDLE, p->handle, 0,
 				  "buf %u: no such handle on this fd", p->handle);
 	p->size = buf->size;
-	p->dma_addr = rf->see_phys ? buf->dma : 0;
+	p->dma_addr = rf->can_see_phys ? buf->dma : 0;
 	ramon_buf_put(buf);
 	return 0;
 }
@@ -228,7 +229,7 @@ int ramon_buf_mmap(struct file *file, struct vm_area_struct *vma)
 
 	/* vm_pgoff selected the buffer; dma_mmap_coherent() takes it as an offset into it */
 	vma->vm_pgoff = 0;
-	ret = dma_mmap_coherent(&rd->pdev->dev, vma, buf->cpu, buf->dma, buf->size);
+	ret = dma_mmap_coherent(&rd->pdev->dev, vma, buf->cpu_addr, buf->dma, buf->size);
 	if (ret) {
 		dev_dbg(&rd->pdev->dev, "mmap handle %lu: dma_mmap_coherent failed: %d\n",
 			handle, ret);
