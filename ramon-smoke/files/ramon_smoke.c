@@ -68,47 +68,48 @@
 #include "ramon_dma_uapi.h"
 
 /* 0.<driver step>.<tool revision>; ramon-smoke.bb PV must match */
-#define SMOKE_VERSION		"0.8.20"
+#define SMOKE_VERSION		"0.8.21"
 
 #define INFO_THREADS		8
-#define INFO_ITERATIONS		20000
+#define INFO_CALLS_PER_THREAD	20000
 #define CHURN_THREADS		8
-#define CHURN_ITERATIONS	300
-#define CHURN_MAX_SIZE		(256 * 1024)
-#define CMA_TEST_SIZE		(16 * 1024 * 1024)
+#define CHURN_ITERATIONS_PER_THREAD	300
+#define CHURN_MAX_BYTES		(256 * 1024)
+#define CMA_TEST_BYTES		(16 * 1024 * 1024)
 #define CMA_SLACK_KB		2048	/* other CMA users may move CmaFree a little */
 #define CMA_SETTLE_MS		2000
-#define EXHAUST_MAX_BUFS	64
+#define CMA_EXHAUST_MAX_BUFS	64
 #define BOGUS_HANDLE		424242
-#define REG_THREADS		8
-#define REG_ITERATIONS		5000
-#define RSTOP_MAJOR		0x00
-#define RSTOP_MINOR		0x04
-#define RSTOP_MINOR_MINOR	0x08
-#define RSTOP_TRST_SPI_EN	0x40
-#define SYSMON_TEMP		0x000
+#define REGWIN_THREADS		8
+#define REGWIN_ITERATIONS_PER_THREAD	5000
+#define RSTOP_MAJOR_REG		0x00
+#define RSTOP_MINOR_REG		0x04
+#define RSTOP_MINOR_MINOR_REG	0x08
+#define RSTOP_TRST_SPI_EN_REG	0x40
+#define SYSMON_TEMP_REG		0x000
 #define SYSMON_TEMP_MIN_C	(-40.0)
 #define SYSMON_TEMP_MAX_C	125.0
-#define RTC_CUR_TIME		0x10
-#define TTC_REG			0x0C
-#define SPW_VERSION		0x00
-#define SPFI_WR_VERSION		0x40	/* word 16 */
-#define SPW_LINK_STATUS		0x28
+#define RTC_CUR_TIME_REG	0x10
+#define TTC_CNT_CTRL1_REG	0x0C
+#define SPW_VERSION_REG		0x00
+#define SPFI_WR_VERSION_REG	0x40	/* word 16 */
+#define SPW_LINK_STATUS_REG	0x28
 #define SPW_LINK_MASK		0x07
 #define SPW_LINK_SYNCED		0x05
 #define SPW_LOOPBACK_REG	0x10
 #define SPW_HDR_BYTES		40	/* L2 + L3 + L4 */
 #define SPW_FOOTER_BYTES	16
-#define SPW_WAIT_MS		3000
-#define SPW_SHORT_WAIT_MS	200
+#define SPW_XFER_TIMEOUT_MS	3000
+#define SPW_WAITER_TIMEOUT_MS	(10 * SPW_XFER_TIMEOUT_MS)
+#define IDLE_WAIT_MS		200
 #define SPW_RESET_REG	0x1C
 #define SPW_ENABLE_REG	0x2C	/* write 1 to enable the core; it syncs only then */
-#define CANCEL_AFTER_MS		300
-#define ZDMA_LIST_N		100
-#define ZDMA_LIST_BUF		(4 * 1024 * 1024)
-#define ZDMA_SMALL		64
+#define WAITER_BLOCK_MS		300
+#define ZDMA_LIST_ENTRIES	100
+#define ZDMA_LIST_BUF_BYTES	(4 * 1024 * 1024)
+#define ZDMA_SMALL_BYTES	64
 #define ZDMA_THREADS		8
-#define ZDMA_THREAD_COPIES	100
+#define ZDMA_COPIES_PER_THREAD	100
 #define ZDMA_THREAD_BYTES	(64 * 1024)
 #define SYSFS_VERSION		"/sys/module/" RAMON_DEV_NAME "/version"
 #define SYSFS_DRIVER		"/sys/bus/platform/drivers/" RAMON_DEV_NAME
@@ -116,28 +117,28 @@
 #define REBIND_WAIT_MS		2000
 
 static const char *dev_path = "/dev/" RAMON_DEV_NAME;
-static int fd = -1;
+static int dev_fd = -1;
 static int failures;
 static size_t page_size;
 static unsigned int page_shift;
 static unsigned int drv_step;	/* 0.<step>.0 of the loaded driver */
 static unsigned int drv_patch;	/* 0.<step>.<patch> */
-static unsigned char code_seen[256];	/* RAMON_E_* codes a check has produced */
-static int targc;			/* arguments after the test name */
-static char *targv[8];
+static unsigned char code_produced[256];	/* RAMON_E_* codes a check has produced */
+static int test_argc;				/* arguments after the test name */
+static char *test_argv[8];
 
-static uint32_t targ_u32(int i, uint32_t def)
+static uint32_t test_arg_u32(int i, uint32_t def)
 {
-	return i < targc ? strtoul(targv[i], NULL, 0) : def;
+	return i < test_argc ? strtoul(test_argv[i], NULL, 0) : def;
 }
 
-static void seen(uint32_t code)
+static void mark_code_produced(uint32_t code)
 {
-	code_seen[code & 0xff] = 1;
+	code_produced[code & 0xff] = 1;
 }
 
 /* the loaded driver is 0.<step>.<patch> or later (a 1.x driver always is) */
-static int drv_has(unsigned int step, unsigned int patch)
+static int drv_is_at_least(unsigned int step, unsigned int patch)
 {
 	return drv_step > step || (drv_step == step && drv_patch >= patch);
 }
@@ -195,7 +196,7 @@ static int must(unsigned long req, void *arg, struct ramon_status *st, const cha
 {
 	int err;
 
-	if (ioctl(fd, req, arg) == 0) {
+	if (ioctl(dev_fd, req, arg) == 0) {
 		if (st->code != RAMON_E_OK || st->err != 0)
 			fail("%s: returned 0 but status code %u err %d", what, st->code, st->err);
 		return 0;
@@ -215,7 +216,7 @@ static void expect_fail(unsigned long req, void *arg, struct ramon_status *st, c
 {
 	int err;
 
-	if (ioctl(fd, req, arg) == 0) {
+	if (ioctl(dev_fd, req, arg) == 0) {
 		fail("%s: succeeded, expected %s", what, ramon_err_name(want_code));
 		return;
 	}
@@ -227,7 +228,7 @@ static void expect_fail(unsigned long req, void *arg, struct ramon_status *st, c
 		print_status("got", err, st);
 		return;
 	}
-	seen(st->code);
+	mark_code_produced(st->code);
 	pass("%s -> %s \"%s\"", what, ramon_err_name(st->code), st->msg);
 }
 
@@ -236,7 +237,7 @@ static void expect_errno(unsigned long req, void *arg, const char *what, int wan
 {
 	int err;
 
-	if (ioctl(fd, req, arg) == 0) {
+	if (ioctl(dev_fd, req, arg) == 0) {
 		fail("%s: succeeded, expected errno %d", what, want_errno);
 		return;
 	}
@@ -281,7 +282,7 @@ static int buf_free(uint32_t handle)
 
 static void *buf_map(uint32_t handle, size_t len, int flags)
 {
-	return mmap(NULL, len, PROT_READ | PROT_WRITE, flags, fd, (off_t)handle << page_shift);
+	return mmap(NULL, len, PROT_READ | PROT_WRITE, flags, dev_fd, (off_t)handle << page_shift);
 }
 
 static size_t round_page(uint64_t size)
@@ -348,9 +349,9 @@ static void sleep_ms(long ms)
 static long cma_wait_back(long want_kb)
 {
 	long now = meminfo_kb("CmaFree");
-	int waited;
+	int waited_ms;
 
-	for (waited = 0; now < want_kb && waited < CMA_SETTLE_MS; waited += 50) {
+	for (waited_ms = 0; now < want_kb && waited_ms < CMA_SETTLE_MS; waited_ms += 50) {
 		sleep_ms(50);
 		now = meminfo_kb("CmaFree");
 	}
@@ -382,25 +383,25 @@ static void check_sysfs_version(const struct ramon_get_info *gi)
 static void *info_thread(void *unused)
 {
 	struct ramon_get_info gi;
-	long bad = 0;
+	long n_bad = 0;
 	int i;
 
 	(void)unused;
-	for (i = 0; i < INFO_ITERATIONS; i++) {
+	for (i = 0; i < INFO_CALLS_PER_THREAD; i++) {
 		/* garbage in the trailer must come back cleared */
 		memset(&gi, 0xa5, sizeof(gi));
-		if (ioctl(fd, RAMON_IOC_GET_INFO, &gi) || gi.abi_version != RAMON_ABI_VERSION ||
+		if (ioctl(dev_fd, RAMON_IOC_GET_INFO, &gi) || gi.abi_version != RAMON_ABI_VERSION ||
 		    gi.st.code != RAMON_E_OK || gi.st.err != 0 || gi.st.msg[0])
-			bad++;
+			n_bad++;
 	}
-	return (void *)bad;
+	return (void *)n_bad;
 }
 
 static void test_info(void)
 {
 	struct ramon_get_info gi;
 	pthread_t th[INFO_THREADS];
-	long bad = 0;
+	long n_bad = 0;
 	void *ret;
 	int i;
 
@@ -428,24 +429,24 @@ static void test_info(void)
 		}
 	for (i = 0; i < INFO_THREADS; i++) {
 		pthread_join(th[i], &ret);
-		bad += (long)ret;
+		n_bad += (long)ret;
 	}
-	if (bad)
-		fail("concurrent GET_INFO: %ld bad results", bad);
+	if (n_bad)
+		fail("concurrent GET_INFO: %ld bad results", n_bad);
 	else
 		pass("concurrent GET_INFO: %d threads x %d calls on one fd",
-		     INFO_THREADS, INFO_ITERATIONS);
+		     INFO_THREADS, INFO_CALLS_PER_THREAD);
 }
 
 /* ---- buf ---- */
 
 /* alloc, info, map, zero check, pattern, free, stale handle */
-static void buf_roundtrip(uint64_t size)
+static void buf_check_lifecycle(uint64_t size)
 {
 	struct ramon_buf_info bi;
 	uint64_t actual;
 	uint32_t h;
-	long bad;
+	long bad_word;
 	void *p;
 
 	if (buf_alloc(size, &h, &actual))
@@ -470,9 +471,9 @@ static void buf_roundtrip(uint64_t size)
 		if (!all_zero(p, actual))
 			fail("handle %u: fresh buffer is not zeroed", h);
 		fill(p, actual, h);
-		bad = verify(p, actual, h);
-		if (bad >= 0)
-			fail("handle %u: pattern mismatch at word %ld", h, bad);
+		bad_word = verify(p, actual, h);
+		if (bad_word >= 0)
+			fail("handle %u: pattern mismatch at word %ld", h, bad_word);
 		munmap(p, actual);
 	}
 	if (buf_free(h))
@@ -480,7 +481,7 @@ static void buf_roundtrip(uint64_t size)
 
 	memset(&bi, 0, sizeof(bi));
 	bi.handle = h;
-	if (ioctl(fd, RAMON_IOC_BUF_INFO, &bi) == 0 || bi.st.code != RAMON_E_NO_SUCH_HANDLE)
+	if (ioctl(dev_fd, RAMON_IOC_BUF_INFO, &bi) == 0 || bi.st.code != RAMON_E_NO_SUCH_HANDLE)
 		fail("BUF_INFO on freed handle %u: code %u", h, bi.st.code);
 	else
 		pass("size %" PRIu64 " -> handle %u, %" PRIu64 " bytes at dma 0x%" PRIx64
@@ -488,14 +489,14 @@ static void buf_roundtrip(uint64_t size)
 }
 
 /* BUF_FREE while mapped: the mapping keeps the memory; munmap releases it */
-static void buf_map_outlives_free(void)
+static void buf_check_map_outlives_free(void)
 {
 	long before = meminfo_kb("CmaFree"), mid, after;
 	uint64_t actual;
 	uint32_t h;
 	void *p;
 
-	if (buf_alloc(CMA_TEST_SIZE, &h, &actual))
+	if (buf_alloc(CMA_TEST_BYTES, &h, &actual))
 		return;
 	p = buf_map(h, actual, MAP_SHARED);
 	if (p == MAP_FAILED) {
@@ -529,7 +530,7 @@ static void buf_map_outlives_free(void)
 		pass("mapping outlives BUF_FREE; memory returned at munmap");
 }
 
-static void buf_partial_map(void)
+static void buf_check_partial_map(void)
 {
 	uint32_t h;
 	void *p;
@@ -549,12 +550,12 @@ static void buf_partial_map(void)
 
 static void test_buf(void)
 {
-	buf_roundtrip(1);
-	buf_roundtrip(page_size);
-	buf_roundtrip(page_size + 904);
-	buf_roundtrip(1024 * 1024 + 1);
-	buf_partial_map();
-	buf_map_outlives_free();
+	buf_check_lifecycle(1);
+	buf_check_lifecycle(page_size);
+	buf_check_lifecycle(page_size + 904);
+	buf_check_lifecycle(1024 * 1024 + 1);
+	buf_check_partial_map();
+	buf_check_map_outlives_free();
 }
 
 /* ---- churn: alloc/map/free from many threads on one fd ---- */
@@ -562,40 +563,40 @@ static void test_buf(void)
 static void *churn_thread(void *arg)
 {
 	unsigned int seed = (unsigned int)(uintptr_t)arg;
-	long bad = 0;
+	long n_bad = 0;
 	int i;
 
-	for (i = 0; i < CHURN_ITERATIONS; i++) {
-		uint64_t size = 1 + rand_r(&seed) % CHURN_MAX_SIZE, actual;
+	for (i = 0; i < CHURN_ITERATIONS_PER_THREAD; i++) {
+		uint64_t size = 1 + rand_r(&seed) % CHURN_MAX_BYTES, actual;
 		uint32_t h, tag = (seed << 8) ^ (uint32_t)i;
 		void *p;
 
 		if (buf_alloc(size, &h, &actual)) {
-			bad++;
+			n_bad++;
 			continue;
 		}
 		p = buf_map(h, actual, MAP_SHARED);
 		if (p == MAP_FAILED) {
-			bad++;
+			n_bad++;
 		} else {
 			/* a fresh zeroed buffer proves no other thread got the same handle */
 			if (!all_zero(p, actual))
-				bad++;
+				n_bad++;
 			fill(p, actual, tag);
 			if (verify(p, actual, tag) >= 0)
-				bad++;
+				n_bad++;
 			munmap(p, actual);
 		}
 		if (buf_free(h))
-			bad++;
+			n_bad++;
 	}
-	return (void *)bad;
+	return (void *)n_bad;
 }
 
 static void test_churn(void)
 {
 	pthread_t th[CHURN_THREADS];
-	long bad = 0;
+	long n_bad = 0;
 	void *ret;
 	int i;
 
@@ -606,30 +607,30 @@ static void test_churn(void)
 		}
 	for (i = 0; i < CHURN_THREADS; i++) {
 		pthread_join(th[i], &ret);
-		bad += (long)ret;
+		n_bad += (long)ret;
 	}
-	if (bad)
-		fail("churn: %ld bad iterations", bad);
+	if (n_bad)
+		fail("churn: %ld bad iterations", n_bad);
 	else
 		pass("churn: %d threads x %d alloc/mmap/verify/free on one fd",
-		     CHURN_THREADS, CHURN_ITERATIONS);
+		     CHURN_THREADS, CHURN_ITERATIONS_PER_THREAD);
 }
 
 /* ---- kill: SIGKILL a process that holds a mapped buffer ---- */
 
-static void kill_child(int ready_fd)
+static void hold_buf_until_killed(int ready_fd)
 {
 	uint32_t h;
 	void *p;
 
 	/* own fd, so the buffer belongs only to this process */
-	fd = open(dev_path, O_RDWR);
-	if (fd < 0 || buf_alloc(CMA_TEST_SIZE, &h, NULL))
+	dev_fd = open(dev_path, O_RDWR);
+	if (dev_fd < 0 || buf_alloc(CMA_TEST_BYTES, &h, NULL))
 		_exit(1);
-	p = buf_map(h, CMA_TEST_SIZE, MAP_SHARED);
+	p = buf_map(h, CMA_TEST_BYTES, MAP_SHARED);
 	if (p == MAP_FAILED)
 		_exit(1);
-	fill(p, CMA_TEST_SIZE, 1);
+	fill(p, CMA_TEST_BYTES, 1);
 	if (write(ready_fd, "r", 1) != 1)
 		_exit(1);
 	for (;;)
@@ -654,7 +655,7 @@ static void test_kill(void)
 	}
 	if (pid == 0) {
 		close(pipefd[0]);
-		kill_child(pipefd[1]);
+		hold_buf_until_killed(pipefd[1]);
 	}
 	close(pipefd[1]);
 	if (read(pipefd[0], &c, 1) != 1) {
@@ -676,7 +677,7 @@ static void test_kill(void)
 	}
 	after = cma_wait_back(before - CMA_SLACK_KB);
 	printf("      CmaFree kB: before %ld, child holding %d MiB %ld, after kill %ld\n",
-	       before, CMA_TEST_SIZE >> 20, held, after);
+	       before, CMA_TEST_BYTES >> 20, held, after);
 	if (after < before - CMA_SLACK_KB)
 		fail("CmaFree did not come back after kill -9 (%ld kB < %ld kB)", after, before);
 	else
@@ -690,7 +691,7 @@ static const char *const fixed_win_names[RAMON_WIN_FIXED] = {
 	"spw0", "spw1", "spfi0", "spfi1",
 };
 
-static int win_is_ro(uint32_t i)
+static int win_should_be_ro(uint32_t i)
 {
 	return i >= RAMON_WIN_SYSMON_PS && i < RAMON_WIN_TTC0 + RAMON_TTC_COUNT;
 }
@@ -700,7 +701,7 @@ static int regwin_info(uint32_t index, struct ramon_regwin_info *ri)
 {
 	memset(ri, 0, sizeof(*ri));
 	ri->index = index;
-	return ioctl(fd, RAMON_IOC_REGWIN_INFO, ri) ? errno : 0;
+	return ioctl(dev_fd, RAMON_IOC_REGWIN_INFO, ri) ? errno : 0;
 }
 
 /* name == NULL selects by index */
@@ -730,7 +731,7 @@ static int reg_read(const char *name, uint32_t index, uint32_t offset, uint32_t 
 	return reg_io(name, index, RAMON_REG_OP_READ, offset, value);
 }
 
-static int win_present(uint32_t index)
+static int win_is_present(uint32_t index)
 {
 	struct ramon_regwin_info ri;
 
@@ -765,9 +766,9 @@ static void regwin_list(uint32_t n)
 			fail("window %u is \"%.32s\", expected \"%s\"", i, ri.name,
 			     fixed_win_names[i]);
 		if (!(ri.flags & RAMON_REGWIN_ABSENT) &&
-		    !!(ri.flags & RAMON_REGWIN_RO) != win_is_ro(i))
+		    !!(ri.flags & RAMON_REGWIN_RO) != win_should_be_ro(i))
 			fail("window %u %s: RO flag %s", i, ri.name,
-			     win_is_ro(i) ? "missing" : "unexpected");
+			     win_should_be_ro(i) ? "missing" : "unexpected");
 	}
 	pass("%u windows listed; fixed names, order and RO flags as in the UAPI", n);
 }
@@ -776,22 +777,22 @@ static void regwin_rstop(void)
 {
 	uint32_t maj, min, mm, by_name, en = 1;
 
-	if (!win_present(RAMON_WIN_RS_TOP)) {
+	if (!win_is_present(RAMON_WIN_RS_TOP)) {
 		printf("      rs_top absent: skipped\n");
 		return;
 	}
-	if (reg_read(NULL, RAMON_WIN_RS_TOP, RSTOP_MAJOR, &maj) ||
-	    reg_read(NULL, RAMON_WIN_RS_TOP, RSTOP_MINOR, &min) ||
-	    reg_read(NULL, RAMON_WIN_RS_TOP, RSTOP_MINOR_MINOR, &mm) ||
-	    reg_read("rs_top", 0, RSTOP_MAJOR, &by_name))
+	if (reg_read(NULL, RAMON_WIN_RS_TOP, RSTOP_MAJOR_REG, &maj) ||
+	    reg_read(NULL, RAMON_WIN_RS_TOP, RSTOP_MINOR_REG, &min) ||
+	    reg_read(NULL, RAMON_WIN_RS_TOP, RSTOP_MINOR_MINOR_REG, &mm) ||
+	    reg_read("rs_top", 0, RSTOP_MAJOR_REG, &by_name))
 		return;
 	if (by_name != maj)
 		fail("rs_top[0] by name 0x%x != by index 0x%x", by_name, maj);
 	pass("RS-TOP version %u.%u.%u (0x%x 0x%x 0x%x); name and index agree",
 	     maj, min, mm, maj, min, mm);
 	/* the same write probe does: enable TRST and SPI_EN */
-	if (!reg_io(NULL, RAMON_WIN_RS_TOP, RAMON_REG_OP_WRITE, RSTOP_TRST_SPI_EN, &en) &&
-	    !reg_read(NULL, RAMON_WIN_RS_TOP, RSTOP_TRST_SPI_EN, &en))
+	if (!reg_io(NULL, RAMON_WIN_RS_TOP, RAMON_REG_OP_WRITE, RSTOP_TRST_SPI_EN_REG, &en) &&
+	    !reg_read(NULL, RAMON_WIN_RS_TOP, RSTOP_TRST_SPI_EN_REG, &en))
 		pass("RS-TOP 0x40 (TRST/SPI_EN) written 1, reads back 0x%x", en);
 }
 
@@ -803,11 +804,11 @@ static void regwin_sysmon(void)
 	size_t i;
 
 	for (i = 0; i < 2; i++) {
-		if (!win_present(win[i])) {
+		if (!win_is_present(win[i])) {
 			printf("      %s absent: skipped\n", fixed_win_names[win[i]]);
 			continue;
 		}
-		if (reg_read(NULL, win[i], SYSMON_TEMP, &raw))
+		if (reg_read(NULL, win[i], SYSMON_TEMP_REG, &raw))
 			continue;
 		/* ZynqMP SYSMON temperature, same formula as the old app */
 		c = raw / 65536.0 * 509.314 - 280.239;
@@ -823,15 +824,16 @@ static void regwin_rtc_ttc(void)
 {
 	uint32_t t0, t1, v, i;
 
-	if (win_present(RAMON_WIN_RTC) && !reg_read(NULL, RAMON_WIN_RTC, RTC_CUR_TIME, &t0)) {
+	if (win_is_present(RAMON_WIN_RTC) &&
+	    !reg_read(NULL, RAMON_WIN_RTC, RTC_CUR_TIME_REG, &t0)) {
 		sleep_ms(1200);
-		if (!reg_read(NULL, RAMON_WIN_RTC, RTC_CUR_TIME, &t1))
+		if (!reg_read(NULL, RAMON_WIN_RTC, RTC_CUR_TIME_REG, &t1))
 			printf("      rtc[0x10] %u then %u after 1.2 s%s\n", t0, t1,
 			       t1 == t0 ? " (RTC not counting?)" : "");
 	}
 	for (i = 0; i < RAMON_TTC_COUNT; i++)
-		if (win_present(RAMON_WIN_TTC0 + i) &&
-		    !reg_read(NULL, RAMON_WIN_TTC0 + i, TTC_REG, &v))
+		if (win_is_present(RAMON_WIN_TTC0 + i) &&
+		    !reg_read(NULL, RAMON_WIN_TTC0 + i, TTC_CNT_CTRL1_REG, &v))
 			printf("      ttc%u[0x0c] 0x%08x\n", i, v);
 }
 
@@ -839,11 +841,12 @@ static void regwin_rtc_ttc(void)
 static void regwin_spw_spfi(uint32_t spfi_mask)
 {
 	static const char *const prefix[] = { "spw0", "spw1", "spfi0", "spfi1" };
-	static const uint32_t reg[] = { SPW_VERSION, SPW_VERSION, SPFI_WR_VERSION, SPFI_WR_VERSION };
+	static const uint32_t reg[] = { SPW_VERSION_REG, SPW_VERSION_REG, SPFI_WR_VERSION_REG,
+					SPFI_WR_VERSION_REG };
 	uint32_t i, by_name, by_index;
 
 	for (i = 0; i < 4; i++) {
-		if (!win_present(RAMON_WIN_SPW0 + i))
+		if (!win_is_present(RAMON_WIN_SPW0 + i))
 			continue;
 		/* SPFI NNs the driver does not use are not touched at all */
 		if (i >= RAMON_NN_COUNT && !(spfi_mask & (1u << (i - RAMON_NN_COUNT))))
@@ -863,53 +866,53 @@ static void regwin_spw_spfi(uint32_t spfi_mask)
 static void *regwin_thread(void *arg)
 {
 	uint32_t want = (uint32_t)(uintptr_t)arg;
-	long bad = 0;
+	long n_bad = 0;
 	int i;
 
-	for (i = 0; i < REG_ITERATIONS; i++) {
+	for (i = 0; i < REGWIN_ITERATIONS_PER_THREAD; i++) {
 		struct ramon_reg_io r;
 
 		memset(&r, 0, sizeof(r));
 		if (i & 1)
 			snprintf(r.name, sizeof(r.name), "rs_top");
-		r.offset = RSTOP_MAJOR;
-		if (ioctl(fd, RAMON_IOC_REG_IO, &r) || r.value != want)
-			bad++;
+		r.offset = RSTOP_MAJOR_REG;
+		if (ioctl(dev_fd, RAMON_IOC_REG_IO, &r) || r.value != want)
+			n_bad++;
 		memset(&r, 0, sizeof(r));
 		r.index = RAMON_WIN_SYSMON_PS;
-		if (ioctl(fd, RAMON_IOC_REG_IO, &r))
-			bad++;
+		if (ioctl(dev_fd, RAMON_IOC_REG_IO, &r))
+			n_bad++;
 	}
-	return (void *)bad;
+	return (void *)n_bad;
 }
 
 static void regwin_concurrent(void)
 {
-	pthread_t th[REG_THREADS];
+	pthread_t th[REGWIN_THREADS];
 	uint32_t maj;
-	long bad = 0;
+	long n_bad = 0;
 	void *ret;
 	int i;
 
-	if (!win_present(RAMON_WIN_RS_TOP) || !win_present(RAMON_WIN_SYSMON_PS) ||
-	    reg_read(NULL, RAMON_WIN_RS_TOP, RSTOP_MAJOR, &maj)) {
+	if (!win_is_present(RAMON_WIN_RS_TOP) || !win_is_present(RAMON_WIN_SYSMON_PS) ||
+	    reg_read(NULL, RAMON_WIN_RS_TOP, RSTOP_MAJOR_REG, &maj)) {
 		printf("      rs_top or sysmon_ps absent: concurrent reads skipped\n");
 		return;
 	}
-	for (i = 0; i < REG_THREADS; i++)
+	for (i = 0; i < REGWIN_THREADS; i++)
 		if (pthread_create(&th[i], NULL, regwin_thread, (void *)(uintptr_t)maj)) {
 			fail("pthread_create");
 			return;
 		}
-	for (i = 0; i < REG_THREADS; i++) {
+	for (i = 0; i < REGWIN_THREADS; i++) {
 		pthread_join(th[i], &ret);
-		bad += (long)ret;
+		n_bad += (long)ret;
 	}
-	if (bad)
-		fail("concurrent REG_IO: %ld bad results", bad);
+	if (n_bad)
+		fail("concurrent REG_IO: %ld bad results", n_bad);
 	else
-		pass("concurrent REG_IO: %d threads x %d rs_top + sysmon reads", REG_THREADS,
-		     REG_ITERATIONS);
+		pass("concurrent REG_IO: %d threads x %d rs_top + sysmon reads", REGWIN_THREADS,
+		     REGWIN_ITERATIONS_PER_THREAD);
 }
 
 static void test_regwin(void)
@@ -930,33 +933,33 @@ static void test_regwin(void)
 
 /* ---- shared DMA helpers ---- */
 
-/* a buffer allocated and mapped on the global fd */
+/* a buffer allocated and mapped on the global dev_fd */
 struct mbuf {
-	uint32_t h;
+	uint32_t handle;
 	uint64_t size;
-	uint8_t *p;
+	uint8_t *ptr;
 };
 
 static int mbuf_new(struct mbuf *m, uint64_t size)
 {
 	void *p;
 
-	if (buf_alloc(size, &m->h, &m->size))
+	if (buf_alloc(size, &m->handle, &m->size))
 		return -1;
-	p = buf_map(m->h, m->size, MAP_SHARED);
+	p = buf_map(m->handle, m->size, MAP_SHARED);
 	if (p == MAP_FAILED) {
-		fail("mmap handle %u: %s", m->h, strerror(errno));
-		buf_free(m->h);
+		fail("mmap handle %u: %s", m->handle, strerror(errno));
+		buf_free(m->handle);
 		return -1;
 	}
-	m->p = p;
+	m->ptr = p;
 	return 0;
 }
 
 static void mbuf_del(struct mbuf *m)
 {
-	munmap(m->p, m->size);
-	buf_free(m->h);
+	munmap(m->ptr, m->size);
+	buf_free(m->handle);
 }
 
 static long long now_ms(void)
@@ -971,7 +974,7 @@ static int chan_info(uint32_t index, struct ramon_chan_info *ci)
 {
 	memset(ci, 0, sizeof(*ci));
 	ci->index = index;
-	return ioctl(fd, RAMON_IOC_CHAN_INFO, ci) ? errno : 0;
+	return ioctl(dev_fd, RAMON_IOC_CHAN_INFO, ci) ? errno : 0;
 }
 
 static int axi_xfer(uint32_t chan, uint32_t h, uint64_t off, uint64_t len, uint32_t timeout_ms,
@@ -1068,10 +1071,10 @@ _Static_assert(sizeof(struct spw_hdr) == SPW_HDR_BYTES, "SPW header is 40 bytes"
 
 #define SPW_L2L3_BYTES		32
 #define SPW_L3_BYTES		24
-#define SPW_RX_MAX		0x100000	/* MAX_SPW_RX_MSG_SIZE of the old spw_api */
+#define SPW_RX_MAX_BYTES	0x100000	/* MAX_SPW_RX_MSG_SIZE of the old spw_api */
 #define SPW_NODE_DEFAULT	68		/* old "spwappinit 0 +68": our own node id */
 #define SPW_TARGET_DEFAULT	0x41		/* old get_nn_version() destination */
-#define SPW_VERSION_PROTOCOL	9
+#define SPW_NN_PROTOCOL		9
 #define SPW_VERSION_APP_TYPE	9
 #define SPW_VERSION_ATTRIBUTE	0x98
 #define SPW_SYNC_TRIES		1000		/* as the old spw_init() */
@@ -1080,10 +1083,10 @@ _Static_assert(sizeof(struct spw_hdr) == SPW_HDR_BYTES, "SPW header is 40 bytes"
 
 static uint32_t spw_node = SPW_NODE_DEFAULT;
 static uint32_t spw_target = SPW_TARGET_DEFAULT;
-static uint32_t crc_table[256];
+static uint32_t crc32_table[256];
 
 /* the old rc_crc32sw() with initial value 0, byte by byte (standard CRC-32) */
-static void crc_init(void)
+static void crc32_init(void)
 {
 	uint32_t i, r;
 	int j;
@@ -1092,18 +1095,18 @@ static void crc_init(void)
 		r = i;
 		for (j = 0; j < 8; j++)
 			r = (r & 1 ? 0 : 0xEDB88320u) ^ r >> 1;
-		crc_table[i] = r ^ 0xFF000000u;
+		crc32_table[i] = r ^ 0xFF000000u;
 	}
 }
 
-static uint32_t crc_rc(const void *data, size_t n)
+static uint32_t crc32_compute(const void *data, size_t bytes)
 {
 	const uint8_t *p = data;
 	uint32_t crc = 0;
 	size_t i;
 
-	for (i = 0; i < n; i++)
-		crc = crc_table[(uint8_t)crc ^ p[i]] ^ crc >> 8;
+	for (i = 0; i < bytes; i++)
+		crc = crc32_table[(uint8_t)crc ^ p[i]] ^ crc >> 8;
 	return crc;
 }
 
@@ -1113,20 +1116,20 @@ static uint32_t spw_header_crc(const struct spw_hdr *h)
 
 	t.header_crc = 0;
 	t.payload_crc = 0;
-	return crc_rc(&t, SPW_L2L3_BYTES);
+	return crc32_compute(&t, SPW_L2L3_BYTES);
 }
 
 struct spw_nn {
 	uint32_t nn;
-	uint32_t rx;		/* AXI channel ids, from CHAN_INFO */
-	uint32_t tx;
+	uint32_t rx_chan;	/* AXI channel ids, from CHAN_INFO */
+	uint32_t tx_chan;
 	uint32_t saved_loopback;
 	char win[8];		/* "spw0" */
-	struct mbuf scratch;	/* RX landing area, SPW_RX_MAX bytes */
+	struct mbuf scratch;	/* RX landing area of SPW_RX_MAX_BYTES */
 };
 
 /* NN n uses AXI channels 2n and 2n+1, the S2MM one for RX (the old spw_api layout) */
-static int spw_channels(struct spw_nn *s)
+static int spw_find_channels(struct spw_nn *s)
 {
 	struct ramon_chan_info a, b;
 
@@ -1136,9 +1139,9 @@ static int spw_channels(struct spw_nn *s)
 		     2 * s->nn + 1);
 		return -1;
 	}
-	s->rx = a.dir == RAMON_DIR_DEV_TO_MEM ? a.index : b.index;
-	s->tx = a.dir == RAMON_DIR_DEV_TO_MEM ? b.index : a.index;
-	printf("      spw%u: rx chan %u, tx chan %u\n", s->nn, s->rx, s->tx);
+	s->rx_chan = a.dir == RAMON_DIR_DEV_TO_MEM ? a.index : b.index;
+	s->tx_chan = a.dir == RAMON_DIR_DEV_TO_MEM ? b.index : a.index;
+	printf("      spw%u: rx chan %u, tx chan %u\n", s->nn, s->rx_chan, s->tx_chan);
 	return 0;
 }
 
@@ -1150,7 +1153,7 @@ static int spw_wait(uint32_t nn, uint32_t timeout_ms, uint32_t *size, struct ram
 	memset(&w, 0, sizeof(w));
 	w.nn = nn;
 	w.timeout_ms = timeout_ms;
-	if (ioctl(fd, RAMON_IOC_SPW_WAIT_RX, &w))
+	if (ioctl(dev_fd, RAMON_IOC_SPW_WAIT_RX, &w))
 		err = errno;
 	*size = w.size;
 	if (st)
@@ -1176,7 +1179,8 @@ static int spw_consume(struct spw_nn *s, uint32_t size)
 		     s->scratch.size);
 		return -1;
 	}
-	return axi_xfer(s->rx, s->scratch.h, 0, size, SPW_WAIT_MS, "AXI_XFER spw rx");
+	return axi_xfer(s->rx_chan, s->scratch.handle, 0, size, SPW_XFER_TIMEOUT_MS,
+			"AXI_XFER spw rx");
 }
 
 /* collect packets nobody asked for */
@@ -1203,7 +1207,7 @@ static int spw_sync(struct spw_nn *s)
 	if (reg_io(s->win, 0, RAMON_REG_OP_WRITE, SPW_ENABLE_REG, &one))
 		return -1;
 	for (tries = 0; tries < SPW_SYNC_TRIES; tries++) {
-		if (reg_read(s->win, 0, SPW_LINK_STATUS, &v))
+		if (reg_read(s->win, 0, SPW_LINK_STATUS_REG, &v))
 			return -1;
 		if ((v & SPW_LINK_MASK) == SPW_LINK_SYNCED) {
 			pass("%s: link synced after %d core reset(s) (0x28 = 0x%x)", s->win, tries,
@@ -1222,7 +1226,7 @@ static int spw_sync(struct spw_nn *s)
 }
 
 struct spw_rx_arg {
-	struct spw_nn *s;
+	struct spw_nn *spw;
 	uint32_t size;
 	int ok;
 };
@@ -1234,20 +1238,20 @@ static void *spw_rx_thread(void *arg)
 	struct ramon_status st;
 	int err;
 
-	err = spw_wait(a->s->nn, SPW_REPLY_WAIT_MS, &a->size, &st);
+	err = spw_wait(a->spw->nn, SPW_REPLY_WAIT_MS, &a->size, &st);
 	if (err) {
-		fail("spw%u: no reply within %d ms", a->s->nn, SPW_REPLY_WAIT_MS);
+		fail("spw%u: no reply within %d ms", a->spw->nn, SPW_REPLY_WAIT_MS);
 		print_status("SPW_WAIT_RX", err, &st);
 		return NULL;
 	}
-	a->ok = !spw_consume(a->s, a->size);
+	a->ok = !spw_consume(a->spw, a->size);
 	return NULL;
 }
 
 /* version reply of get_nn_version(): four fixed-width text fields (old dmaapi_testv2.cpp) */
-#define SPW_VER_FIELD		200
-#define SPW_VER_FW_FIELD	20
-#define SPW_VER_BYTES		(3 * SPW_VER_FIELD + SPW_VER_FW_FIELD)
+#define SPW_VERSION_FIELD_BYTES	200
+#define SPW_VERSION_FW_FIELD_BYTES	20
+#define SPW_VERSION_REPLY_BYTES	(3 * SPW_VERSION_FIELD_BYTES + SPW_VERSION_FW_FIELD_BYTES)
 
 static void spw_print_field(const char *name, const uint8_t *p, uint32_t len)
 {
@@ -1263,17 +1267,17 @@ static void spw_print_field(const char *name, const uint8_t *p, uint32_t len)
 
 static void spw_print_versions(const uint8_t *p)
 {
-	spw_print_field("4KBL version:", p, SPW_VER_FIELD);
-	spw_print_field("RSBL version:", p + SPW_VER_FIELD, SPW_VER_FIELD);
-	spw_print_field("Image version:", p + 2 * SPW_VER_FIELD, SPW_VER_FIELD);
-	spw_print_field("FW version:", p + 3 * SPW_VER_FIELD, SPW_VER_FW_FIELD);
+	spw_print_field("4KBL version:", p, SPW_VERSION_FIELD_BYTES);
+	spw_print_field("RSBL version:", p + SPW_VERSION_FIELD_BYTES, SPW_VERSION_FIELD_BYTES);
+	spw_print_field("Image version:", p + 2 * SPW_VERSION_FIELD_BYTES, SPW_VERSION_FIELD_BYTES);
+	spw_print_field("FW version:", p + 3 * SPW_VERSION_FIELD_BYTES, SPW_VERSION_FW_FIELD_BYTES);
 }
 
 static void spw_print_payload(const uint8_t *p, uint32_t len)
 {
 	uint32_t i;
 
-	if (len >= SPW_VER_BYTES) {
+	if (len >= SPW_VERSION_REPLY_BYTES) {
 		spw_print_versions(p);
 		return;
 	}
@@ -1289,20 +1293,20 @@ static void spw_print_payload(const uint8_t *p, uint32_t len)
 /* prints the reply in s->scratch; 0 if addressed to us with both CRCs right */
 static int spw_check_reply(struct spw_nn *s, uint32_t size)
 {
-	const struct spw_hdr *h = (const struct spw_hdr *)s->scratch.p;
+	const struct spw_hdr *h = (const struct spw_hdr *)s->scratch.ptr;
 	int before = __atomic_load_n(&failures, __ATOMIC_RELAXED);
-	const uint32_t *f;
-	uint32_t payload, crc;
+	const uint32_t *footer;
+	uint32_t payload_len, crc;
 
 	if (size < SPW_HDR_BYTES + SPW_FOOTER_BYTES) {
 		fail("spw%u: reply of %u bytes is shorter than header + footer", s->nn, size);
 		return -1;
 	}
-	payload = size - SPW_HDR_BYTES - SPW_FOOTER_BYTES;
-	f = (const uint32_t *)(s->scratch.p + SPW_HDR_BYTES + payload);
+	payload_len = size - SPW_HDR_BYTES - SPW_FOOTER_BYTES;
+	footer = (const uint32_t *)(s->scratch.ptr + SPW_HDR_BYTES + payload_len);
 	printf("      reply: %u bytes, dst %u src 0x%x proto %u app 0x%x attr 0x%x l3_len %u, footer pkt_size %u err 0x%x count %u\n",
 	       size, h->dst, h->src, h->protocol_id, h->app_type, h->attribute_id, h->l3_len,
-	       f[0], f[1], f[2]);
+	       footer[0], footer[1], footer[2]);
 	if (h->dst != spw_node)
 		fail("spw%u: reply addressed to node %u, we are %u", s->nn, h->dst, spw_node);
 	crc = spw_header_crc(h);
@@ -1312,11 +1316,11 @@ static int spw_check_reply(struct spw_nn *s, uint32_t size)
 		fail("spw%u: reply l3_len %u does not fit %u bytes", s->nn, h->l3_len, size);
 		return -1;
 	}
-	crc = crc_rc(s->scratch.p + SPW_L2L3_BYTES, h->l3_len - SPW_L3_BYTES);
+	crc = crc32_compute(s->scratch.ptr + SPW_L2L3_BYTES, h->l3_len - SPW_L3_BYTES);
 	if (crc != h->payload_crc)
 		fail("spw%u: reply payload CRC 0x%08x, computed 0x%08x", s->nn, h->payload_crc,
 		     crc);
-	spw_print_payload(s->scratch.p + SPW_HDR_BYTES, payload);
+	spw_print_payload(s->scratch.ptr + SPW_HDR_BYTES, payload_len);
 	return __atomic_load_n(&failures, __ATOMIC_RELAXED) != before ? -1 : 0;
 }
 
@@ -1327,7 +1331,7 @@ struct spw_msg {
 	uint32_t app_type;
 	uint32_t attribute_id;
 	const uint8_t *payload;
-	uint32_t len;
+	uint32_t payload_len;
 };
 
 /* a built packet: buffer and its exact length (the buffer is page-rounded) */
@@ -1339,17 +1343,17 @@ struct spw_pkt {
 #define SPW_DPS_APP_TYPE	1
 #define SPW_DPS_ATTRIBUTE	0x01
 #define SPW_DPS_REPLY_ATTR	0x101
-#define SPW_MAX_PAYLOAD		4096	/* the FPGA's largest SPW payload */
+#define SPW_MAX_PAYLOAD_BYTES	4096	/* the FPGA's largest SPW payload */
 
 static struct spw_msg spw_version_msg(void)
 {
-	return (struct spw_msg){ spw_target, SPW_VERSION_PROTOCOL, SPW_VERSION_APP_TYPE,
+	return (struct spw_msg){ spw_target, SPW_NN_PROTOCOL, SPW_VERSION_APP_TYPE,
 				 SPW_VERSION_ATTRIBUTE, NULL, 0 };
 }
 
 static struct spw_msg spw_dps_msg(void)
 {
-	return (struct spw_msg){ spw_target, SPW_VERSION_PROTOCOL, SPW_DPS_APP_TYPE,
+	return (struct spw_msg){ spw_target, SPW_NN_PROTOCOL, SPW_DPS_APP_TYPE,
 				 SPW_DPS_ATTRIBUTE, NULL, 0 };
 }
 
@@ -1358,36 +1362,37 @@ static int spw_build(struct spw_pkt *pkt, const struct spw_msg *m)
 {
 	struct spw_hdr *h;
 
-	if (m->len > SPW_MAX_PAYLOAD) {
+	if (m->payload_len > SPW_MAX_PAYLOAD_BYTES) {
 		fail("SPW payload of %u bytes is above the maximum of %u; packet dropped, not sent",
-		     m->len, SPW_MAX_PAYLOAD);
+		     m->payload_len, SPW_MAX_PAYLOAD_BYTES);
 		return -1;
 	}
-	pkt->len = SPW_HDR_BYTES + m->len;
+	pkt->len = SPW_HDR_BYTES + m->payload_len;
 	if (mbuf_new(&pkt->buf, pkt->len))
 		return -1;
-	h = (struct spw_hdr *)pkt->buf.p;
+	h = (struct spw_hdr *)pkt->buf.ptr;
 	memset(h, 0, sizeof(*h));
 	h->dst = m->dst;
 	h->src = spw_node;
 	h->protocol_id = m->protocol_id;
 	h->app_type = m->app_type;
 	h->attribute_id = m->attribute_id;
-	h->l3_len = SPW_L3_BYTES + (SPW_HDR_BYTES - SPW_L2L3_BYTES) + m->len;
-	if (m->len)
-		memcpy(pkt->buf.p + SPW_HDR_BYTES, m->payload, m->len);
+	h->l3_len = SPW_L3_BYTES + (SPW_HDR_BYTES - SPW_L2L3_BYTES) + m->payload_len;
+	if (m->payload_len)
+		memcpy(pkt->buf.ptr + SPW_HDR_BYTES, m->payload, m->payload_len);
 	h->header_crc = spw_header_crc(h);
-	h->payload_crc = crc_rc(pkt->buf.p + SPW_L2L3_BYTES, h->l3_len - SPW_L3_BYTES);
+	h->payload_crc = crc32_compute(pkt->buf.ptr + SPW_L2L3_BYTES, h->l3_len - SPW_L3_BYTES);
 	return 0;
 }
 
 /* request, then wait and read the reply in the same thread (quiet on success) */
-static int spw_roundtrip_seq(struct spw_nn *s, struct spw_pkt *pkt)
+static int spw_request_same_thread(struct spw_nn *s, struct spw_pkt *pkt)
 {
-	const struct spw_hdr *h = (const struct spw_hdr *)s->scratch.p;
+	const struct spw_hdr *h = (const struct spw_hdr *)s->scratch.ptr;
 	uint32_t size;
 
-	if (axi_xfer(s->tx, pkt->buf.h, 0, pkt->len, SPW_WAIT_MS, "AXI_XFER spw tx"))
+	if (axi_xfer(s->tx_chan, pkt->buf.handle, 0, pkt->len, SPW_XFER_TIMEOUT_MS,
+		     "AXI_XFER spw tx"))
 		return -1;
 	if (spw_wait(s->nn, SPW_REPLY_WAIT_MS, &size, NULL)) {
 		fail("spw%u: no reply within %d ms", s->nn, SPW_REPLY_WAIT_MS);
@@ -1409,7 +1414,7 @@ static int spw_roundtrip_seq(struct spw_nn *s, struct spw_pkt *pkt)
 static int spw_request(struct spw_nn *s, const struct spw_msg *m, const char *name,
 		       uint32_t *size)
 {
-	struct spw_rx_arg a = { .s = s };
+	struct spw_rx_arg a = { .spw = s };
 	struct spw_pkt pkt;
 	pthread_t th;
 
@@ -1421,10 +1426,11 @@ static int spw_request(struct spw_nn *s, const struct spw_msg *m, const char *na
 		return -1;
 	}
 	sleep_ms(10);	/* let the RX thread block first */
-	if (!axi_xfer(s->tx, pkt.buf.h, 0, pkt.len, SPW_WAIT_MS, "AXI_XFER spw tx"))
+	if (!axi_xfer(s->tx_chan, pkt.buf.handle, 0, pkt.len, SPW_XFER_TIMEOUT_MS,
+		      "AXI_XFER spw tx"))
 		printf("      spw%u: %s sent: node %u -> 0x%x, proto %u app %u attr 0x%x, %u payload bytes\n",
 		       s->nn, name, spw_node, m->dst, m->protocol_id, m->app_type, m->attribute_id,
-		       m->len);
+		       m->payload_len);
 	pthread_join(th, NULL);
 	mbuf_del(&pkt.buf);
 	*size = a.size;
@@ -1432,7 +1438,7 @@ static int spw_request(struct spw_nn *s, const struct spw_msg *m, const char *na
 }
 
 /* get_nn_version() of the old spw_api */
-static void spw_version(struct spw_nn *s)
+static void spw_check_version_reply(struct spw_nn *s)
 {
 	struct spw_msg m = spw_version_msg();
 	uint32_t size;
@@ -1444,9 +1450,9 @@ static void spw_version(struct spw_nn *s)
 }
 
 /* the old "spwdps": answered with attribute 0x101 */
-static void spw_dps(struct spw_nn *s)
+static void spw_send_dps(struct spw_nn *s)
 {
-	const struct spw_hdr *h = (const struct spw_hdr *)s->scratch.p;
+	const struct spw_hdr *h = (const struct spw_hdr *)s->scratch.ptr;
 	struct spw_msg m = spw_dps_msg();
 	uint32_t size;
 
@@ -1459,14 +1465,14 @@ static void spw_dps(struct spw_nn *s)
 		pass("spw%u: DPS acknowledged (attribute 0x%x)", s->nn, h->attribute_id);
 }
 
-static void spw_timeout_check(struct spw_nn *s)
+static void spw_check_timeout(struct spw_nn *s)
 {
 	struct ramon_status st;
-	long long t0 = now_ms();
+	long long start_ms = now_ms();
 	uint32_t size;
 	int err;
 
-	err = spw_wait(s->nn, SPW_SHORT_WAIT_MS, &size, &st);
+	err = spw_wait(s->nn, IDLE_WAIT_MS, &size, &st);
 	if (!err)
 		spw_consume(s, size);
 	if (err != ETIMEDOUT || st.code != RAMON_E_SPW_TIMEOUT)
@@ -1474,43 +1480,43 @@ static void spw_timeout_check(struct spw_nn *s)
 		     ramon_err_name(st.code));
 	else
 		pass("spw%u: idle wait of %d ms timed out after %lld ms", s->nn,
-		     SPW_SHORT_WAIT_MS, now_ms() - t0);
+		     IDLE_WAIT_MS, now_ms() - start_ms);
 }
 
-struct cancel_arg {
+struct spw_waiter {
 	uint32_t nn;
 	int err;
 	uint32_t code;
-	long long ms;
+	long long elapsed_ms;
 };
 
-static void *cancel_thread(void *arg)
+static void *spw_waiter_thread(void *arg)
 {
-	struct cancel_arg *c = arg;
+	struct spw_waiter *w = arg;
 	struct ramon_status st;
-	long long t0 = now_ms();
+	long long start_ms = now_ms();
 	uint32_t size;
 
-	c->err = spw_wait(c->nn, 10 * SPW_WAIT_MS, &size, &st);
-	c->code = st.code;
-	c->ms = now_ms() - t0;
+	w->err = spw_wait(w->nn, SPW_WAITER_TIMEOUT_MS, &size, &st);
+	w->code = st.code;
+	w->elapsed_ms = now_ms() - start_ms;
 	return NULL;
 }
 
 /* two waiters on one NN, one SPW_CANCEL releases both */
-static void spw_cancel_check(uint32_t nn)
+static void spw_check_cancel(uint32_t nn)
 {
-	struct cancel_arg c[2] = { { .nn = nn }, { .nn = nn } };
+	struct spw_waiter c[2] = { { .nn = nn }, { .nn = nn } };
 	struct ramon_spw_cancel sc;
 	pthread_t th[2];
 	int i;
 
 	for (i = 0; i < 2; i++)
-		if (pthread_create(&th[i], NULL, cancel_thread, &c[i])) {
+		if (pthread_create(&th[i], NULL, spw_waiter_thread, &c[i])) {
 			fail("pthread_create");
 			return;
 		}
-	sleep_ms(CANCEL_AFTER_MS);
+	sleep_ms(WAITER_BLOCK_MS);
 	memset(&sc, 0, sizeof(sc));
 	sc.nn = nn;
 	must(RAMON_IOC_SPW_CANCEL, &sc, &sc.st, "SPW_CANCEL");
@@ -1520,7 +1526,7 @@ static void spw_cancel_check(uint32_t nn)
 			fail("spw%u waiter %d: errno %d code %s, expected ECANCELED", nn, i,
 			     c[i].err, ramon_err_name(c[i].code));
 		else
-			pass("spw%u waiter %d cancelled after %lld ms", nn, i, c[i].ms);
+			pass("spw%u waiter %d cancelled after %lld ms", nn, i, c[i].elapsed_ms);
 	}
 }
 
@@ -1529,13 +1535,13 @@ static int spw_setup(struct spw_nn *s, uint32_t nn)
 	memset(s, 0, sizeof(*s));
 	s->nn = nn;
 	snprintf(s->win, sizeof(s->win), "spw%u", nn);
-	if (spw_channels(s) || reg_read(s->win, 0, SPW_LOOPBACK_REG, &s->saved_loopback))
+	if (spw_find_channels(s) || reg_read(s->win, 0, SPW_LOOPBACK_REG, &s->saved_loopback))
 		return -1;
-	return mbuf_new(&s->scratch, SPW_RX_MAX);
+	return mbuf_new(&s->scratch, SPW_RX_MAX_BYTES);
 }
 
 /* returns 1 if the link synced and the version round trip was attempted */
-static int spw_one(uint32_t nn)
+static int spw_check_nn(uint32_t nn)
 {
 	struct spw_nn s;
 	int synced = 0;
@@ -1545,14 +1551,14 @@ static int spw_one(uint32_t nn)
 	/* loopback isolates the RX side from NN traffic for the wait/cancel checks */
 	if (!spw_loopback(nn, 1)) {
 		spw_drain(&s);
-		spw_timeout_check(&s);
-		spw_cancel_check(nn);
+		spw_check_timeout(&s);
+		spw_check_cancel(nn);
 	}
 	/* then the old spwinit: loopback off (its default), link sync, talk to the NN */
 	if (!spw_loopback(nn, 0) && !spw_sync(&s)) {
 		synced = 1;
 		spw_drain(&s);
-		spw_version(&s);
+		spw_check_version_reply(&s);
 		spw_drain(&s);
 	}
 	if (s.saved_loopback && !spw_loopback(nn, 1))
@@ -1564,7 +1570,7 @@ static int spw_one(uint32_t nn)
 static void test_spw(void)
 {
 	struct ramon_get_info gi;
-	int present = 0, synced = 0;
+	int n_present = 0, n_synced = 0;
 	uint32_t nn;
 
 	if (get_info(&gi))
@@ -1576,16 +1582,16 @@ static void test_spw(void)
 			printf("      spw%u absent: skipped\n", nn);
 			continue;
 		}
-		present++;
-		synced += spw_one(nn);
+		n_present++;
+		n_synced += spw_check_nn(nn);
 	}
-	if (present && !synced)
+	if (n_present && !n_synced)
 		fail("no SPW link synced; the NN round trip was not tested");
 }
 
 /* ---- spfi: stream table, stream round trip, concurrent write + read, alerts ---- */
 
-#define SPFI_PAGE		RAMON_SPFI_OFFSET_BYTES
+#define SPFI_PAGE_BYTES		RAMON_SPFI_OFFSET_BYTES
 #define SPFI_HDR_BYTES		64
 #define SPFI_REC_BYTES		64
 #define SPFI_STREAMS		198
@@ -1594,9 +1600,9 @@ static void test_spw(void)
 #define SPFI_ST_OPEN		0x02
 #define SPFI_STREAMS_USABLE	(SPFI_STREAMS - 5)	/* NN rule: never use the last 5 */
 #define SPFI_MAX_OPEN		8			/* NN rule: at most 8 open at once */
-#define SPFI_PAGES_MAX		64	/* --spfi-pages bound */
+#define SPFI_MAX_WRITE_PAGES	64	/* --spfi-pages bound */
 #define SPFI_ROUNDS		3	/* writes to the second stream */
-#define SPFI_ALERT_DRAIN	10
+#define SPFI_ALERT_DRAIN_LIMIT	10
 
 /* RX message table, as parsed by the old spfi_api.cpp */
 struct spfi_table_hdr {
@@ -1630,27 +1636,28 @@ _Static_assert(sizeof(struct spfi_table_hdr) == SPFI_HDR_BYTES, "table header");
 _Static_assert(sizeof(struct spfi_record) == SPFI_REC_BYTES, "table record");
 
 /*
- * AXI write channel per SPFI NN, as the old spfidrvinit: NN0 = 5 (axi_dma at
- * 0xa0020000, confirmed on the board with the old stack), NN1 = 4.
+ * AXI write channel per SPFI NN: 4 for both NNs in the current FPGA design. The
+ * earlier design, as the old spfidrvinit, had NN0 = 5 (axi_dma at 0xa0020000,
+ * confirmed on the board with the old stack) and NN1 = 4: --spfi-chans 5,4.
  */
 static uint32_t spfi_chan[RAMON_NN_COUNT] = { 4, 4 };	/* one SPFI write channel, 4 (5,4 on the earlier design) */
-static int spfi_init_first;
-static int spfi_format;
+static int spfi_init_requested;
+static int spfi_format_requested;
 static uint32_t spfi_pages = 8;			/* per write, --spfi-pages */
 static uint32_t spfi_first_stream = ~0u;	/* --spfi-stream, else highest free */
 
-#define SPFI_LINK_STATUS	0xCC	/* word 51; the old "spfireg +204" */
+#define SPFI_LINK_STATUS_REG	0xCC	/* word 51; the old "spfireg +204" */
 #define SPFI_LINK_MASK		0xFF	/* only the low byte is the link state, e.g. 0x4488 */
 #define SPFI_LINK_UP		0x88
 
 /* the old "spfireg +204" check */
-static int spfi_link_up(uint32_t nn)
+static int spfi_link_is_up(uint32_t nn)
 {
 	char win[8];
 	uint32_t v;
 
 	snprintf(win, sizeof(win), "spfi%u", nn);
-	if (reg_read(win, 0, SPFI_LINK_STATUS, &v))
+	if (reg_read(win, 0, SPFI_LINK_STATUS_REG, &v))
 		return 0;
 	if ((v & SPFI_LINK_MASK) == SPFI_LINK_UP) {
 		printf("      spfi%u: link status 0x%x at 0xCC (low byte 0x%x: up)\n", nn, v,
@@ -1661,20 +1668,21 @@ static int spfi_link_up(uint32_t nn)
 	return 0;
 }
 
-/* polls 0xCC quietly for up to ms, then reports as spfi_link_up() */
-static int spfi_link_wait(uint32_t nn, unsigned ms)
+/* polls 0xCC quietly for up to timeout_ms, then reports as spfi_link_is_up() */
+static int spfi_wait_link_up(uint32_t nn, unsigned timeout_ms)
 {
 	char win[8];
-	unsigned waited;
+	unsigned waited_ms;
 	uint32_t v;
 
 	snprintf(win, sizeof(win), "spfi%u", nn);
-	for (waited = 0; waited < ms; waited += 10) {
-		if (reg_read(win, 0, SPFI_LINK_STATUS, &v) || (v & SPFI_LINK_MASK) == SPFI_LINK_UP)
+	for (waited_ms = 0; waited_ms < timeout_ms; waited_ms += 10) {
+		if (reg_read(win, 0, SPFI_LINK_STATUS_REG, &v) ||
+		    (v & SPFI_LINK_MASK) == SPFI_LINK_UP)
 			break;
 		sleep_ms(10);
 	}
-	return spfi_link_up(nn);
+	return spfi_link_is_up(nn);
 }
 
 static int spfi_cmd(uint32_t nn, uint32_t opcode, struct ramon_spfi_cmd *c, const char *what)
@@ -1686,7 +1694,7 @@ static int spfi_cmd(uint32_t nn, uint32_t opcode, struct ramon_spfi_cmd *c, cons
 }
 
 /* GET_ALL_STREAM_STATUS, then the RX message table into @tab */
-static int spfi_table(uint32_t nn, uint8_t *tab)
+static int spfi_read_table(uint32_t nn, uint8_t *tab)
 {
 	struct ramon_spfi_mem_read m;
 	struct ramon_spfi_cmd c;
@@ -1707,14 +1715,14 @@ static const struct spfi_record *spfi_rec(const uint8_t *tab, uint32_t sid)
 }
 
 /* OPEN / FLUSH / CLOSE / DELETE; an rx_err_code is a failure here */
-static int spfi_stream(uint32_t nn, uint32_t opcode, uint32_t sid, uint32_t last,
-		       const char *what)
+static int spfi_stream_cmd(uint32_t nn, uint32_t opcode, uint32_t sid, uint32_t last_offset,
+			   const char *what)
 {
 	struct ramon_spfi_cmd c;
 
 	memset(&c, 0, sizeof(c));
 	c.stream_id = sid;
-	c.stream_last_offset = last;
+	c.stream_last_offset = last_offset;
 	if (spfi_cmd(nn, opcode, &c, what))
 		return -1;
 	if (c.rx_err_code) {
@@ -1732,7 +1740,7 @@ static int spfi_stream(uint32_t nn, uint32_t opcode, uint32_t sid, uint32_t last
 static const uint32_t spfi_diag_words[] = { 48, 49, 50, 51, 19, 21, 33 };
 
 /* SPFI_WR_STATUS0 (word 50) bits, as described by the FPGA team */
-static void spfi_decode_ws0(uint32_t v)
+static void spfi_print_wr_status0(uint32_t v)
 {
 	if (v & (1u << 5))
 		printf(" VC1-sticky-no-TLAST");
@@ -1742,7 +1750,7 @@ static void spfi_decode_ws0(uint32_t v)
 		printf(" VC1-CMD-OVERFLOW");
 }
 
-static void spfi_diag(uint32_t nn, const char *when)
+static void spfi_print_diag(uint32_t nn, const char *when)
 {
 	struct ramon_get_stats g;
 	char win[8];
@@ -1756,13 +1764,13 @@ static void spfi_diag(uint32_t nn, const char *when)
 		memset(&r, 0, sizeof(r));
 		snprintf(r.name, sizeof(r.name), "%s", win);
 		r.offset = spfi_diag_words[i] * 4;
-		v = ioctl(fd, RAMON_IOC_REG_IO, &r) ? 0xdeadbeef : r.value;
+		v = ioctl(dev_fd, RAMON_IOC_REG_IO, &r) ? 0xdeadbeef : r.value;
 		printf(" [%u]=0x%x", spfi_diag_words[i], v);
 		if (spfi_diag_words[i] == 50)
-			spfi_decode_ws0(v);
+			spfi_print_wr_status0(v);
 	}
 	memset(&g, 0, sizeof(g));
-	if (!ioctl(fd, RAMON_IOC_GET_STATS, &g)) {
+	if (!ioctl(dev_fd, RAMON_IOC_GET_STATS, &g)) {
 		printf("; irq vectors:");
 		for (i = 0; i < RAMON_SPFI_IRQ_VECTORS; i++)
 			if (g.spfi_irq_hist[nn][i])
@@ -1774,48 +1782,48 @@ static void spfi_diag(uint32_t nn, const char *when)
 }
 
 /* DATA_WRITE of spfi_pages pages; non-cyclic, so stream_last_offset is 0 (old spfi_send) */
-static int spfi_write(uint32_t nn, uint32_t sid, uint32_t tx_offset, const struct mbuf *src)
+static int spfi_write(uint32_t nn, uint32_t sid, uint32_t first_page, const struct mbuf *src)
 {
-	struct ramon_sg_item it[SPFI_PAGES_MAX];
+	struct ramon_sg_item it[SPFI_MAX_WRITE_PAGES];
 	struct ramon_spfi_write w;
 	uint32_t i;
 
 	for (i = 0; i < spfi_pages; i++) {
-		it[i].handle = src->h;
+		it[i].handle = src->handle;
 		it[i].pad = 0;
-		it[i].offset = (uint64_t)i * SPFI_PAGE;
-		it[i].len = SPFI_PAGE;
+		it[i].offset = (uint64_t)i * SPFI_PAGE_BYTES;
+		it[i].len = SPFI_PAGE_BYTES;
 	}
 	memset(&w, 0, sizeof(w));
 	w.nn = nn;
 	w.chan = spfi_chan[nn];
 	w.stream_id = sid;
-	w.tx_offset = tx_offset;
+	w.tx_offset = first_page;
 	w.tx_num_offset = spfi_pages;
 	w.n_items = spfi_pages;
 	w.items = (uintptr_t)it;
 	printf("      spfi%u DATA_WRITE stream %u: tx_offset %u, tx_num_offset %u, stream_type 0, last 0, chan %u\n",
-	       nn, sid, tx_offset, spfi_pages, spfi_chan[nn]);
+	       nn, sid, first_page, spfi_pages, spfi_chan[nn]);
 	if (!must(RAMON_IOC_SPFI_WRITE, &w, &w.st, "SPFI_WRITE"))
 		return 0;
-	spfi_diag(nn, "after the failed write");
+	spfi_print_diag(nn, "after the failed write");
 	return -1;
 }
 
-static int spfi_read(uint32_t nn, uint32_t sid, uint32_t first, uint32_t pages,
+static int spfi_read(uint32_t nn, uint32_t sid, uint32_t first_page, uint32_t n_pages,
 		     const struct mbuf *dst)
 {
-	uint32_t off[SPFI_PAGES_MAX * SPFI_ROUNDS], i;
+	uint32_t pages[SPFI_MAX_WRITE_PAGES * SPFI_ROUNDS], i;
 	struct ramon_spfi_read r;
 
-	for (i = 0; i < pages; i++)
-		off[i] = first + i;
+	for (i = 0; i < n_pages; i++)
+		pages[i] = first_page + i;
 	memset(&r, 0, sizeof(r));
 	r.nn = nn;
 	r.stream_id = sid;
-	r.n_offsets = pages;
-	r.offsets = (uintptr_t)off;
-	r.dst_handle = dst->h;
+	r.n_offsets = n_pages;
+	r.offsets = (uintptr_t)pages;
+	r.dst_handle = dst->handle;
 	return must(RAMON_IOC_SPFI_READ, &r, &r.st, "SPFI_READ");
 }
 
@@ -1823,16 +1831,17 @@ static int spfi_read(uint32_t nn, uint32_t sid, uint32_t first, uint32_t pages,
 static uint32_t spfi_print_table(uint32_t nn, const uint8_t *tab)
 {
 	const struct spfi_table_hdr *h = (const struct spfi_table_hdr *)tab;
-	uint32_t sid, exist = 0, open = 0;
+	uint32_t sid, n_exist = 0, n_open = 0;
 	uint8_t st;
 
 	for (sid = 0; sid < SPFI_STREAMS; sid++) {
 		st = spfi_rec(tab, sid)->status;
-		exist += !!(st & SPFI_ST_EXIST);
-		open += !!(st & SPFI_ST_OPEN);
+		n_exist += !!(st & SPFI_ST_EXIST);
+		n_open += !!(st & SPFI_ST_OPEN);
 	}
 	printf("      spfi%u table: media %u pages, allocated %u, used %u; %u stream(s) exist, %u open\n",
-	       nn, h->total_media_size, h->total_allocated_size, h->total_used_size, exist, open);
+	       nn, h->total_media_size, h->total_allocated_size, h->total_used_size, n_exist,
+	       n_open);
 	for (sid = 0; sid < SPFI_STREAMS; sid++) {
 		st = spfi_rec(tab, sid)->status;
 		if (st & SPFI_ST_EXIST)
@@ -1841,7 +1850,7 @@ static uint32_t spfi_print_table(uint32_t nn, const uint8_t *tab)
 			       (int)spfi_rec(tab, sid)->latest_write_offs,
 			       sid >= SPFI_STREAMS_USABLE ? "  (reserved id!)" : "");
 	}
-	return open;
+	return n_open;
 }
 
 /*
@@ -1849,14 +1858,15 @@ static uint32_t spfi_print_table(uint32_t nn, const uint8_t *tab)
  * must be deleted before its id is opened again), provided two more open
  * streams stay within the NN's limit.
  */
-static int spfi_free_streams(uint32_t nn, const uint8_t *tab, uint32_t *s1, uint32_t *s2)
+static int spfi_find_free_sids(uint32_t nn, const uint8_t *tab, uint32_t *sid1, uint32_t *sid2)
 {
-	uint32_t sid, found = 0, open;
+	uint32_t sid, found = 0, n_open;
 
-	open = spfi_print_table(nn, tab);
-	if (open + 2 > SPFI_MAX_OPEN) {
+	n_open = spfi_print_table(nn, tab);
+	if (n_open + 2 > SPFI_MAX_OPEN) {
 		fail("spfi%u: %u streams are open; two more would exceed the NN limit of %d "
-		     "(close/delete with \"ramon_smoke spfidel %u <sid>\")", nn, open, SPFI_MAX_OPEN, nn);
+		     "(close/delete with \"ramon_smoke spfidel %u <sid>\")", nn, n_open,
+		     SPFI_MAX_OPEN, nn);
 		return -1;
 	}
 	if (spfi_first_stream != ~0u) {
@@ -1866,16 +1876,16 @@ static int spfi_free_streams(uint32_t nn, const uint8_t *tab, uint32_t *s1, uint
 			     spfi_first_stream, nn, spfi_first_stream);
 			return -1;
 		}
-		*s1 = spfi_first_stream;
+		*sid1 = spfi_first_stream;
 		found = 1;
 	}
 	for (sid = SPFI_STREAMS_USABLE; sid-- > 0 && found < 2;) {
 		if ((spfi_rec(tab, sid)->status & SPFI_ST_EXIST) || sid == spfi_first_stream)
 			continue;
 		if (found++)
-			*s2 = sid;
+			*sid2 = sid;
 		else
-			*s1 = sid;
+			*sid1 = sid;
 	}
 	if (found < 2)
 		fail("spfi%u: fewer than 2 free streams", nn);
@@ -1887,21 +1897,22 @@ static int spfi_free_streams(uint32_t nn, const uint8_t *tab, uint32_t *s1, uint
  * spfiginfo + spfi_send did); no GET_ALL_STREAM_STATUS between OPEN and the
  * first DATA_WRITE, matching the old command order.
  */
-static int spfi_open(uint32_t nn, uint32_t sid, uint32_t last, const uint8_t *tab, uint32_t *tx)
+static int spfi_open(uint32_t nn, uint32_t sid, uint32_t size_pages, const uint8_t *tab,
+		     uint32_t *first_page)
 {
 	const struct spfi_record *r = spfi_rec(tab, sid);
 
-	*tx = r->latest_write_offs + 1;
-	if (spfi_stream(nn, RAMON_SPFI_OP_OPEN_STREAM_FOR_WRITE, sid, last, "OPEN"))
+	*first_page = r->latest_write_offs + 1;
+	if (spfi_stream_cmd(nn, RAMON_SPFI_OP_OPEN_STREAM_FOR_WRITE, sid, size_pages, "OPEN"))
 		return -1;
 	printf("      spfi%u stream %u opened: table before OPEN had status 0x%x latest_write_offs %d -> first page %u\n",
-	       nn, sid, r->status, (int)r->latest_write_offs, *tx);
-	spfi_diag(nn, "after OPEN");
+	       nn, sid, r->status, (int)r->latest_write_offs, *first_page);
+	spfi_print_diag(nn, "after OPEN");
 	return 0;
 }
 
 struct spfi_writer {
-	uint32_t nn, sid, tx;
+	uint32_t nn, sid, first_page;
 	struct mbuf *src;
 	int ok;
 };
@@ -1913,8 +1924,8 @@ static void *spfi_writer_thread(void *arg)
 	uint32_t r;
 
 	for (r = 0; r < SPFI_ROUNDS; r++) {
-		fill((uint32_t *)w->src->p, w->src->size, 0x5000 + r);
-		if (spfi_write(w->nn, w->sid, w->tx + r * spfi_pages, w->src))
+		fill((uint32_t *)w->src->ptr, w->src->size, 0x5000 + r);
+		if (spfi_write(w->nn, w->sid, w->first_page + r * spfi_pages, w->src))
 			return NULL;
 	}
 	w->ok = 1;
@@ -1924,66 +1935,68 @@ static void *spfi_writer_thread(void *arg)
 static void spfi_verify(uint32_t nn, const struct mbuf *dst, size_t bytes, uint32_t seed,
 			const char *what)
 {
-	long bad = verify((const uint32_t *)dst->p, bytes, seed);
+	long bad_word = verify((const uint32_t *)dst->ptr, bytes, seed);
 
-	if (bad >= 0)
-		fail("spfi%u %s: data differs at word %ld", nn, what, bad);
+	if (bad_word >= 0)
+		fail("spfi%u %s: data differs at word %ld", nn, what, bad_word);
 }
 
 /* stream 1 round trip, then stream 2 written while stream 1 is read */
-static void spfi_streams(uint32_t nn, uint8_t *tab, uint32_t s1, uint32_t s2, int *open1,
-			 int *open2)
+static void spfi_check_streams(uint32_t nn, uint8_t *tab, uint32_t sid1, uint32_t sid2,
+			       int *opened1, int *opened2)
 {
 	struct mbuf src, dst, src2, dst2;
-	struct spfi_writer w = { .nn = nn, .sid = s2, .src = &src2 };
-	uint32_t tx1, r;
+	struct spfi_writer w = { .nn = nn, .sid = sid2, .src = &src2 };
+	uint32_t first_page1, r;
 	pthread_t th;
 
-	if (mbuf_new(&src, spfi_pages * SPFI_PAGE))
+	if (mbuf_new(&src, spfi_pages * SPFI_PAGE_BYTES))
 		return;
-	if (mbuf_new(&dst, spfi_pages * SPFI_PAGE))
+	if (mbuf_new(&dst, spfi_pages * SPFI_PAGE_BYTES))
 		goto out_src;
-	if (mbuf_new(&src2, spfi_pages * SPFI_PAGE))
+	if (mbuf_new(&src2, spfi_pages * SPFI_PAGE_BYTES))
 		goto out_dst;
-	if (mbuf_new(&dst2, SPFI_ROUNDS * spfi_pages * SPFI_PAGE))
+	if (mbuf_new(&dst2, SPFI_ROUNDS * spfi_pages * SPFI_PAGE_BYTES))
 		goto out_src2;
 
-	if (spfi_open(nn, s1, spfi_pages, tab, &tx1))
+	if (spfi_open(nn, sid1, spfi_pages, tab, &first_page1))
 		goto out;
-	*open1 = 1;
-	fill((uint32_t *)src.p, src.size, 0x4000 + nn);
-	if (spfi_write(nn, s1, tx1, &src) ||
-	    spfi_stream(nn, RAMON_SPFI_OP_FLUSH_STREAM, s1, 0, "FLUSH") ||
-	    spfi_read(nn, s1, tx1, spfi_pages, &dst))
+	*opened1 = 1;
+	fill((uint32_t *)src.ptr, src.size, 0x4000 + nn);
+	if (spfi_write(nn, sid1, first_page1, &src) ||
+	    spfi_stream_cmd(nn, RAMON_SPFI_OP_FLUSH_STREAM, sid1, 0, "FLUSH") ||
+	    spfi_read(nn, sid1, first_page1, spfi_pages, &dst))
 		goto out;
 	spfi_verify(nn, &dst, dst.size, 0x4000 + nn, "stream 1 read back");
-	pass("spfi%u stream %u: open, write %d x 16 KiB, flush, read back, verified", nn, s1,
+	pass("spfi%u stream %u: open, write %d x 16 KiB, flush, read back, verified", nn, sid1,
 	     spfi_pages);
 
-	if (spfi_open(nn, s2, SPFI_ROUNDS * spfi_pages, tab, &w.tx))
+	if (spfi_open(nn, sid2, SPFI_ROUNDS * spfi_pages, tab, &w.first_page))
 		goto out;
-	*open2 = 1;
+	*opened2 = 1;
 	if (pthread_create(&th, NULL, spfi_writer_thread, &w)) {
 		fail("pthread_create");
 		goto out;
 	}
 	for (r = 0; r < SPFI_ROUNDS; r++) {
-		memset(dst.p, 0, dst.size);
-		if (!spfi_read(nn, s1, tx1, spfi_pages, &dst))
+		memset(dst.ptr, 0, dst.size);
+		if (!spfi_read(nn, sid1, first_page1, spfi_pages, &dst))
 			spfi_verify(nn, &dst, dst.size, 0x4000 + nn, "concurrent read");
 	}
 	pthread_join(th, NULL);
-	if (!w.ok || spfi_stream(nn, RAMON_SPFI_OP_FLUSH_STREAM, s2, 0, "FLUSH") ||
-	    spfi_read(nn, s2, w.tx, SPFI_ROUNDS * spfi_pages, &dst2))
+	if (!w.ok || spfi_stream_cmd(nn, RAMON_SPFI_OP_FLUSH_STREAM, sid2, 0, "FLUSH") ||
+	    spfi_read(nn, sid2, w.first_page, SPFI_ROUNDS * spfi_pages, &dst2))
 		goto out;
 	for (r = 0; r < SPFI_ROUNDS; r++) {
-		long bad = verify((const uint32_t *)(dst2.p + (size_t)r * spfi_pages * SPFI_PAGE),
-				  spfi_pages * SPFI_PAGE, 0x5000 + r);
-		if (bad >= 0)
-			fail("spfi%u stream %u round %u: data differs at word %ld", nn, s2, r, bad);
+		long bad_word = verify((const uint32_t *)(dst2.ptr +
+							  (size_t)r * spfi_pages * SPFI_PAGE_BYTES),
+				       spfi_pages * SPFI_PAGE_BYTES, 0x5000 + r);
+		if (bad_word >= 0)
+			fail("spfi%u stream %u round %u: data differs at word %ld", nn, sid2, r,
+			     bad_word);
 	}
 	pass("spfi%u: %d writes to stream %u while stream %u was read %d times, all verified",
-	     nn, SPFI_ROUNDS, s2, s1, SPFI_ROUNDS);
+	     nn, SPFI_ROUNDS, sid2, sid1, SPFI_ROUNDS);
 out:
 	mbuf_del(&dst2);
 out_src2:
@@ -1999,34 +2012,34 @@ static int spfi_wait_alert(uint32_t nn, uint32_t timeout_ms, struct ramon_spfi_w
 	memset(a, 0, sizeof(*a));
 	a->nn = nn;
 	a->timeout_ms = timeout_ms;
-	return ioctl(fd, RAMON_IOC_SPFI_WAIT_ALERT, a) ? errno : 0;
+	return ioctl(dev_fd, RAMON_IOC_SPFI_WAIT_ALERT, a) ? errno : 0;
 }
 
-struct alert_arg {
+struct spfi_alert_waiter {
 	uint32_t nn;
 	int err;
-	struct ramon_spfi_wait_alert a;
+	struct ramon_spfi_wait_alert alert;
 };
 
-static void *alert_thread(void *arg)
+static void *spfi_alert_waiter_thread(void *arg)
 {
-	struct alert_arg *c = arg;
+	struct spfi_alert_waiter *w = arg;
 
-	c->err = spfi_wait_alert(c->nn, 0, &c->a);
+	w->err = spfi_wait_alert(w->nn, 0, &w->alert);
 	return NULL;
 }
 
 /* print pending alerts, then an idle timeout and a cancel of two waiters */
-static void spfi_alerts(uint32_t nn)
+static void spfi_check_alerts(uint32_t nn)
 {
-	struct alert_arg c[2] = { { .nn = nn }, { .nn = nn } };
+	struct spfi_alert_waiter c[2] = { { .nn = nn }, { .nn = nn } };
 	struct ramon_spfi_cancel_alert ca;
 	struct ramon_spfi_wait_alert a;
 	pthread_t th[2];
 	int i, err = 0;
 
-	for (i = 0; i < SPFI_ALERT_DRAIN; i++) {
-		err = spfi_wait_alert(nn, SPW_SHORT_WAIT_MS, &a);
+	for (i = 0; i < SPFI_ALERT_DRAIN_LIMIT; i++) {
+		err = spfi_wait_alert(nn, IDLE_WAIT_MS, &a);
 		if (err)
 			break;
 		printf("      spfi%u alert: code 0x%x sub 0x%x param1 0x%x param2 0x%x status 0x%x\n",
@@ -2039,11 +2052,11 @@ static void spfi_alerts(uint32_t nn)
 		pass("spfi%u: idle alert wait timed out", nn);
 
 	for (i = 0; i < 2; i++)
-		if (pthread_create(&th[i], NULL, alert_thread, &c[i])) {
+		if (pthread_create(&th[i], NULL, spfi_alert_waiter_thread, &c[i])) {
 			fail("pthread_create");
 			return;
 		}
-	sleep_ms(CANCEL_AFTER_MS);
+	sleep_ms(WAITER_BLOCK_MS);
 	memset(&ca, 0, sizeof(ca));
 	ca.nn = nn;
 	must(RAMON_IOC_SPFI_CANCEL_ALERT, &ca, &ca.st, "SPFI_CANCEL_ALERT");
@@ -2051,10 +2064,11 @@ static void spfi_alerts(uint32_t nn)
 		pthread_join(th[i], NULL);
 		if (!c[i].err)
 			printf("      spfi%u waiter %d got alert 0x%x instead of the cancel\n", nn, i,
-			       c[i].a.code);
-		else if (c[i].err != ECANCELED || c[i].a.st.code != RAMON_E_SPFI_ALERT_CANCELLED)
+			       c[i].alert.code);
+		else if (c[i].err != ECANCELED ||
+			 c[i].alert.st.code != RAMON_E_SPFI_ALERT_CANCELLED)
 			fail("spfi%u waiter %d: errno %d code %s, expected ECANCELED", nn, i,
-			     c[i].err, ramon_err_name(c[i].a.st.code));
+			     c[i].err, ramon_err_name(c[i].alert.st.code));
 		else
 			pass("spfi%u alert waiter %d cancelled", nn, i);
 	}
@@ -2086,40 +2100,40 @@ static void spfi_init_nn(uint32_t nn)
 }
 
 /* returns 1 if the SPFI link was up and the stream test ran */
-static int spfi_one(uint32_t nn)
+static int spfi_check_nn(uint32_t nn)
 {
 	uint8_t *tab;
-	uint32_t s1 = 0, s2 = 0;
-	int open1 = 0, open2 = 0;
+	uint32_t sid1 = 0, sid2 = 0;
+	int opened1 = 0, opened2 = 0;
 
-	if (!spfi_link_up(nn)) {
+	if (!spfi_link_is_up(nn)) {
 		printf("      spfi%u: skipped; bring it up with \"ramon_smoke spfiprep %u\"\n", nn, nn);
 		return 0;
 	}
 	tab = malloc(SPFI_TABLE_BYTES);
 	if (!tab || !spfi_chan_ok(nn))
 		goto out;
-	if (spfi_init_first)
+	if (spfi_init_requested)
 		spfi_init_nn(nn);
-	spfi_diag(nn, "at start");
-	if (spfi_table(nn, tab))
+	spfi_print_diag(nn, "at start");
+	if (spfi_read_table(nn, tab))
 		goto out;
-	spfi_diag(nn, "after GET_ALL_STREAM_STATUS");
-	if (spfi_free_streams(nn, tab, &s1, &s2))
+	spfi_print_diag(nn, "after GET_ALL_STREAM_STATUS");
+	if (spfi_find_free_sids(nn, tab, &sid1, &sid2))
 		goto out;
-	spfi_streams(nn, tab, s1, s2, &open1, &open2);
+	spfi_check_streams(nn, tab, sid1, sid2, &opened1, &opened2);
 	/* only what this test created is closed and deleted */
-	if (open2 && !spfi_stream(nn, RAMON_SPFI_OP_CLOSE_STREAM_FOR_WRITE, s2, 0, "CLOSE"))
-		spfi_stream(nn, RAMON_SPFI_OP_DELETE_STREAM, s2, 0, "DELETE");
-	if (open1 && !spfi_stream(nn, RAMON_SPFI_OP_CLOSE_STREAM_FOR_WRITE, s1, 0, "CLOSE"))
-		spfi_stream(nn, RAMON_SPFI_OP_DELETE_STREAM, s1, 0, "DELETE");
-	if ((open1 || open2) && !spfi_table(nn, tab)) {
-		if ((spfi_rec(tab, s1)->status | spfi_rec(tab, s2)->status) & SPFI_ST_EXIST)
-			fail("spfi%u: test streams %u/%u still exist after DELETE", nn, s1, s2);
+	if (opened2 && !spfi_stream_cmd(nn, RAMON_SPFI_OP_CLOSE_STREAM_FOR_WRITE, sid2, 0, "CLOSE"))
+		spfi_stream_cmd(nn, RAMON_SPFI_OP_DELETE_STREAM, sid2, 0, "DELETE");
+	if (opened1 && !spfi_stream_cmd(nn, RAMON_SPFI_OP_CLOSE_STREAM_FOR_WRITE, sid1, 0, "CLOSE"))
+		spfi_stream_cmd(nn, RAMON_SPFI_OP_DELETE_STREAM, sid1, 0, "DELETE");
+	if ((opened1 || opened2) && !spfi_read_table(nn, tab)) {
+		if ((spfi_rec(tab, sid1)->status | spfi_rec(tab, sid2)->status) & SPFI_ST_EXIST)
+			fail("spfi%u: test streams %u/%u still exist after DELETE", nn, sid1, sid2);
 		else
-			pass("spfi%u: test streams %u and %u closed and deleted", nn, s1, s2);
+			pass("spfi%u: test streams %u and %u closed and deleted", nn, sid1, sid2);
 	}
-	spfi_alerts(nn);
+	spfi_check_alerts(nn);
 out:
 	free(tab);
 	return 1;
@@ -2128,7 +2142,7 @@ out:
 static void test_spfi(void)
 {
 	struct ramon_get_info gi;
-	int present = 0, up = 0;
+	int n_present = 0, n_up = 0;
 	uint32_t nn;
 
 	if (get_info(&gi))
@@ -2138,10 +2152,10 @@ static void test_spfi(void)
 			printf("      spfi%u absent: skipped\n", nn);
 			continue;
 		}
-		present++;
-		up += spfi_one(nn);
+		n_present++;
+		n_up += spfi_check_nn(nn);
 	}
-	if (present && !up)
+	if (n_present && !n_up)
 		fail("no SPFI link is up (0xCC low byte != 0x88); run \"ramon_smoke spfiprep <nn>\" first");
 }
 
@@ -2179,20 +2193,20 @@ static void test_spwdps(void)
 {
 	struct spw_nn s;
 
-	if (spw_open_link(&s, targ_u32(0, 0)))
+	if (spw_open_link(&s, test_arg_u32(0, 0)))
 		return;
-	spw_dps(&s);
+	spw_send_dps(&s);
 	spw_drain(&s);
 	mbuf_del(&s.scratch);
 }
 
-static int parse_hex(const char *hex, uint8_t *out, uint32_t max, uint32_t *len)
+static int parse_hex(const char *hex, uint8_t *out, uint32_t out_capacity, uint32_t *len)
 {
 	size_t n = strlen(hex);
 	uint32_t i;
 	char byte[3] = "";
 
-	if (n % 2 || n / 2 > max)
+	if (n % 2 || n / 2 > out_capacity)
 		return -1;
 	for (i = 0; i < n / 2; i++) {
 		byte[0] = hex[2 * i];
@@ -2208,27 +2222,27 @@ static int parse_hex(const char *hex, uint8_t *out, uint32_t max, uint32_t *len)
 /* ramon_smoke spwsend <nn> <dst> <proto> <app> <attr> [hexpayload] */
 static void test_spwsend(void)
 {
-	static uint8_t payload[SPW_MAX_PAYLOAD];
+	static uint8_t payload[SPW_MAX_PAYLOAD_BYTES];
 	struct spw_msg m;
 	struct spw_nn s;
 	uint32_t size;
 
-	if (targc < 5) {
+	if (test_argc < 5) {
 		fail("usage: spwsend <nn> <dst> <proto> <app> <attr> [hexpayload]");
 		return;
 	}
 	memset(&m, 0, sizeof(m));
-	m.dst = targ_u32(1, 0);
-	m.protocol_id = targ_u32(2, 0);
-	m.app_type = targ_u32(3, 0);
-	m.attribute_id = targ_u32(4, 0);
+	m.dst = test_arg_u32(1, 0);
+	m.protocol_id = test_arg_u32(2, 0);
+	m.app_type = test_arg_u32(3, 0);
+	m.attribute_id = test_arg_u32(4, 0);
 	m.payload = payload;
-	if (targc > 5 && parse_hex(targv[5], payload, sizeof(payload), &m.len)) {
-		fail("payload \"%s\": even number of hex digits, at most %d bytes", targv[5],
-		     SPW_MAX_PAYLOAD);
+	if (test_argc > 5 && parse_hex(test_argv[5], payload, sizeof(payload), &m.payload_len)) {
+		fail("payload \"%s\": even number of hex digits, at most %d bytes", test_argv[5],
+		     SPW_MAX_PAYLOAD_BYTES);
 		return;
 	}
-	if (spw_open_link(&s, targ_u32(0, 0)))
+	if (spw_open_link(&s, test_arg_u32(0, 0)))
 		return;
 	if (!spw_request(&s, &m, "message", &size) && !spw_check_reply(&s, size))
 		pass("spw%u: reply received", s.nn);
@@ -2242,7 +2256,7 @@ static void spfi_print_alerts(uint32_t nn)
 	struct ramon_spfi_wait_alert a;
 	int i;
 
-	for (i = 0; i < SPFI_ALERT_DRAIN && !spfi_wait_alert(nn, 100, &a); i++)
+	for (i = 0; i < SPFI_ALERT_DRAIN_LIMIT && !spfi_wait_alert(nn, 100, &a); i++)
 		printf("      spfi%u alert: code 0x%x sub 0x%x param1 0x%x param2 0x%x status 0x%x\n",
 		       nn, a.code, a.sub_code, a.param1, a.param2, a.rx_status);
 	if (!i)
@@ -2256,10 +2270,10 @@ static void spfi_print_alerts(uint32_t nn)
  */
 static void test_spficmd(void)
 {
-	uint32_t nn = targ_u32(0, 0), opcode = targ_u32(1, 0), param = targ_u32(2, 0);
+	uint32_t nn = test_arg_u32(0, 0), opcode = test_arg_u32(1, 0), param = test_arg_u32(2, 0);
 	struct ramon_spfi_cmd c;
 
-	if (targc < 2) {
+	if (test_argc < 2) {
 		fail("usage: spficmd <nn> <opcode> [stream id | init type | tod]");
 		return;
 	}
@@ -2267,57 +2281,57 @@ static void test_spficmd(void)
 	c.stream_id = param;
 	c.init_type = param;
 	c.tod = param;
-	spfi_diag(nn, "before");
+	spfi_print_diag(nn, "before");
 	if (!spfi_cmd(nn, opcode, &c, "SPFI_CMD"))
 		printf("      spfi%u opcode 0x%x: rx_opcode 0x%x rx_err_code %u rx_stream_id %u rx_offset %u rx_init_info 0x%x rx_curr_tod %u rx_status 0x%x%s%s\n",
 		       nn, opcode, c.rx_opcode, c.rx_err_code, c.rx_stream_id, c.rx_offset,
 		       c.rx_init_info, c.rx_curr_tod, c.rx_status, c.st.msg[0] ? " -- " : "",
 		       c.st.msg);
-	spfi_diag(nn, "after");
+	spfi_print_diag(nn, "after");
 	spfi_print_alerts(nn);
 }
 
 /* ramon_smoke reg <window> <offset> [value]: one REG_IO read, or write + read back */
 static void test_reg(void)
 {
-	uint32_t off = targ_u32(1, 0), v = targ_u32(2, 0), index;
+	uint32_t off = test_arg_u32(1, 0), v = test_arg_u32(2, 0), index;
 	const char *name;
 
-	if (targc < 2) {
+	if (test_argc < 2) {
 		fail("usage: reg <window name or index> <offset> [value]");
 		return;
 	}
 	/* a leading digit selects by index, anything else by name */
-	name = isdigit((unsigned char)targv[0][0]) ? NULL : targv[0];
-	index = name ? 0 : targ_u32(0, 0);
-	if (targc > 2 && reg_io(name, index, RAMON_REG_OP_WRITE, off, &v))
+	name = isdigit((unsigned char)test_argv[0][0]) ? NULL : test_argv[0];
+	index = name ? 0 : test_arg_u32(0, 0);
+	if (test_argc > 2 && reg_io(name, index, RAMON_REG_OP_WRITE, off, &v))
 		return;
 	if (!reg_read(name, index, off, &v))
-		printf("      %s[0x%x] = 0x%08x (%u)\n", targv[0], off, v, v);
+		printf("      %s[0x%x] = 0x%08x (%u)\n", test_argv[0], off, v, v);
 }
 
 /* ramon_smoke spfidel <nn> <sid>: CLOSE if open, then DELETE (any id, also 193..197) */
 static void test_spfidel(void)
 {
-	uint32_t nn = targ_u32(0, 0), sid = targ_u32(1, SPFI_STREAMS);
+	uint32_t nn = test_arg_u32(0, 0), sid = test_arg_u32(1, SPFI_STREAMS);
 	uint8_t *tab;
 
-	if (targc < 2 || nn >= RAMON_NN_COUNT || sid >= SPFI_STREAMS) {
+	if (test_argc < 2 || nn >= RAMON_NN_COUNT || sid >= SPFI_STREAMS) {
 		fail("usage: spfidel <nn> <stream id 0..%d>", SPFI_STREAMS - 1);
 		return;
 	}
 	tab = malloc(SPFI_TABLE_BYTES);
-	if (!tab || spfi_table(nn, tab))
+	if (!tab || spfi_read_table(nn, tab))
 		goto out;
 	if (!(spfi_rec(tab, sid)->status & SPFI_ST_EXIST)) {
 		printf("      spfi%u stream %u does not exist; nothing to do\n", nn, sid);
 		goto out;
 	}
 	if ((spfi_rec(tab, sid)->status & SPFI_ST_OPEN) &&
-	    spfi_stream(nn, RAMON_SPFI_OP_CLOSE_STREAM_FOR_WRITE, sid, 0, "CLOSE"))
+	    spfi_stream_cmd(nn, RAMON_SPFI_OP_CLOSE_STREAM_FOR_WRITE, sid, 0, "CLOSE"))
 		goto out;
-	if (spfi_stream(nn, RAMON_SPFI_OP_DELETE_STREAM, sid, 0, "DELETE") ||
-	    spfi_table(nn, tab))
+	if (spfi_stream_cmd(nn, RAMON_SPFI_OP_DELETE_STREAM, sid, 0, "DELETE") ||
+	    spfi_read_table(nn, tab))
 		goto out;
 	if (spfi_rec(tab, sid)->status & SPFI_ST_EXIST)
 		fail("spfi%u stream %u still exists after DELETE", nn, sid);
@@ -2335,7 +2349,7 @@ out:
  */
 static void test_spfiprep(void)
 {
-	uint32_t nn = targ_u32(0, 0);
+	uint32_t nn = test_arg_u32(0, 0);
 	struct ramon_get_info gi;
 	struct ramon_spfi_cmd c;
 	uint8_t *tab;
@@ -2348,36 +2362,36 @@ static void test_spfiprep(void)
 		return;
 	}
 	/* the SPFI link comes up only after the SPW core is enabled and synced */
-	spfi_link_up(nn);
-	spfi_diag(nn, "at start");
+	spfi_link_is_up(nn);
+	spfi_print_diag(nn, "at start");
 	if (spw_open_link(&s, nn))
 		return;
-	spfi_diag(nn, "after SPW enable and link sync");
-	if (!spfi_link_wait(nn, 2000)) {
+	spfi_print_diag(nn, "after SPW enable and link sync");
+	if (!spfi_wait_link_up(nn, 2000)) {
 		fail("spfi%u: link not up after the SPW enable and sync (0xCC low byte must be 0x88)", nn);
 		mbuf_del(&s.scratch);
 		return;
 	}
 	pass("spfi%u: link up", nn);
-	spw_dps(&s);
+	spw_send_dps(&s);
 	spw_drain(&s);
 	mbuf_del(&s.scratch);
-	spfi_diag(nn, "after DPS");
+	spfi_print_diag(nn, "after DPS");
 	spfi_init_nn(nn);
-	spfi_diag(nn, "after INIT");
-	if (spfi_format) {
+	spfi_print_diag(nn, "after INIT");
+	if (spfi_format_requested) {
 		printf("      spfi%u: FORMAT erases every stream on the NN\n", nn);
 		memset(&c, 0, sizeof(c));
 		if (!spfi_cmd(nn, RAMON_SPFI_OP_FORMAT, &c, "SPFI FORMAT"))
 			printf("      spfi%u FORMAT: rx_err_code %u\n", nn, c.rx_err_code);
-		spfi_diag(nn, "after FORMAT");
+		spfi_print_diag(nn, "after FORMAT");
 	}
 	tab = malloc(SPFI_TABLE_BYTES);
-	if (tab && !spfi_table(nn, tab)) {
+	if (tab && !spfi_read_table(nn, tab)) {
 		spfi_print_table(nn, tab);
 		pass("spfi%u prepared", nn);
 	} else {
-		spfi_diag(nn, "after the failed GET_ALL_STREAM_STATUS");
+		spfi_print_diag(nn, "after the failed GET_ALL_STREAM_STATUS");
 		spfi_print_alerts(nn);
 	}
 	free(tab);
@@ -2385,24 +2399,24 @@ static void test_spfiprep(void)
 
 /* ---- zdma ---- */
 
-static void zdma_single(void)
+static void zdma_check_single(void)
 {
 	struct ramon_copy c;
 	struct mbuf a, b;
-	long bad;
+	long bad_word;
 
 	if (mbuf_new(&a, 1024 * 1024))
 		return;
 	if (!mbuf_new(&b, 1024 * 1024)) {
-		fill((uint32_t *)a.p, a.size, 0x11);
+		fill((uint32_t *)a.ptr, a.size, 0x11);
 		memset(&c, 0, sizeof(c));
-		c.src_handle = a.h;
-		c.dst_handle = b.h;
+		c.src_handle = a.handle;
+		c.dst_handle = b.handle;
 		c.len = a.size;
 		if (!zdma_copy(&c, 1, "ZDMA_COPY single")) {
-			bad = verify((uint32_t *)b.p, b.size, 0x11);
-			if (bad >= 0)
-				fail("zdma single: mismatch at word %ld", bad);
+			bad_word = verify((uint32_t *)b.ptr, b.size, 0x11);
+			if (bad_word >= 0)
+				fail("zdma single: mismatch at word %ld", bad_word);
 			else
 				pass("zdma single copy of %" PRIu64 " bytes verified", a.size);
 		}
@@ -2411,8 +2425,8 @@ static void zdma_single(void)
 	mbuf_del(&a);
 }
 
-/* n entries of scattered sizes, or all ZDMA_SMALL bytes, into consecutive dst slots */
-static void zdma_list(uint32_t n, int small, const char *what)
+/* n entries of scattered sizes, or all ZDMA_SMALL_BYTES long, into consecutive dst slots */
+static void zdma_check_list(uint32_t n, int small, const char *what)
 {
 	struct ramon_copy *c = calloc(n, sizeof(*c));
 	uint64_t dst_off = 0;
@@ -2420,25 +2434,26 @@ static void zdma_list(uint32_t n, int small, const char *what)
 	struct mbuf a, b;
 	uint32_t i;
 
-	if (!c || mbuf_new(&a, ZDMA_LIST_BUF)) {
+	if (!c || mbuf_new(&a, ZDMA_LIST_BUF_BYTES)) {
 		free(c);
 		return;
 	}
-	if (mbuf_new(&b, ZDMA_LIST_BUF))
+	if (mbuf_new(&b, ZDMA_LIST_BUF_BYTES))
 		goto out_a;
-	fill((uint32_t *)a.p, a.size, 0x22);
-	memset(b.p, 0, b.size);
+	fill((uint32_t *)a.ptr, a.size, 0x22);
+	memset(b.ptr, 0, b.size);
 	for (i = 0; i < n; i++) {
-		c[i].src_handle = a.h;
-		c[i].dst_handle = b.h;
-		c[i].len = small ? ZDMA_SMALL : ZDMA_SMALL * (1 + rand_r(&seed) % 512);
-		c[i].src_off = (rand_r(&seed) % (a.size - c[i].len)) & ~(uint64_t)(ZDMA_SMALL - 1);
+		c[i].src_handle = a.handle;
+		c[i].dst_handle = b.handle;
+		c[i].len = small ? ZDMA_SMALL_BYTES : ZDMA_SMALL_BYTES * (1 + rand_r(&seed) % 512);
+		c[i].src_off = (rand_r(&seed) % (a.size - c[i].len)) &
+			       ~(uint64_t)(ZDMA_SMALL_BYTES - 1);
 		c[i].dst_off = dst_off;
 		dst_off += c[i].len;
 	}
 	if (!zdma_copy(c, n, what)) {
 		for (i = 0; i < n; i++)
-			if (memcmp(b.p + c[i].dst_off, a.p + c[i].src_off, c[i].len))
+			if (memcmp(b.ptr + c[i].dst_off, a.ptr + c[i].src_off, c[i].len))
 				break;
 		if (i < n)
 			fail("%s: entry %u differs", what, i);
@@ -2457,7 +2472,7 @@ static void *zdma_thread(void *arg)
 	struct ramon_zdma_copy z;
 	struct ramon_copy c;
 	struct mbuf a, b;
-	long bad = 0;
+	long n_bad = 0;
 	int i;
 
 	if (mbuf_new(&a, ZDMA_THREAD_BYTES))
@@ -2466,28 +2481,28 @@ static void *zdma_thread(void *arg)
 		mbuf_del(&a);
 		return (void *)1L;
 	}
-	for (i = 0; i < ZDMA_THREAD_COPIES; i++) {
-		fill((uint32_t *)a.p, a.size, seed + i);
+	for (i = 0; i < ZDMA_COPIES_PER_THREAD; i++) {
+		fill((uint32_t *)a.ptr, a.size, seed + i);
 		memset(&c, 0, sizeof(c));
-		c.src_handle = a.h;
-		c.dst_handle = b.h;
+		c.src_handle = a.handle;
+		c.dst_handle = b.handle;
 		c.len = a.size;
 		memset(&z, 0, sizeof(z));
 		z.n = 1;
 		z.entries = (uintptr_t)&c;
-		if (ioctl(fd, RAMON_IOC_ZDMA_COPY, &z) || z.done != 1 ||
-		    verify((uint32_t *)b.p, b.size, seed + i) >= 0)
-			bad++;
+		if (ioctl(dev_fd, RAMON_IOC_ZDMA_COPY, &z) || z.done != 1 ||
+		    verify((uint32_t *)b.ptr, b.size, seed + i) >= 0)
+			n_bad++;
 	}
 	mbuf_del(&b);
 	mbuf_del(&a);
-	return (void *)bad;
+	return (void *)n_bad;
 }
 
-static void zdma_threads(uint32_t n_chan)
+static void zdma_check_concurrent(uint32_t n_chan)
 {
 	pthread_t th[ZDMA_THREADS];
-	long bad = 0;
+	long n_bad = 0;
 	void *ret;
 	int i;
 
@@ -2498,13 +2513,13 @@ static void zdma_threads(uint32_t n_chan)
 		}
 	for (i = 0; i < ZDMA_THREADS; i++) {
 		pthread_join(th[i], &ret);
-		bad += (long)ret;
+		n_bad += (long)ret;
 	}
-	if (bad)
-		fail("zdma contention: %ld bad copies", bad);
+	if (n_bad)
+		fail("zdma contention: %ld bad copies", n_bad);
 	else
 		pass("zdma contention: %d threads x %d copies over %u channels", ZDMA_THREADS,
-		     ZDMA_THREAD_COPIES, n_chan);
+		     ZDMA_COPIES_PER_THREAD, n_chan);
 }
 
 static void test_zdma(void)
@@ -2517,10 +2532,10 @@ static void test_zdma(void)
 		printf("      no ZDMA channels (zdma_channels=0, or ps2psk still loaded?): skipped\n");
 		return;
 	}
-	zdma_single();
-	zdma_list(ZDMA_LIST_N, 0, "ZDMA_COPY list");
-	zdma_list(RAMON_ZDMA_MAX_COPIES, 1, "ZDMA_COPY max list");
-	zdma_threads(gi.n_zdma_chan);
+	zdma_check_single();
+	zdma_check_list(ZDMA_LIST_ENTRIES, 0, "ZDMA_COPY list");
+	zdma_check_list(RAMON_ZDMA_MAX_COPIES, 1, "ZDMA_COPY max list");
+	zdma_check_concurrent(gi.n_zdma_chan);
 }
 
 /* ---- stats ---- */
@@ -2565,22 +2580,23 @@ static void test_stats(void)
 
 /* ---- stress: everything at once for --minutes ---- */
 
-enum { ST_ZDMA, ST_CHURN, ST_REG, ST_STATS, ST_SPW, ST_SPFI, ST_GROUPS };
+enum { STRESS_ZDMA, STRESS_CHURN, STRESS_REG, STRESS_STATS, STRESS_SPW, STRESS_SPFI,
+       N_STRESS_GROUPS };
 
-static const char *const stress_names[ST_GROUPS] = {
+static const char *const stress_group_names[N_STRESS_GROUPS] = {
 	"zdma copy", "buf churn", "reg read", "get stats", "spw round trip", "spfi table",
 };
 
 static unsigned int stress_minutes = 10;
-static atomic_int stress_stop;
-static atomic_long stress_ops[ST_GROUPS];
-static atomic_long stress_fails[ST_GROUPS];
+static atomic_int stress_stop_requested;
+static atomic_long stress_ops[N_STRESS_GROUPS];
+static atomic_long stress_failures[N_STRESS_GROUPS];
 
 struct stress_arg {
 	int group;
 	uint32_t seed;
 	struct spw_nn *spw;
-	struct spw_pkt *spw_tx;
+	struct spw_pkt *request_pkt;
 	uint32_t nn;
 };
 
@@ -2589,22 +2605,22 @@ static int stress_zdma(struct stress_arg *a, struct mbuf *src, struct mbuf *dst)
 	struct ramon_zdma_copy z;
 	struct ramon_copy c;
 
-	fill((uint32_t *)src->p, src->size, a->seed++);
+	fill((uint32_t *)src->ptr, src->size, a->seed++);
 	memset(&c, 0, sizeof(c));
-	c.src_handle = src->h;
-	c.dst_handle = dst->h;
+	c.src_handle = src->handle;
+	c.dst_handle = dst->handle;
 	c.len = src->size;
 	memset(&z, 0, sizeof(z));
 	z.n = 1;
 	z.entries = (uintptr_t)&c;
-	return ioctl(fd, RAMON_IOC_ZDMA_COPY, &z) || z.done != 1 ||
-	       verify((uint32_t *)dst->p, dst->size, a->seed - 1) >= 0;
+	return ioctl(dev_fd, RAMON_IOC_ZDMA_COPY, &z) || z.done != 1 ||
+	       verify((uint32_t *)dst->ptr, dst->size, a->seed - 1) >= 0;
 }
 
 static int stress_churn(struct stress_arg *a)
 {
-	uint64_t size = 1 + rand_r(&a->seed) % CHURN_MAX_SIZE, actual;
-	int bad = 0;
+	uint64_t size = 1 + rand_r(&a->seed) % CHURN_MAX_BYTES, actual;
+	int failed = 0;
 	uint32_t h;
 	void *p;
 
@@ -2612,34 +2628,34 @@ static int stress_churn(struct stress_arg *a)
 		return 1;
 	p = buf_map(h, actual, MAP_SHARED);
 	if (p == MAP_FAILED) {
-		bad = 1;
+		failed = 1;
 	} else {
 		fill(p, actual, a->seed);
-		bad = verify(p, actual, a->seed) >= 0;
+		failed = verify(p, actual, a->seed) >= 0;
 		munmap(p, actual);
 	}
-	return buf_free(h) || bad;
+	return buf_free(h) || failed;
 }
 
-static int stress_one(struct stress_arg *a, struct mbuf *src, struct mbuf *dst, uint8_t *tab)
+static int stress_run_op(struct stress_arg *a, struct mbuf *src, struct mbuf *dst, uint8_t *tab)
 {
 	struct ramon_get_stats g;
 	uint32_t v;
 
 	switch (a->group) {
-	case ST_ZDMA:
+	case STRESS_ZDMA:
 		return stress_zdma(a, src, dst);
-	case ST_CHURN:
+	case STRESS_CHURN:
 		return stress_churn(a);
-	case ST_REG:
-		return reg_read(NULL, RAMON_WIN_SYSMON_PS, SYSMON_TEMP, &v);
-	case ST_STATS:
+	case STRESS_REG:
+		return reg_read(NULL, RAMON_WIN_SYSMON_PS, SYSMON_TEMP_REG, &v);
+	case STRESS_STATS:
 		memset(&g, 0, sizeof(g));
 		return must(RAMON_IOC_GET_STATS, &g, &g.st, "GET_STATS");
-	case ST_SPW:
-		return spw_roundtrip_seq(a->spw, a->spw_tx);
-	case ST_SPFI:
-		return spfi_table(a->nn, tab);
+	case STRESS_SPW:
+		return spw_request_same_thread(a->spw, a->request_pkt);
+	case STRESS_SPFI:
+		return spfi_read_table(a->nn, tab);
 	}
 	return 1;
 }
@@ -2651,7 +2667,7 @@ static void *stress_thread(void *arg)
 	struct mbuf src, dst;
 	int have_bufs = 0;
 
-	if (a->group == ST_ZDMA) {
+	if (a->group == STRESS_ZDMA) {
 		if (mbuf_new(&src, ZDMA_THREAD_BYTES))
 			goto out;
 		if (mbuf_new(&dst, ZDMA_THREAD_BYTES)) {
@@ -2660,9 +2676,9 @@ static void *stress_thread(void *arg)
 		}
 		have_bufs = 1;
 	}
-	while (tab && !atomic_load(&stress_stop)) {
-		if (stress_one(a, &src, &dst, tab))
-			atomic_fetch_add(&stress_fails[a->group], 1);
+	while (tab && !atomic_load(&stress_stop_requested)) {
+		if (stress_run_op(a, &src, &dst, tab))
+			atomic_fetch_add(&stress_failures[a->group], 1);
 		atomic_fetch_add(&stress_ops[a->group], 1);
 	}
 	if (have_bufs) {
@@ -2679,20 +2695,20 @@ static void stress_report(const char *when)
 	int g;
 
 	printf("      %s:", when);
-	for (g = 0; g < ST_GROUPS; g++)
-		printf(" %s %ld/%ld", stress_names[g], atomic_load(&stress_ops[g]),
-		       atomic_load(&stress_fails[g]));
+	for (g = 0; g < N_STRESS_GROUPS; g++)
+		printf(" %s %ld/%ld", stress_group_names[g], atomic_load(&stress_ops[g]),
+		       atomic_load(&stress_failures[g]));
 	printf("  (ops/failures)\n");
 }
 
 /* SPW round trips need a synced link with loopback off */
-static int stress_spw_setup(struct spw_nn *s, struct spw_pkt *tx, uint32_t nn)
+static int stress_spw_setup(struct spw_nn *s, struct spw_pkt *request_pkt, uint32_t nn)
 {
 	struct spw_msg m = spw_version_msg();
 
 	if (spw_setup(s, nn))
 		return -1;
-	if (spw_loopback(nn, 0) || spw_sync(s) || spw_build(tx, &m)) {
+	if (spw_loopback(nn, 0) || spw_sync(s) || spw_build(request_pkt, &m)) {
 		mbuf_del(&s->scratch);
 		return -1;
 	}
@@ -2704,62 +2720,65 @@ static void test_stress(void)
 {
 	struct stress_arg args[16];
 	struct spw_nn spw[RAMON_NN_COUNT];
-	struct spw_pkt spw_tx[RAMON_NN_COUNT];
+	struct spw_pkt request_pkt[RAMON_NN_COUNT];
 	int spw_ok[RAMON_NN_COUNT] = { 0 };
 	struct ramon_get_info gi;
 	pthread_t th[16];
-	int n = 0, i, g;
-	long long end;
+	int n_threads = 0, i, minute, group;
+	long long end_ms;
 	uint32_t nn;
 
 	if (get_info(&gi))
 		return;
 	for (i = 0; i < 4 && gi.n_zdma_chan; i++)
-		args[n++] = (struct stress_arg){ .group = ST_ZDMA, .seed = 0x10000u * i };
+		args[n_threads++] = (struct stress_arg){ .group = STRESS_ZDMA,
+							 .seed = 0x10000u * i };
 	for (i = 0; i < 2; i++)
-		args[n++] = (struct stress_arg){ .group = ST_CHURN, .seed = 77 + i };
-	args[n++] = (struct stress_arg){ .group = ST_REG };
-	args[n++] = (struct stress_arg){ .group = ST_STATS };
+		args[n_threads++] = (struct stress_arg){ .group = STRESS_CHURN, .seed = 77 + i };
+	args[n_threads++] = (struct stress_arg){ .group = STRESS_REG };
+	args[n_threads++] = (struct stress_arg){ .group = STRESS_STATS };
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
-		if ((gi.spw_mask & (1u << nn)) && !stress_spw_setup(&spw[nn], &spw_tx[nn], nn)) {
+		if ((gi.spw_mask & (1u << nn)) &&
+		    !stress_spw_setup(&spw[nn], &request_pkt[nn], nn)) {
 			spw_ok[nn] = 1;
-			args[n++] = (struct stress_arg){ .group = ST_SPW, .spw = &spw[nn],
-							 .spw_tx = &spw_tx[nn] };
+			args[n_threads++] = (struct stress_arg){ .group = STRESS_SPW,
+								 .spw = &spw[nn],
+								 .request_pkt = &request_pkt[nn] };
 		}
-		if ((gi.spfi_mask & (1u << nn)) && spfi_link_up(nn))
-			args[n++] = (struct stress_arg){ .group = ST_SPFI, .nn = nn };
+		if ((gi.spfi_mask & (1u << nn)) && spfi_link_is_up(nn))
+			args[n_threads++] = (struct stress_arg){ .group = STRESS_SPFI, .nn = nn };
 	}
 	printf("      %d threads for %u minute(s); no SPFI stream data is written (media wear)\n",
-	       n, stress_minutes);
-	for (i = 0; i < n; i++)
+	       n_threads, stress_minutes);
+	for (i = 0; i < n_threads; i++)
 		if (pthread_create(&th[i], NULL, stress_thread, &args[i]))
 			fail("pthread_create");
-	end = now_ms() + stress_minutes * 60000LL;
-	for (g = 1; now_ms() < end; g++) {
-		sleep_ms(end - now_ms() < 60000 ? end - now_ms() : 60000);
-		if (now_ms() < end) {
+	end_ms = now_ms() + stress_minutes * 60000LL;
+	for (minute = 1; now_ms() < end_ms; minute++) {
+		sleep_ms(end_ms - now_ms() < 60000 ? end_ms - now_ms() : 60000);
+		if (now_ms() < end_ms) {
 			char when[32];
 
-			snprintf(when, sizeof(when), "after %d min", g);
+			snprintf(when, sizeof(when), "after %d min", minute);
 			stress_report(when);
 		}
 	}
-	atomic_store(&stress_stop, 1);
-	for (i = 0; i < n; i++)
+	atomic_store(&stress_stop_requested, 1);
+	for (i = 0; i < n_threads; i++)
 		pthread_join(th[i], NULL);
 	stress_report("total");
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
 		if (!spw_ok[nn])
 			continue;
-		mbuf_del(&spw_tx[nn].buf);
+		mbuf_del(&request_pkt[nn].buf);
 		mbuf_del(&spw[nn].scratch);
 		if (spw[nn].saved_loopback)
 			spw_loopback(nn, 1);
 	}
-	for (g = 0; g < ST_GROUPS; g++)
-		if (atomic_load(&stress_fails[g]))
-			fail("stress %s: %ld failures", stress_names[g],
-			     atomic_load(&stress_fails[g]));
+	for (group = 0; group < N_STRESS_GROUPS; group++)
+		if (atomic_load(&stress_failures[group]))
+			fail("stress %s: %ld failures", stress_group_names[group],
+			     atomic_load(&stress_failures[group]));
 	pass("stress finished");
 }
 
@@ -2778,29 +2797,29 @@ static int sysfs_write(const char *path, const char *val)
 }
 
 /* platform device name behind /dev/ramon_dma, e.g. "a0000000.nanrec_axidma" */
-static int bound_device(char *name, size_t len)
+static int find_bound_device(char *name, size_t len)
 {
-	char link[PATH_MAX];
+	char link_path[PATH_MAX];
 	const char *base;
-	ssize_t n = readlink(SYSFS_MISC_DEVICE, link, sizeof(link) - 1);
+	ssize_t n = readlink(SYSFS_MISC_DEVICE, link_path, sizeof(link_path) - 1);
 
 	if (n < 0) {
 		fail("readlink %s: %s", SYSFS_MISC_DEVICE, strerror(errno));
 		return -1;
 	}
-	link[n] = '\0';
-	base = strrchr(link, '/');
-	snprintf(name, len, "%s", base ? base + 1 : link);
+	link_path[n] = '\0';
+	base = strrchr(link_path, '/');
+	snprintf(name, len, "%s", base ? base + 1 : link_path);
 	return 0;
 }
 
 static int reopen_device(void)
 {
-	int waited;
+	int waited_ms;
 
-	for (waited = 0; waited < REBIND_WAIT_MS; waited += 50) {
-		fd = open(dev_path, O_RDWR);
-		if (fd >= 0)
+	for (waited_ms = 0; waited_ms < REBIND_WAIT_MS; waited_ms += 50) {
+		dev_fd = open(dev_path, O_RDWR);
+		if (dev_fd >= 0)
 			return 0;
 		sleep_ms(50);
 	}
@@ -2839,24 +2858,24 @@ struct blocker {
 	union {
 		struct ramon_spfi_wait_alert alert;
 		struct ramon_spw_wait_rx spw;
-	} u;
+	} arg;
 	struct ramon_status *st;
 	int err;
 	pthread_t th;
-	int running;
+	int started;
 };
 
 static void *blocker_thread(void *arg)
 {
 	struct blocker *b = arg;
 
-	b->err = ioctl(fd, b->req, &b->u) ? errno : 0;
+	b->err = ioctl(dev_fd, b->req, &b->arg) ? errno : 0;
 	return NULL;
 }
 
 static int blockers_start(struct blocker *b, const struct ramon_get_info *gi)
 {
-	uint32_t nn;
+	uint32_t nn, i;
 	int n = 0;
 
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
@@ -2864,23 +2883,23 @@ static int blockers_start(struct blocker *b, const struct ramon_get_info *gi)
 			memset(&b[n], 0, sizeof(b[n]));
 			b[n].what = nn ? "SPFI_WAIT_ALERT nn1" : "SPFI_WAIT_ALERT nn0";
 			b[n].req = RAMON_IOC_SPFI_WAIT_ALERT;
-			b[n].u.alert.nn = nn;
-			b[n].st = &b[n].u.alert.st;
+			b[n].arg.alert.nn = nn;
+			b[n].st = &b[n].arg.alert.st;
 			n++;
 		}
 		if (gi->spw_mask & (1u << nn)) {
 			memset(&b[n], 0, sizeof(b[n]));
 			b[n].what = nn ? "SPW_WAIT_RX nn1" : "SPW_WAIT_RX nn0";
 			b[n].req = RAMON_IOC_SPW_WAIT_RX;
-			b[n].u.spw.nn = nn;
-			b[n].u.spw.timeout_ms = RAMON_TIMEOUT_MAX_MS;
-			b[n].st = &b[n].u.spw.st;
+			b[n].arg.spw.nn = nn;
+			b[n].arg.spw.timeout_ms = RAMON_TIMEOUT_MAX_MS;
+			b[n].st = &b[n].arg.spw.st;
 			n++;
 		}
 	}
-	for (nn = 0; nn < (uint32_t)n; nn++)
-		b[nn].running = !pthread_create(&b[nn].th, NULL, blocker_thread, &b[nn]);
-	sleep_ms(CANCEL_AFTER_MS);
+	for (i = 0; i < (uint32_t)n; i++)
+		b[i].started = !pthread_create(&b[i].th, NULL, blocker_thread, &b[i]);
+	sleep_ms(WAITER_BLOCK_MS);
 	return n;
 }
 
@@ -2892,7 +2911,7 @@ static void blockers_check(struct blocker *b, int n)
 	clock_gettime(CLOCK_REALTIME, &deadline);
 	deadline.tv_sec += 5;
 	for (i = 0; i < n; i++) {
-		if (!b[i].running)
+		if (!b[i].started)
 			continue;
 		if (pthread_timedjoin_np(b[i].th, NULL, &deadline)) {
 			fail("%s still blocked 5 s after the unbind", b[i].what);
@@ -2919,7 +2938,7 @@ static void test_unbind(void)
 	void *p;
 	int err;
 
-	if (bound_device(name, sizeof(name)) || buf_alloc(1024 * 1024, &h, &actual))
+	if (find_bound_device(name, sizeof(name)) || buf_alloc(1024 * 1024, &h, &actual))
 		return;
 	p = buf_map(h, actual, MAP_SHARED);
 	if (p == MAP_FAILED) {
@@ -2946,8 +2965,8 @@ static void test_unbind(void)
 	/* the last references go now: the buffer is freed on the unbound device */
 	munmap(p, actual);
 	buf_free(h);
-	close(fd);
-	fd = -1;
+	close(dev_fd);
+	dev_fd = -1;
 
 	err = sysfs_write(SYSFS_DRIVER "/bind", name);
 	if (err) {
@@ -2976,7 +2995,7 @@ static void errors_dispatch(void)
 	expect_errno(RAMON_IOC_GET_INFO, (void *)8, "GET_INFO with a bad pointer", EFAULT);
 }
 
-static void errors_buf_ioctls(uint64_t max)
+static void errors_buf_ioctls(uint64_t max_buf_bytes)
 {
 	struct ramon_buf_alloc a;
 	struct ramon_buf_free f;
@@ -2988,8 +3007,8 @@ static void errors_buf_ioctls(uint64_t max)
 		    RAMON_E_INVAL_ARG, "size 0");
 
 	memset(&a, 0, sizeof(a));
-	a.size = max + 1;
-	snprintf(want, sizeof(want), "0x%" PRIx64, max + 1);
+	a.size = max_buf_bytes + 1;
+	snprintf(want, sizeof(want), "0x%" PRIx64, max_buf_bytes + 1);
 	expect_fail(RAMON_IOC_BUF_ALLOC, &a, &a.st, "BUF_ALLOC above max_buf_mb", EINVAL,
 		    RAMON_E_BUF_TOO_LARGE, want);
 
@@ -3034,28 +3053,29 @@ static void errors_mmap(void)
 }
 
 /* allocate max-size buffers until the coherent allocator gives up */
-static void errors_cma_exhaustion(uint64_t max)
+static void errors_cma_exhaustion(uint64_t max_buf_bytes)
 {
-	uint32_t held[EXHAUST_MAX_BUFS];
+	uint32_t held[CMA_EXHAUST_MAX_BUFS];
 	struct ramon_buf_alloc a;
 	int n, i;
 
-	for (n = 0; n < EXHAUST_MAX_BUFS; n++) {
+	for (n = 0; n < CMA_EXHAUST_MAX_BUFS; n++) {
 		memset(&a, 0, sizeof(a));
-		a.size = max;
-		if (ioctl(fd, RAMON_IOC_BUF_ALLOC, &a))
+		a.size = max_buf_bytes;
+		if (ioctl(dev_fd, RAMON_IOC_BUF_ALLOC, &a))
 			break;
 		held[n] = a.handle;
 	}
-	if (n == EXHAUST_MAX_BUFS) {
+	if (n == CMA_EXHAUST_MAX_BUFS) {
 		printf("      note: %d x %" PRIu64 " bytes all succeeded; exhaustion not reached\n",
-		       n, max);
+		       n, max_buf_bytes);
 	} else if (errno != ENOMEM || a.st.code != RAMON_E_BUF_ALLOC_FAILED || !a.st.msg[0]) {
-		fail("allocation %d of %" PRIu64 " bytes failed unexpectedly", n + 1, max);
+		fail("allocation %d of %" PRIu64 " bytes failed unexpectedly", n + 1,
+		     max_buf_bytes);
 		print_status("got", errno, &a.st);
 	} else {
-		seen(a.st.code);
-		pass("CMA exhaustion after %d x %" PRIu64 " bytes -> %s \"%s\"", n, max,
+		mark_code_produced(a.st.code);
+		pass("CMA exhaustion after %d x %" PRIu64 " bytes -> %s \"%s\"", n, max_buf_bytes,
 		     ramon_err_name(a.st.code), a.st.msg);
 	}
 	for (i = 0; i < n; i++)
@@ -3077,18 +3097,18 @@ static void expect_reg_fail(const char *name, uint32_t index, uint32_t op, uint3
 	expect_fail(RAMON_IOC_REG_IO, &r, &r.st, what, want_errno, want_code, want_in_msg);
 }
 
-static void errors_regwin(uint32_t n)
+static void errors_regwin(uint32_t n_regwin)
 {
 	struct ramon_regwin_info ri;
-	char want[32], name[64];
+	char want[32], what[64];
 	uint32_t i;
 
-	snprintf(want, sizeof(want), "%u", n);
+	snprintf(want, sizeof(want), "%u", n_regwin);
 	memset(&ri, 0, sizeof(ri));
-	ri.index = n;
+	ri.index = n_regwin;
 	expect_fail(RAMON_IOC_REGWIN_INFO, &ri, &ri.st, "REGWIN_INFO past the end", ENOENT,
 		    RAMON_E_REGWIN_BAD_INDEX, want);
-	expect_reg_fail(NULL, n, RAMON_REG_OP_READ, 0, "REG_IO index past the end", ENOENT,
+	expect_reg_fail(NULL, n_regwin, RAMON_REG_OP_READ, 0, "REG_IO index past the end", ENOENT,
 			RAMON_E_REGWIN_BAD_INDEX, want);
 	expect_reg_fail("no_such_window", 0, RAMON_REG_OP_READ, 0, "REG_IO unknown name",
 			ENOENT, RAMON_E_REGWIN_BAD_NAME, "no_such_window");
@@ -3097,7 +3117,7 @@ static void errors_regwin(uint32_t n)
 			"REG_IO 32-char unterminated name", ENOENT, RAMON_E_REGWIN_BAD_NAME,
 			"abcdefghijklmnopqrstuvwxyz012345");
 
-	if (win_present(RAMON_WIN_SYSMON_PS)) {
+	if (win_is_present(RAMON_WIN_SYSMON_PS)) {
 		expect_reg_fail("sysmon_ps", 0, RAMON_REG_OP_READ, 0x2, "REG_IO unaligned offset",
 				EINVAL, RAMON_E_REGWIN_UNALIGNED, "0x2");
 		expect_reg_fail("sysmon_ps", 0, RAMON_REG_OP_READ, 0x300,
@@ -3111,19 +3131,19 @@ static void errors_regwin(uint32_t n)
 		expect_reg_fail("sysmon_ps", 0, 7, 0, "REG_IO op 7", EINVAL, RAMON_E_INVAL_ARG,
 				"op 7");
 	}
-	for (i = 0; i < n; i++) {
+	for (i = 0; i < n_regwin; i++) {
 		if (regwin_info(i, &ri) || !(ri.flags & RAMON_REGWIN_ABSENT))
 			continue;
-		snprintf(name, sizeof(name), "REG_IO on absent window %.32s", ri.name);
-		expect_reg_fail(NULL, i, RAMON_REG_OP_READ, 0, name, ENXIO, RAMON_E_NOT_PRESENT,
+		snprintf(what, sizeof(what), "REG_IO on absent window %.32s", ri.name);
+		expect_reg_fail(NULL, i, RAMON_REG_OP_READ, 0, what, ENXIO, RAMON_E_NOT_PRESENT,
 				"not present");
 		break;
 	}
-	if (i == n)
+	if (i == n_regwin)
 		printf("      every window is present: NOT_PRESENT not exercised\n");
 
 	/* the SPFI command block (words 0..10) is written only by the driver (0.8.12) */
-	if (drv_has(8, 12) && win_present(RAMON_WIN_SPFI0)) {
+	if (drv_is_at_least(8, 12) && win_is_present(RAMON_WIN_SPFI0)) {
 		uint32_t v = 0;
 
 		expect_reg_fail("spfi0", 0, RAMON_REG_OP_WRITE, 0x24,
@@ -3147,11 +3167,11 @@ static void errors_regwin(uint32_t n)
  * Addresses, as one opener sees them: the DMA address of a fresh buffer, the
  * first present window's phys and channel 0's phys. 0 when there is none.
  */
-struct phys_seen {
-	uint64_t dma, win, chan;
+struct phys_addrs {
+	uint64_t buf_dma_addr, win_phys, chan_phys;
 };
 
-static void phys_probe(const struct ramon_get_info *gi, struct phys_seen *ps)
+static void read_phys_addrs(const struct ramon_get_info *gi, struct phys_addrs *ps)
 {
 	struct ramon_regwin_info ri;
 	struct ramon_buf_info bi;
@@ -3163,16 +3183,16 @@ static void phys_probe(const struct ramon_get_info *gi, struct phys_seen *ps)
 		memset(&bi, 0, sizeof(bi));
 		bi.handle = h;
 		if (!must(RAMON_IOC_BUF_INFO, &bi, &bi.st, "BUF_INFO"))
-			ps->dma = bi.dma_addr;
+			ps->buf_dma_addr = bi.dma_addr;
 		buf_free(h);
 	}
 	for (i = 0; i < gi->n_regwin; i++)
 		if (!regwin_info(i, &ri) && !(ri.flags & RAMON_REGWIN_ABSENT)) {
-			ps->win = ri.phys;
+			ps->win_phys = ri.phys;
 			break;
 		}
 	if (gi->n_axi_chan && !chan_info(0, &ci))
-		ps->chan = ci.phys;
+		ps->chan_phys = ci.phys;
 }
 
 /*
@@ -3184,17 +3204,18 @@ static void errors_phys(const struct ramon_get_info *gi)
 {
 	struct __user_cap_header_struct h = { _LINUX_CAPABILITY_VERSION_3, 0 };
 	struct __user_cap_data_struct d[_LINUX_CAPABILITY_U32S_3];
-	struct phys_seen ps;
+	struct phys_addrs ps;
 	int status;
 	pid_t pid;
 
-	if (!drv_has(8, 12))
+	if (!drv_is_at_least(8, 12))
 		return;
 	if (have_rawio()) {
-		phys_probe(gi, &ps);
-		if (!ps.dma || !ps.win || (gi->n_axi_chan && !ps.chan))
+		read_phys_addrs(gi, &ps);
+		if (!ps.buf_dma_addr || !ps.win_phys || (gi->n_axi_chan && !ps.chan_phys))
 			fail("with CAP_SYS_RAWIO: dma 0x%" PRIx64 " window 0x%" PRIx64
-			     " chan 0x%" PRIx64 ", all expected non-zero", ps.dma, ps.win, ps.chan);
+			     " chan 0x%" PRIx64 ", all expected non-zero", ps.buf_dma_addr,
+			     ps.win_phys, ps.chan_phys);
 		else
 			pass("with CAP_SYS_RAWIO: buffer, window and channel addresses reported");
 	}
@@ -3215,16 +3236,17 @@ static void errors_phys(const struct ramon_get_info *gi)
 			printf("      capset: %s\n", strerror(errno));
 			_exit(2);
 		}
-		close(fd);
-		fd = open(dev_path, O_RDWR);
-		if (fd < 0) {
+		close(dev_fd);
+		dev_fd = open(dev_path, O_RDWR);
+		if (dev_fd < 0) {
 			printf("      open %s without CAP_SYS_RAWIO: %s\n", dev_path, strerror(errno));
 			_exit(2);
 		}
-		phys_probe(gi, &ps);
-		if (ps.dma || ps.win || ps.chan) {
+		read_phys_addrs(gi, &ps);
+		if (ps.buf_dma_addr || ps.win_phys || ps.chan_phys) {
 			fail("without CAP_SYS_RAWIO: dma 0x%" PRIx64 " window 0x%" PRIx64
-			     " chan 0x%" PRIx64 ", all expected 0", ps.dma, ps.win, ps.chan);
+			     " chan 0x%" PRIx64 ", all expected 0", ps.buf_dma_addr, ps.win_phys,
+			     ps.chan_phys);
 			fflush(stdout);
 			_exit(1);
 		}
@@ -3309,11 +3331,11 @@ static void errors_axi_timeout(const struct ramon_get_info *gi)
 	if (!spw_loopback(0, 1)) {
 		spw_drain(&s);
 		memset(&it, 0, sizeof(it));
-		it.handle = s.scratch.h;
+		it.handle = s.scratch.handle;
 		it.len = page_size;
 		printf("      the next check terminates AXI ch%u, which resets its axi_dma IP\n",
-		       s.rx);
-		expect_axi_fail(s.rx, 1, (uintptr_t)&it, SPW_SHORT_WAIT_MS,
+		       s.rx_chan);
+		expect_axi_fail(s.rx_chan, 1, (uintptr_t)&it, IDLE_WAIT_MS,
 				"AXI_XFER RX with no traffic", ETIMEDOUT, RAMON_E_AXI_TIMEOUT,
 				"200 ms");
 		spw_loopback(0, s.saved_loopback ? 1 : 0);
@@ -3354,23 +3376,23 @@ static void errors_zdma(const struct ramon_get_info *gi)
 	if (mbuf_new(&a, 2 * page_size))
 		return;
 	memset(c, 0, sizeof(c));
-	c[0].src_handle = a.h;
-	c[0].dst_handle = a.h;
+	c[0].src_handle = a.handle;
+	c[0].dst_handle = a.handle;
 	c[0].dst_off = page_size;
-	c[0].len = ZDMA_SMALL;
+	c[0].len = ZDMA_SMALL_BYTES;
 	c[1] = c[0];
 	c[1].src_handle = BOGUS_HANDLE;
 	snprintf(want, sizeof(want), "buf %u", BOGUS_HANDLE);
-	memset(a.p, 0x33, ZDMA_SMALL);
-	memset(a.p + page_size, 0, ZDMA_SMALL);
+	memset(a.ptr, 0x33, ZDMA_SMALL_BYTES);
+	memset(a.ptr + page_size, 0, ZDMA_SMALL_BYTES);
 	expect_zdma_fail(c, 2, 0, "ZDMA_COPY list with a bad second entry", ENOENT,
 			 RAMON_E_NO_SUCH_HANDLE, want);
-	if (a.p[page_size])
+	if (a.ptr[page_size])
 		fail("ZDMA_COPY with an invalid entry copied the valid one");
 	else
 		pass("an invalid list copies nothing");
 	c[1] = c[0];
-	c[1].dst_off = 2 * page_size - ZDMA_SMALL / 2;
+	c[1].dst_off = 2 * page_size - ZDMA_SMALL_BYTES / 2;
 	expect_zdma_fail(c, 2, 0, "ZDMA_COPY dst past the buffer end", ERANGE,
 			 RAMON_E_BUF_RANGE, "zdma dst 1");
 	mbuf_del(&a);
@@ -3387,11 +3409,11 @@ static void errors_spw_waits(void)
 	if (!spw_loopback(0, 1)) {
 		spw_drain(&s);
 		memset(&w, 0, sizeof(w));
-		w.timeout_ms = SPW_SHORT_WAIT_MS;
+		w.timeout_ms = IDLE_WAIT_MS;
 		expect_fail(RAMON_IOC_SPW_WAIT_RX, &w, &w.st, "SPW_WAIT_RX idle", ETIMEDOUT,
 			    RAMON_E_SPW_TIMEOUT, "200 ms");
-		spw_cancel_check(0);
-		seen(RAMON_E_SPW_CANCELLED);
+		spw_check_cancel(0);
+		mark_code_produced(RAMON_E_SPW_CANCELLED);
 		spw_loopback(0, s.saved_loopback ? 1 : 0);
 	}
 	mbuf_del(&s.scratch);
@@ -3444,13 +3466,13 @@ static void errors_spfi_cmd_timeout(uint32_t nn)
 	c.opcode = RAMON_SPFI_OP_GET_ALL_STREAM_STATUS;
 	c.wait_ack = 1;
 	c.timeout_ms = 1;
-	err = ioctl(fd, RAMON_IOC_SPFI_CMD, &c) ? errno : 0;
+	err = ioctl(dev_fd, RAMON_IOC_SPFI_CMD, &c) ? errno : 0;
 	if (!err)
 		printf("      the NN answered within 1 ms: SPFI_CMD_TIMEOUT not exercised\n");
 	else if (err != ETIMEDOUT || c.st.code != RAMON_E_SPFI_CMD_TIMEOUT)
 		fail("SPFI_CMD 1 ms timeout: errno %d code %s", err, ramon_err_name(c.st.code));
 	else {
-		seen(c.st.code);
+		mark_code_produced(c.st.code);
 		pass("SPFI_CMD with a 1 ms timeout -> %s \"%s\"", ramon_err_name(c.st.code),
 		     c.st.msg);
 	}
@@ -3460,7 +3482,7 @@ static void errors_spfi_cmd_timeout(uint32_t nn)
 static void errors_spfi_read(uint32_t nn)
 {
 	struct ramon_spfi_read r;
-	uint32_t off[2] = { 0, 1 };
+	uint32_t pages[2] = { 0, 1 };
 	struct mbuf small;
 
 	memset(&r, 0, sizeof(r));
@@ -3470,11 +3492,11 @@ static void errors_spfi_read(uint32_t nn)
 	r.n_offsets = RAMON_SPFI_TX_OFFS_MAX / 4 + 1;
 	expect_fail(RAMON_IOC_SPFI_READ, &r, &r.st, "SPFI_READ too many offsets", EINVAL,
 		    RAMON_E_BAD_COUNT, "8193");
-	if (mbuf_new(&small, SPFI_PAGE))
+	if (mbuf_new(&small, SPFI_PAGE_BYTES))
 		return;
 	r.n_offsets = 2;
-	r.offsets = (uintptr_t)off;
-	r.dst_handle = small.h;
+	r.offsets = (uintptr_t)pages;
+	r.dst_handle = small.handle;
 	expect_fail(RAMON_IOC_SPFI_READ, &r, &r.st, "SPFI_READ into a 1-page buffer", ERANGE,
 		    RAMON_E_SPFI_DST_TOO_SMALL, "0x8000");
 	r.n_offsets = 1;
@@ -3489,30 +3511,30 @@ static void errors_spfi_read_timeout(uint32_t nn)
 {
 	uint8_t *tab = malloc(SPFI_TABLE_BYTES);
 	struct ramon_spfi_read r;
-	uint32_t s1, s2, off = 0;
+	uint32_t sid1, sid2, page = 0;
 	struct mbuf dst;
 	int err;
 
-	if (!tab || spfi_table(nn, tab) || spfi_free_streams(nn, tab, &s1, &s2) ||
-	    mbuf_new(&dst, SPFI_PAGE)) {
+	if (!tab || spfi_read_table(nn, tab) || spfi_find_free_sids(nn, tab, &sid1, &sid2) ||
+	    mbuf_new(&dst, SPFI_PAGE_BYTES)) {
 		free(tab);
 		return;
 	}
 	memset(&r, 0, sizeof(r));
 	r.nn = nn;
-	r.stream_id = s1;
+	r.stream_id = sid1;
 	r.n_offsets = 1;
-	r.offsets = (uintptr_t)&off;
-	r.dst_handle = dst.h;
+	r.offsets = (uintptr_t)&page;
+	r.dst_handle = dst.handle;
 	r.timeout_ms = 300;
-	err = ioctl(fd, RAMON_IOC_SPFI_READ, &r) ? errno : 0;
+	err = ioctl(dev_fd, RAMON_IOC_SPFI_READ, &r) ? errno : 0;
 	if (err == ETIMEDOUT && r.st.code == RAMON_E_SPFI_READ_TIMEOUT) {
-		seen(r.st.code);
-		pass("SPFI_READ of missing stream %u -> %s \"%s\"", s1,
+		mark_code_produced(r.st.code);
+		pass("SPFI_READ of missing stream %u -> %s \"%s\"", sid1,
 		     ramon_err_name(r.st.code), r.st.msg);
 	} else {
 		printf("      SPFI_READ of missing stream %u: errno %d %s \"%s\" (READ_TIMEOUT not exercised)\n",
-		       s1, err, ramon_err_name(r.st.code), r.st.msg);
+		       sid1, err, ramon_err_name(r.st.code), r.st.msg);
 	}
 	sleep_ms(500);
 	mbuf_del(&dst);
@@ -3526,7 +3548,7 @@ static void errors_spfi(const struct ramon_get_info *gi)
 	struct ramon_spfi_write w;
 	struct ramon_sg_item it;
 	uint8_t buf[8];
-	struct mbuf one;
+	struct mbuf page_buf;
 	uint32_t nn;
 
 	expect_spfi_cmd_fail(RAMON_NN_COUNT, RAMON_SPFI_OP_GET_ALL_STREAM_STATUS,
@@ -3561,10 +3583,10 @@ static void errors_spfi(const struct ramon_get_info *gi)
 		    ERANGE, RAMON_E_SPFI_OFFS_RANGE, "0x7ffc");
 	errors_spfi_read(nn);
 
-	if (!mbuf_new(&one, SPFI_PAGE)) {
+	if (!mbuf_new(&page_buf, SPFI_PAGE_BYTES)) {
 		memset(&it, 0, sizeof(it));
-		it.handle = one.h;
-		it.len = SPFI_PAGE;
+		it.handle = page_buf.handle;
+		it.len = SPFI_PAGE_BYTES;
 		memset(&w, 0, sizeof(w));
 		w.nn = nn;
 		w.chan = spfi_chan[nn];
@@ -3573,9 +3595,9 @@ static void errors_spfi(const struct ramon_get_info *gi)
 		w.items = (uintptr_t)&it;
 		expect_fail(RAMON_IOC_SPFI_WRITE, &w, &w.st, "SPFI_WRITE 1 page for 2 offsets",
 			    EINVAL, RAMON_E_INVAL_ARG, "tx_num_offset 2");
-		mbuf_del(&one);
+		mbuf_del(&page_buf);
 	}
-	if (spfi_link_up(nn)) {
+	if (spfi_link_is_up(nn)) {
 		errors_spfi_cmd_timeout(nn);
 		errors_spfi_read_timeout(nn);
 	}
@@ -3597,22 +3619,22 @@ static void errors_signal(const struct ramon_get_info *gi)
 		if (gi->spfi_mask & (1u << nn)) {
 			b.what = "SPFI_WAIT_ALERT";
 			b.req = RAMON_IOC_SPFI_WAIT_ALERT;
-			b.u.alert.nn = nn;
-			b.st = &b.u.alert.st;
+			b.arg.alert.nn = nn;
+			b.st = &b.arg.alert.st;
 			break;
 		}
 		if (gi->spw_mask & (1u << nn)) {
 			b.what = "SPW_WAIT_RX";
 			b.req = RAMON_IOC_SPW_WAIT_RX;
-			b.u.spw.nn = nn;
-			b.u.spw.timeout_ms = RAMON_TIMEOUT_MAX_MS;
-			b.st = &b.u.spw.st;
+			b.arg.spw.nn = nn;
+			b.arg.spw.timeout_ms = RAMON_TIMEOUT_MAX_MS;
+			b.st = &b.arg.spw.st;
 			break;
 		}
 	}
 	if (!b.req || pthread_create(&b.th, NULL, blocker_thread, &b))
 		return;
-	sleep_ms(CANCEL_AFTER_MS);
+	sleep_ms(WAITER_BLOCK_MS);
 	pthread_kill(b.th, SIGUSR1);
 	pthread_join(b.th, NULL);
 	if (!b.err)
@@ -3621,7 +3643,7 @@ static void errors_signal(const struct ramon_get_info *gi)
 		fail("%s + SIGUSR1: errno %d code %s, expected EINTR", b.what, b.err,
 		     ramon_err_name(b.st->code));
 	else {
-		seen(b.st->code);
+		mark_code_produced(b.st->code);
 		pass("%s interrupted by SIGUSR1 -> %s \"%s\"", b.what, ramon_err_name(b.st->code),
 		     b.st->msg);
 	}
@@ -3638,21 +3660,21 @@ static void errors_align(const struct ramon_get_info *gi)
 	if (!gi->n_zdma_chan || mbuf_new(&a, 2 * page_size))
 		return;
 	memset(&c, 0, sizeof(c));
-	c.src_handle = a.h;
-	c.dst_handle = a.h;
+	c.src_handle = a.handle;
+	c.dst_handle = a.handle;
 	c.src_off = 1;
 	c.dst_off = page_size;
-	c.len = ZDMA_SMALL;
+	c.len = ZDMA_SMALL_BYTES;
 	memset(&z, 0, sizeof(z));
 	z.n = 1;
 	z.entries = (uintptr_t)&c;
-	err = ioctl(fd, RAMON_IOC_ZDMA_COPY, &z) ? errno : 0;
+	err = ioctl(dev_fd, RAMON_IOC_ZDMA_COPY, &z) ? errno : 0;
 	if (!err)
 		printf("      ZDMA copies from odd addresses: NOT_ALIGNED not reachable here\n");
 	else if (err != EINVAL || z.st.code != RAMON_E_NOT_ALIGNED)
 		fail("ZDMA odd src: errno %d code %s", err, ramon_err_name(z.st.code));
 	else {
-		seen(z.st.code);
+		mark_code_produced(z.st.code);
 		pass("ZDMA odd src -> %s \"%s\"", ramon_err_name(z.st.code), z.st.msg);
 	}
 	mbuf_del(&a);
@@ -3669,7 +3691,7 @@ static void errors_coverage(void)
 		if (!ramon_err_lookup(code))
 			continue;
 		total++;
-		if (code_seen[code]) {
+		if (code_produced[code]) {
 			n++;
 			continue;
 		}
@@ -3757,7 +3779,7 @@ static const struct test tests[] = {
  * Prints the tool and driver versions; returns the driver step, or 0 if it
  * cannot be told (a 1.x driver passes every min_step).
  */
-static unsigned int driver_step(void)
+static unsigned int read_drv_version(void)
 {
 	struct ramon_get_info gi;
 
@@ -3805,7 +3827,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[a], "--minutes") && a + 1 < argc)
 			stress_minutes = strtoul(argv[++a], NULL, 0);
 		else if (!strcmp(argv[a], "--spfi-init"))
-			spfi_init_first = 1;
+			spfi_init_requested = 1;
 		else if (!strcmp(argv[a], "--spfi-stream") && a + 1 < argc)
 			spfi_first_stream = strtoul(argv[++a], NULL, 0);
 		else if (!strcmp(argv[a], "--spfi-pages") && a + 1 < argc)
@@ -3814,11 +3836,11 @@ int main(int argc, char **argv)
 			 sscanf(argv[a + 1], "%u,%u", &spfi_chan[0], &spfi_chan[1]) == 2)
 			a++;
 		else if (!strcmp(argv[a], "--format"))
-			spfi_format = 1;
+			spfi_format_requested = 1;
 		else if (!which)
 			which = argv[a];
-		else if (targc < (int)(sizeof(targv) / sizeof(targv[0])))
-			targv[targc++] = argv[a];
+		else if (test_argc < (int)(sizeof(test_argv) / sizeof(test_argv[0])))
+			test_argv[test_argc++] = argv[a];
 		else
 			usage(argv[0]);
 	}
@@ -3830,11 +3852,11 @@ int main(int argc, char **argv)
 			usage(argv[0]);
 	}
 
-	if (!spfi_pages || spfi_pages > SPFI_PAGES_MAX) {
-		fprintf(stderr, "--spfi-pages must be 1..%d\n", SPFI_PAGES_MAX);
+	if (!spfi_pages || spfi_pages > SPFI_MAX_WRITE_PAGES) {
+		fprintf(stderr, "--spfi-pages must be 1..%d\n", SPFI_MAX_WRITE_PAGES);
 		return 2;
 	}
-	crc_init();
+	crc32_init();
 	{
 		struct sigaction sa;
 
@@ -3847,13 +3869,13 @@ int main(int argc, char **argv)
 		page_shift++;
 	setvbuf(stdout, NULL, _IOLBF, 0);
 
-	fd = open(dev_path, O_RDWR);
-	if (fd < 0) {
+	dev_fd = open(dev_path, O_RDWR);
+	if (dev_fd < 0) {
 		fprintf(stderr, "open %s: %s\n", dev_path, strerror(errno));
 		return 1;
 	}
 
-	step = driver_step();
+	step = read_drv_version();
 	drv_step = step;
 	for (i = 0; i < N_TESTS; i++) {
 		if (which ? strcmp(which, tests[i].name) : !tests[i].in_default)
@@ -3868,7 +3890,7 @@ int main(int argc, char **argv)
 		tests[i].fn();
 	}
 
-	close(fd);
+	close(dev_fd);
 	printf("%s: %d failure(s)\n", failures ? "FAILED" : "PASSED", failures);
 	return failures ? 1 : 0;
 }
