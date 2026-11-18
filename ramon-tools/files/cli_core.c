@@ -45,7 +45,7 @@ static int cmd_reopen(struct cli *cl, int argc, char **argv)
 	(void)argc;
 	(void)argv;
 	cli_close_ctx(cl);
-	return cli_ctx(cl);
+	return cli_open_ctx(cl);
 }
 
 static int cmd_stats(struct cli *cl, int argc, char **argv)
@@ -54,7 +54,7 @@ static int cmd_stats(struct cli *cl, int argc, char **argv)
 	uint32_t reset, nn, i;
 	int ret;
 
-	ret = cli_opt_u32(cl, argc, argv, 1, 0, "reset", &reset);
+	ret = cli_parse_opt_u32(cl, argc, argv, 1, 0, "reset", &reset);
 	if (!ret)
 		ret = ramon_get_stats(cl->c, reset, &g, &cl->st);
 	if (ret)
@@ -79,7 +79,7 @@ static int cmd_stats(struct cli *cl, int argc, char **argv)
 	return 0;
 }
 
-static const char *chan_dir(uint32_t dir)
+static const char *dir_name(uint32_t dir)
 {
 	return dir == RAMON_DIR_MEM_TO_DEV ? "MEM_TO_DEV" :
 	       dir == RAMON_DIR_DEV_TO_MEM ? "DEV_TO_MEM" : "MEMCPY";
@@ -101,53 +101,53 @@ static int cmd_chan(struct cli *cl, int argc, char **argv)
 		ci.name[RAMON_NAME_LEN - 1] = 0;
 		if (ci.type == RAMON_CHAN_AXI)
 			printf("      %2u AXI  %-10s device-id %u  axi_dma 0x%llx  %s\n", i,
-			       chan_dir(ci.dir), ci.device_id, (unsigned long long)ci.phys, ci.name);
+			       dir_name(ci.dir), ci.device_id, (unsigned long long)ci.phys, ci.name);
 		else
-			printf("      %2u ZDMA %-10s %s\n", i, chan_dir(ci.dir), ci.name);
+			printf("      %2u ZDMA %-10s %s\n", i, dir_name(ci.dir), ci.name);
 	}
 	return 0;
 }
 
 /* ---- registers ---- */
 
-int cli_regio(struct cli *cl, const char *win, uint32_t index, int by_index, uint32_t off,
-	      int write, uint32_t val)
+int cli_access_reg(struct cli *cl, const char *win, uint32_t win_index, int by_index, uint32_t off,
+		   int do_write, uint32_t val)
 {
 	char label[48];
-	uint32_t v;
+	uint32_t readback;
 	int ret;
 
 	if (by_index)
-		snprintf(label, sizeof(label), "window %u", index);
+		snprintf(label, sizeof(label), "window %u", win_index);
 	else
 		snprintf(label, sizeof(label), "%s", win);
-	if (write) {
-		ret = by_index ? ramon_reg_write_idx(cl->c, index, off, val, &cl->st) :
+	if (do_write) {
+		ret = by_index ? ramon_reg_write_idx(cl->c, win_index, off, val, &cl->st) :
 				 ramon_reg_write(cl->c, win, off, val, &cl->st);
 		if (ret)
 			return ret;
 		printf("      %s+0x%x <- 0x%08x\n", label, off, val);
 	}
-	ret = by_index ? ramon_reg_read_idx(cl->c, index, off, &v, &cl->st) :
-			 ramon_reg_read(cl->c, win, off, &v, &cl->st);
+	ret = by_index ? ramon_reg_read_idx(cl->c, win_index, off, &readback, &cl->st) :
+			 ramon_reg_read(cl->c, win, off, &readback, &cl->st);
 	if (!ret)
-		printf("      %s+0x%x = 0x%08x (%u)\n", label, off, v, v);
+		printf("      %s+0x%x = 0x%08x (%u)\n", label, off, readback, readback);
 	return ret;
 }
 
 /* argv[i] = offset, argv[i + 1] = optional value */
-static int regio_args(struct cli *cl, int argc, char **argv, int i, const char *win, uint32_t index,
-		      int by_index)
+static int access_reg_from_args(struct cli *cl, int argc, char **argv, int i, const char *win,
+				uint32_t win_index, int by_index)
 {
 	uint32_t off, val = 0;
 	int ret;
 
-	ret = cli_u32(cl, argv[i], "offset", &off);
+	ret = cli_parse_u32(cl, argv[i], "offset", &off);
 	if (!ret && i + 1 < argc)
-		ret = cli_u32(cl, argv[i + 1], "value", &val);
+		ret = cli_parse_u32(cl, argv[i + 1], "value", &val);
 	if (ret)
 		return ret;
-	return cli_regio(cl, win, index, by_index, off, i + 1 < argc, val);
+	return cli_access_reg(cl, win, win_index, by_index, off, i + 1 < argc, val);
 }
 
 static int cmd_regio(struct cli *cl, int argc, char **argv)
@@ -156,28 +156,28 @@ static int cmd_regio(struct cli *cl, int argc, char **argv)
 	int ret;
 
 	if (isdigit((unsigned char)argv[1][0])) {
-		ret = cli_u32(cl, argv[1], "window index", &index);
-		return ret ? ret : regio_args(cl, argc, argv, 2, NULL, index, 1);
+		ret = cli_parse_u32(cl, argv[1], "window index", &index);
+		return ret ? ret : access_reg_from_args(cl, argc, argv, 2, NULL, index, 1);
 	}
-	return regio_args(cl, argc, argv, 2, argv[1], 0, 0);
+	return access_reg_from_args(cl, argc, argv, 2, argv[1], 0, 0);
 }
 
 static int cmd_rstopregio(struct cli *cl, int argc, char **argv)
 {
-	return regio_args(cl, argc, argv, 1, "rs_top", 0, 0);
+	return access_reg_from_args(cl, argc, argv, 1, "rs_top", 0, 0);
 }
 
 static int cmd_regaccessio(struct cli *cl, int argc, char **argv)
 {
 	uint32_t i;
-	int ret = cli_u32(cl, argv[1], "reg-access index", &i);
+	int ret = cli_parse_u32(cl, argv[1], "reg-access index", &i);
 
-	return ret ? ret : regio_args(cl, argc, argv, 2, NULL, RAMON_WIN_FIXED + i, 1);
+	return ret ? ret : access_reg_from_args(cl, argc, argv, 2, NULL, RAMON_WIN_FIXED + i, 1);
 }
 
 static int cmd_regaccessioname(struct cli *cl, int argc, char **argv)
 {
-	return regio_args(cl, argc, argv, 2, argv[1], 0, 0);
+	return access_reg_from_args(cl, argc, argv, 2, argv[1], 0, 0);
 }
 
 static int cmd_regwins(struct cli *cl, int argc, char **argv)
@@ -262,9 +262,9 @@ static int cmd_rtcttc(struct cli *cl, int argc, char **argv)
 	uint32_t ttc, rtc, v;
 	int ret;
 
-	ret = cli_opt_u32(cl, argc, argv, 1, 0, "ttc", &ttc);
+	ret = cli_parse_opt_u32(cl, argc, argv, 1, 0, "ttc", &ttc);
 	if (!ret && ttc >= RAMON_TTC_COUNT)
-		ret = cli_err(cl, EINVAL, "ttc must be 0..%u", RAMON_TTC_COUNT - 1);
+		ret = cli_set_err(cl, EINVAL, "ttc must be 0..%u", RAMON_TTC_COUNT - 1);
 	if (!ret)
 		ret = ramon_reg_read(cl->c, "rtc", 0x10, &rtc, &cl->st);
 	snprintf(win, sizeof(win), "ttc%u", ttc);
@@ -284,9 +284,9 @@ static int cmd_alloc(struct cli *cl, int argc, char **argv)
 	uint32_t count, n = 0, i;
 	int ret;
 
-	ret = cli_u64(cl, argv[1], "size", &size);
+	ret = cli_parse_u64(cl, argv[1], "size", &size);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 2, 1, "count", &count);
+		ret = cli_parse_opt_u32(cl, argc, argv, 2, 1, "count", &count);
 	if (ret)
 		return ret;
 	for (i = 0; i < CLI_SLOTS && n < count; i++) {
@@ -301,8 +301,8 @@ static int cmd_alloc(struct cli *cl, int argc, char **argv)
 		n++;
 	}
 	if (n < count)
-		return cli_err(cl, ENOSPC, "only %u of %u allocated: all %u slots in use", n, count,
-			       CLI_SLOTS);
+		return cli_set_err(cl, ENOSPC, "only %u of %u allocated: all %u slots in use", n,
+				   count, CLI_SLOTS);
 	return 0;
 }
 
@@ -318,7 +318,7 @@ static int cmd_free(struct cli *cl, int argc, char **argv)
 			ramon_buf_free(&cl->slot[i], NULL);
 		return 0;
 	}
-	ret = cli_slot(cl, argv[1], &b);
+	ret = cli_parse_slot(cl, argv[1], &b);
 	return ret ? ret : ramon_buf_free(b, &cl->st);
 }
 
@@ -337,24 +337,24 @@ static int cmd_bufinfo(struct cli *cl, int argc, char **argv)
 		       (unsigned long long)cl->slot[i].size, (unsigned long long)dma);
 		n++;
 	}
-	printf("      %u slot(s) in use; CmaFree %ld kB\n", n, tc_meminfo_kb("CmaFree"));
+	printf("      %u slot(s) in use; CmaFree %ld kB\n", n, tc_read_meminfo_kb("CmaFree"));
 	return 0;
 }
 
 /* <slot> [seed] [len] */
-static int slot_seed_len(struct cli *cl, int argc, char **argv, ramon_buf **b, uint32_t *seed,
-			 uint64_t *len)
+static int parse_slot_seed_len(struct cli *cl, int argc, char **argv, ramon_buf **b, uint32_t *seed,
+			       uint64_t *len)
 {
-	int ret = cli_slot(cl, argv[1], b);
+	int ret = cli_parse_slot(cl, argv[1], b);
 
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 2, 0, "seed", seed);
+		ret = cli_parse_opt_u32(cl, argc, argv, 2, 0, "seed", seed);
 	*len = ret ? 0 : (*b)->size;
 	if (!ret && argc > 3)
-		ret = cli_u64(cl, argv[3], "len", len);
+		ret = cli_parse_u64(cl, argv[3], "len", len);
 	if (!ret && *len > (*b)->size)
-		ret = cli_err(cl, ERANGE, "len %llu > buffer size %llu", (unsigned long long)*len,
-			      (unsigned long long)(*b)->size);
+		ret = cli_set_err(cl, ERANGE, "len %llu > buffer size %llu",
+				  (unsigned long long)*len, (unsigned long long)(*b)->size);
 	return ret;
 }
 
@@ -363,7 +363,7 @@ static int cmd_fill(struct cli *cl, int argc, char **argv)
 	ramon_buf *b;
 	uint32_t seed;
 	uint64_t len;
-	int ret = slot_seed_len(cl, argc, argv, &b, &seed, &len);
+	int ret = parse_slot_seed_len(cl, argc, argv, &b, &seed, &len);
 
 	if (!ret)
 		tc_fill(b->ptr, len, seed);
@@ -376,13 +376,13 @@ static int cmd_verify(struct cli *cl, int argc, char **argv)
 	uint32_t seed;
 	uint64_t len;
 	long bad;
-	int ret = slot_seed_len(cl, argc, argv, &b, &seed, &len);
+	int ret = parse_slot_seed_len(cl, argc, argv, &b, &seed, &len);
 
 	if (ret)
 		return ret;
-	bad = tc_verify(b->ptr, len, seed);
+	bad = tc_find_mismatch(b->ptr, len, seed);
 	if (bad >= 0)
-		return cli_err(cl, EIO, "pattern %#x differs at byte %ld", seed, bad);
+		return cli_set_err(cl, EIO, "pattern %#x differs at byte %ld", seed, bad);
 	printf("      %llu bytes match pattern %#x\n", (unsigned long long)len, seed);
 	return 0;
 }
@@ -391,14 +391,14 @@ static int cmd_dump(struct cli *cl, int argc, char **argv)
 {
 	ramon_buf *b;
 	uint64_t off = 0, len = 256;
-	int ret = cli_slot(cl, argv[1], &b);
+	int ret = cli_parse_slot(cl, argv[1], &b);
 
 	if (!ret && argc > 2)
-		ret = cli_u64(cl, argv[2], "offset", &off);
+		ret = cli_parse_u64(cl, argv[2], "offset", &off);
 	if (!ret && argc > 3)
-		ret = cli_u64(cl, argv[3], "len", &len);
+		ret = cli_parse_u64(cl, argv[3], "len", &len);
 	if (!ret && off >= b->size)
-		ret = cli_err(cl, ERANGE, "offset beyond the buffer");
+		ret = cli_set_err(cl, ERANGE, "offset beyond the buffer");
 	if (ret)
 		return ret;
 	if (len > b->size - off)
@@ -410,64 +410,65 @@ static int cmd_dump(struct cli *cl, int argc, char **argv)
 static int cmd_zdma(struct cli *cl, int argc, char **argv)
 {
 	ramon_buf *src, *dst;
-	uint64_t len, t0, ns;
+	uint64_t len, t0, elapsed_ns;
 	uint32_t count, i;
 	long bad;
 	int ret;
 
-	ret = cli_slot(cl, argv[1], &src);
+	ret = cli_parse_slot(cl, argv[1], &src);
 	if (!ret)
-		ret = cli_slot(cl, argv[2], &dst);
+		ret = cli_parse_slot(cl, argv[2], &dst);
 	if (ret)
 		return ret;
 	len = src->size < dst->size ? src->size : dst->size;
 	if (argc > 3)
-		ret = cli_u64(cl, argv[3], "len", &len);
+		ret = cli_parse_u64(cl, argv[3], "len", &len);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 4, 1, "count", &count);
+		ret = cli_parse_opt_u32(cl, argc, argv, 4, 1, "count", &count);
 	if (!ret && (len > src->size || len > dst->size))
-		ret = cli_err(cl, ERANGE, "len larger than a buffer");
+		ret = cli_set_err(cl, ERANGE, "len larger than a buffer");
 	if (ret)
 		return ret;
 	tc_fill(src->ptr, len, ZDMA_SEED);
 	memset(dst->ptr, 0, len);
 	t0 = tc_now_ns();
-	for (i = 0; i < count && !cli_intr(); i++) {
+	for (i = 0; i < count && !cli_is_interrupted(); i++) {
 		ret = ramon_zdma_copy1(cl->c, src, 0, dst, 0, len, 0, &cl->st);
 		if (ret)
 			return ret;
 	}
-	ns = tc_now_ns() - t0;
-	bad = tc_verify(dst->ptr, len, ZDMA_SEED);
+	elapsed_ns = tc_now_ns() - t0;
+	bad = tc_find_mismatch(dst->ptr, len, ZDMA_SEED);
 	printf("      %u copies of %llu bytes, %.1f MiB/s\n", i, (unsigned long long)len,
-	       tc_mibps(len * i, ns));
+	       tc_mibps(len * i, elapsed_ns));
 	if (bad >= 0)
-		return cli_err(cl, EIO, "destination differs at byte %ld", bad);
+		return cli_set_err(cl, EIO, "destination differs at byte %ld", bad);
 	return 0;
 }
 
 static int cmd_zdmalist(struct cli *cl, int argc, char **argv)
 {
-	struct ramon_copy *e = NULL;
+	struct ramon_copy *entries = NULL;
 	ramon_buf src, dst;
-	uint64_t size, t0, ns;
+	uint64_t size, t0, elapsed_ns;
 	uint32_t n, count, i, done;
 	int ret;
 
 	memset(&src, 0, sizeof(src));
 	memset(&dst, 0, sizeof(dst));
-	ret = cli_u32(cl, argv[1], "n", &n);
+	ret = cli_parse_u32(cl, argv[1], "n", &n);
 	if (!ret)
-		ret = cli_u64(cl, argv[2], "size", &size);
+		ret = cli_parse_u64(cl, argv[2], "size", &size);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 3, 1, "count", &count);
+		ret = cli_parse_opt_u32(cl, argc, argv, 3, 1, "count", &count);
 	if (!ret && (!n || n > RAMON_ZDMA_MAX_COPIES || !size))
-		ret = cli_err(cl, EINVAL, "n must be 1..%u and size > 0", RAMON_ZDMA_MAX_COPIES);
+		ret = cli_set_err(cl, EINVAL, "n must be 1..%u and size > 0",
+				  RAMON_ZDMA_MAX_COPIES);
 	if (ret)
 		return ret;
-	e = calloc(n, sizeof(*e));
-	if (!e)
-		return cli_err(cl, ENOMEM, "out of memory");
+	entries = calloc(n, sizeof(*entries));
+	if (!entries)
+		return cli_set_err(cl, ENOMEM, "out of memory");
 	ret = ramon_buf_alloc(cl->c, n * size, 0, &src, &cl->st);
 	if (!ret)
 		ret = ramon_buf_alloc(cl->c, n * size, 0, &dst, &cl->st);
@@ -475,55 +476,55 @@ static int cmd_zdmalist(struct cli *cl, int argc, char **argv)
 		goto out;
 	/* entry i copies chunk i to chunk n-1-i */
 	for (i = 0; i < n; i++) {
-		e[i].src_handle = src.handle;
-		e[i].dst_handle = dst.handle;
-		e[i].src_off = i * size;
-		e[i].dst_off = (n - 1 - i) * size;
-		e[i].len = size;
+		entries[i].src_handle = src.handle;
+		entries[i].dst_handle = dst.handle;
+		entries[i].src_off = i * size;
+		entries[i].dst_off = (n - 1 - i) * size;
+		entries[i].len = size;
 	}
 	tc_fill(src.ptr, n * size, ZDMA_SEED);
 	memset(dst.ptr, 0, n * size);
 	t0 = tc_now_ns();
-	for (i = 0; i < count && !ret && !cli_intr(); i++)
-		ret = ramon_zdma_copy(cl->c, e, n, 0, &done, &cl->st);
-	ns = tc_now_ns() - t0;
+	for (i = 0; i < count && !ret && !cli_is_interrupted(); i++)
+		ret = ramon_zdma_copy(cl->c, entries, n, 0, &done, &cl->st);
+	elapsed_ns = tc_now_ns() - t0;
 	if (ret)
 		goto out;
 	for (i = 0; i < n; i++)
 		if (memcmp((uint8_t *)dst.ptr + (n - 1 - i) * size, (uint8_t *)src.ptr + i * size,
 			   size)) {
-			ret = cli_err(cl, EIO, "entry %u copied wrongly", i);
+			ret = cli_set_err(cl, EIO, "entry %u copied wrongly", i);
 			goto out;
 		}
 	printf("      %u lists of %u x %llu bytes, %.1f MiB/s\n", count, n,
-	       (unsigned long long)size, tc_mibps(n * size * count, ns));
+	       (unsigned long long)size, tc_mibps(n * size * count, elapsed_ns));
 out:
 	ramon_buf_free(&src, NULL);
 	ramon_buf_free(&dst, NULL);
-	free(e);
+	free(entries);
 	return ret;
 }
 
 static int cmd_axiraw(struct cli *cl, int argc, char **argv)
 {
-	uint32_t chan, timeout;
+	uint32_t chan, timeout_ms;
 	uint64_t off, len, t0;
 	ramon_buf *b;
 	int ret;
 
-	ret = cli_u32(cl, argv[1], "chan", &chan);
+	ret = cli_parse_u32(cl, argv[1], "chan", &chan);
 	if (!ret)
-		ret = cli_slot(cl, argv[2], &b);
+		ret = cli_parse_slot(cl, argv[2], &b);
 	if (!ret)
-		ret = cli_u64(cl, argv[3], "offset", &off);
+		ret = cli_parse_u64(cl, argv[3], "offset", &off);
 	if (!ret)
-		ret = cli_u64(cl, argv[4], "len", &len);
+		ret = cli_parse_u64(cl, argv[4], "len", &len);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 5, 0, "timeout_ms", &timeout);
+		ret = cli_parse_opt_u32(cl, argc, argv, 5, 0, "timeout_ms", &timeout_ms);
 	if (ret)
 		return ret;
 	t0 = tc_now_ns();
-	ret = ramon_axi_xfer1(cl->c, chan, b, off, len, timeout, &cl->st);
+	ret = ramon_axi_xfer1(cl->c, chan, b, off, len, timeout_ms, &cl->st);
 	if (!ret)
 		printf("      %llu bytes on channel %u in %.3f ms\n", (unsigned long long)len, chan,
 		       tc_ms_since(t0));

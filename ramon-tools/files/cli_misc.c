@@ -12,12 +12,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define LATTICE_SPI	"/dev/spidev2.0"
-#define LATTICE_HZ	10000000u
-#define LATTICE_FRAME	8
-#define FWUPDATE_TOOL	"/apps/fwupdate/fwupdate"
-#define SCRUB_SCRIPT	"/home/root/scrubbing/Scrubbing-tests4.sh"
-#define SCRUB_MAX	1024
+#define LATTICE_SPI_DEV		"/dev/spidev2.0"
+#define LATTICE_HZ		10000000u
+#define LATTICE_FRAME_BYTES	8
+#define FWUPDATE_TOOL		"/apps/fwupdate/fwupdate"
+#define SCRUB_SCRIPT		"/home/root/scrubbing/Scrubbing-tests4.sh"
+#define SCRUB_MAX_BLOCKS	1024
 
 static int cmd_meminfo(struct cli *cl, int argc, char **argv)
 {
@@ -30,7 +30,7 @@ static int cmd_meminfo(struct cli *cl, int argc, char **argv)
 	(void)argc;
 	(void)argv;
 	for (i = 0; i < ARRAY_SIZE(keys); i++)
-		printf("      %-13s %ld kB\n", keys[i], tc_meminfo_kb(keys[i]));
+		printf("      %-13s %ld kB\n", keys[i], tc_read_meminfo_kb(keys[i]));
 	return 0;
 }
 
@@ -43,11 +43,11 @@ static int cmd_devtree(struct cli *cl, int argc, char **argv)
 
 	(void)argc;
 	if (strchr(argv[1], '/'))
-		return cli_err(cl, EINVAL, "a symbol name, not a path");
+		return cli_set_err(cl, EINVAL, "a symbol name, not a path");
 	snprintf(path, sizeof(path), "/proc/device-tree/__symbols__/%s", argv[1]);
 	ret = tc_read_line(path, node, sizeof(node));
 	if (ret)
-		return cli_err(cl, -ret, "%s: %s", path, strerror(-ret));
+		return cli_set_err(cl, -ret, "%s: %s", path, strerror(-ret));
 	printf("      %s -> %s\n", argv[1], node);
 	snprintf(path, sizeof(path), "/proc/device-tree%s/reg", node);
 	if (!tc_read_file(path, &reg, &len, 4096)) {
@@ -62,32 +62,33 @@ static int cmd_devtree(struct cli *cl, int argc, char **argv)
 }
 
 /* one 8-byte full-duplex frame to the Lattice FPGA (mode 0, 8 bits, 10 MHz) */
-static int lattice_xfer(struct cli *cl, const uint8_t tx[LATTICE_FRAME], uint8_t rx[LATTICE_FRAME])
+static int lattice_xfer(struct cli *cl, const uint8_t tx[LATTICE_FRAME_BYTES],
+			uint8_t rx[LATTICE_FRAME_BYTES])
 {
 	struct spi_ioc_transfer t;
 	uint32_t speed = LATTICE_HZ;
 	uint8_t mode = SPI_MODE_0, bits = 8;
 	int fd, ret = 0;
 
-	fd = open(LATTICE_SPI, O_RDWR | O_CLOEXEC);
+	fd = open(LATTICE_SPI_DEV, O_RDWR | O_CLOEXEC);
 	if (fd < 0)
-		return cli_err(cl, errno, "%s: %s", LATTICE_SPI, strerror(errno));
+		return cli_set_err(cl, errno, "%s: %s", LATTICE_SPI_DEV, strerror(errno));
 	memset(&t, 0, sizeof(t));
 	t.tx_buf = (uintptr_t)tx;
 	t.rx_buf = (uintptr_t)rx;
-	t.len = LATTICE_FRAME;
+	t.len = LATTICE_FRAME_BYTES;
 	t.speed_hz = speed;
 	t.bits_per_word = bits;
 	if (ioctl(fd, SPI_IOC_WR_MODE, &mode) < 0 || ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0 ||
 	    ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0 || ioctl(fd, SPI_IOC_MESSAGE(1), &t) < 0)
-		ret = cli_err(cl, errno, "%s: %s", LATTICE_SPI, strerror(errno));
+		ret = cli_set_err(cl, errno, "%s: %s", LATTICE_SPI_DEV, strerror(errno));
 	close(fd);
 	return ret;
 }
 
 static int cmd_rdlatver(struct cli *cl, int argc, char **argv)
 {
-	uint8_t tx[LATTICE_FRAME] = { 0 }, rx[LATTICE_FRAME] = { 0 };
+	uint8_t tx[LATTICE_FRAME_BYTES] = { 0 }, rx[LATTICE_FRAME_BYTES] = { 0 };
 	int ret;
 
 	(void)argc;
@@ -100,14 +101,14 @@ static int cmd_rdlatver(struct cli *cl, int argc, char **argv)
 
 static int cmd_wrlatreg(struct cli *cl, int argc, char **argv)
 {
-	uint8_t tx[LATTICE_FRAME] = { 0x01, 0, 0, 0, 0x04, 0, 0, 0 }, rx[LATTICE_FRAME];
+	uint8_t tx[LATTICE_FRAME_BYTES] = { 0x01, 0, 0, 0, 0x04, 0, 0, 0 }, rx[LATTICE_FRAME_BYTES];
 	uint32_t v;
 	int ret;
 
 	(void)argc;
-	ret = cli_u32(cl, argv[1], "value", &v);
+	ret = cli_parse_u32(cl, argv[1], "value", &v);
 	if (!ret && v > 0xFFFF)
-		ret = cli_err(cl, EINVAL, "the test register is 16 bits");
+		ret = cli_set_err(cl, EINVAL, "the test register is 16 bits");
 	if (ret)
 		return ret;
 	tx[5] = (uint8_t)(v >> 8);
@@ -117,7 +118,8 @@ static int cmd_wrlatreg(struct cli *cl, int argc, char **argv)
 
 static int cmd_rdlatreg(struct cli *cl, int argc, char **argv)
 {
-	uint8_t tx[LATTICE_FRAME] = { 0x00, 0, 0, 0, 0x04, 0, 0, 0 }, rx[LATTICE_FRAME] = { 0 };
+	uint8_t tx[LATTICE_FRAME_BYTES] = { 0x00, 0, 0, 0, 0x04, 0, 0, 0 },
+		rx[LATTICE_FRAME_BYTES] = { 0 };
 	int ret;
 
 	(void)argc;
@@ -137,7 +139,7 @@ static int run_tool(struct cli *cl, char *const args[])
 	fflush(stdout);
 	pid = fork();
 	if (pid < 0)
-		return cli_err(cl, errno, "fork: %s", strerror(errno));
+		return cli_set_err(cl, errno, "fork: %s", strerror(errno));
 	if (!pid) {
 		execv(args[0], args);
 		fprintf(stderr, "%s: %s\n", args[0], strerror(errno));
@@ -145,11 +147,12 @@ static int run_tool(struct cli *cl, char *const args[])
 	}
 	while (waitpid(pid, &status, 0) < 0)
 		if (errno != EINTR)
-			return cli_err(cl, errno, "waitpid: %s", strerror(errno));
+			return cli_set_err(cl, errno, "waitpid: %s", strerror(errno));
 	if (!WIFEXITED(status))
-		return cli_err(cl, EIO, "%s did not exit normally", args[0]);
+		return cli_set_err(cl, EIO, "%s did not exit normally", args[0]);
 	if (WEXITSTATUS(status))
-		return cli_err(cl, EIO, "%s exited with status %d", args[0], WEXITSTATUS(status));
+		return cli_set_err(cl, EIO, "%s exited with status %d", args[0],
+				   WEXITSTATUS(status));
 	return 0;
 }
 
@@ -159,31 +162,32 @@ static int cmd_fwupdate(struct cli *cl, int argc, char **argv)
 
 	(void)argc;
 	if (access(argv[1], R_OK))
-		return cli_err(cl, errno, "%s: %s", argv[1], strerror(errno));
+		return cli_set_err(cl, errno, "%s: %s", argv[1], strerror(errno));
 	return run_tool(cl, args);
 }
 
 static int cmd_scrubtest(struct cli *cl, int argc, char **argv)
 {
-	char n_str[16];
-	char *args[] = { (char *)SCRUB_SCRIPT, n_str, NULL };
-	uint32_t n;
+	char blocks_arg[16];
+	char *args[] = { (char *)SCRUB_SCRIPT, blocks_arg, NULL };
+	uint32_t n_blocks;
 	int ret;
 
 	(void)argc;
-	ret = cli_u32(cl, argv[1], "blocks", &n);
-	if (!ret && (!n || n > SCRUB_MAX))
-		ret = cli_err(cl, EINVAL, "blocks must be 1..%u", SCRUB_MAX);
+	ret = cli_parse_u32(cl, argv[1], "blocks", &n_blocks);
+	if (!ret && (!n_blocks || n_blocks > SCRUB_MAX_BLOCKS))
+		ret = cli_set_err(cl, EINVAL, "blocks must be 1..%u", SCRUB_MAX_BLOCKS);
 	if (ret)
 		return ret;
-	snprintf(n_str, sizeof(n_str), "%u", n);
+	snprintf(blocks_arg, sizeof(blocks_arg), "%u", n_blocks);
 	return run_tool(cl, args);
 }
 
 const struct cli_cmd cli_misc_cmds[] = {
 	{ "meminfo", cmd_meminfo, 0, 0, CMD_NO_DEV, "", "memory and CMA from /proc/meminfo" },
 	{ "devtree", cmd_devtree, 1, 1, CMD_NO_DEV, "<symbol>", "device-tree node and reg of a label" },
-	{ "rdlatver", cmd_rdlatver, 0, 0, CMD_NO_DEV, "", "Lattice FPGA version over " LATTICE_SPI },
+	{ "rdlatver", cmd_rdlatver, 0, 0, CMD_NO_DEV, "",
+	  "Lattice FPGA version over " LATTICE_SPI_DEV },
 	{ "wrlatreg", cmd_wrlatreg, 1, 1, CMD_NO_DEV, "<val>", "write the Lattice test register" },
 	{ "rdlatreg", cmd_rdlatreg, 0, 0, CMD_NO_DEV, "", "read the Lattice test register" },
 	{ "fwupdate", cmd_fwupdate, 1, 1, CMD_NO_DEV | CMD_DESTRUCTIVE, "<file>",

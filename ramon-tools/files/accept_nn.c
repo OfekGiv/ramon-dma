@@ -18,8 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define UPDATE_MAX	(0xFFFFull * RAMON_SPW_SWUP_CHUNK)	/* the packet index is 16 bits */
-#define PROGRESS_STEPS	10
+/* the packet index is 16 bits */
+#define UPDATE_MAX_BYTES	(0xFFFFull * RAMON_SPW_SWUP_CHUNK)
+#define PROGRESS_LINES		10
 
 /* the file for NN nn, or NULL */
 static const char *file_for(const char *const per_nn[RAMON_NN_COUNT], const char *all, uint32_t nn)
@@ -29,14 +30,14 @@ static const char *file_for(const char *const per_nn[RAMON_NN_COUNT], const char
 
 /* NNs with a file; an NN named in NN=FILE must be tested (its link synced) */
 static uint32_t nns_with_file(const char *const per_nn[RAMON_NN_COUNT], const char *all,
-			      uint32_t use)
+			      uint32_t test_mask)
 {
 	uint32_t nn, mask = 0;
 
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
-		if (per_nn[nn] && !(use & (1u << nn)))
+		if (per_nn[nn] && !(test_mask & (1u << nn)))
 			tc_fail("spw%u: a file is given for this NN but its link is not synced", nn);
-		else if ((use & (1u << nn)) && file_for(per_nn, all, nn))
+		else if ((test_mask & (1u << nn)) && file_for(per_nn, all, nn))
 			mask |= 1u << nn;
 	}
 	return mask;
@@ -48,15 +49,16 @@ static void step_nn_version(void)
 {
 	struct ramon_nn_version v;
 	struct ramon_status st;
-	char sum[160] = "";
+	char summary[160] = "";
 	size_t used = 0;
-	uint32_t use, nn;
+	uint32_t test_mask, nn;
 
-	use = a_spw_setup();
+	test_mask = a_spw_setup();
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
-		if (!(use & (1u << nn)))
+		if (!(test_mask & (1u << nn)))
 			continue;
-		if (a_check(ramon_spw_nn_version(A.c, nn, &v, 0, &st), "NN version request", &st))
+		if (a_check(ramon_spw_nn_version(a_env.c, nn, &v, 0, &st), "NN version request",
+			    &st))
 			continue;
 		tc_info("spw%u: 4KBL version:  %s", nn, v.kbl);
 		tc_info("spw%u: RSBL version:  %s", nn, v.rsbl);
@@ -64,16 +66,17 @@ static void step_nn_version(void)
 		tc_info("spw%u: FW version:    %s", nn, v.fw);
 		if (!v.image[0] && !v.kbl[0] && !v.rsbl[0] && !v.fw[0])
 			tc_fail("spw%u: the NN answered with empty version strings", nn);
-		if (A.o.nn_expect && !strstr(v.image, A.o.nn_expect))
+		if (a_env.opts.nn_expect && !strstr(v.image, a_env.opts.nn_expect))
 			tc_fail("spw%u: image version \"%s\" does not contain \"%s\" (--nn-expect)", nn,
-				v.image, A.o.nn_expect);
-		if (used < sizeof(sum))
-			used += (size_t)snprintf(sum + used, sizeof(sum) - used, "%sspw%u image %s",
-						 used ? ", " : "", nn, v.image[0] ? v.image : "(empty)");
+				v.image, a_env.opts.nn_expect);
+		if (used < sizeof(summary))
+			used += (size_t)snprintf(summary + used, sizeof(summary) - used,
+						 "%sspw%u image %s", used ? ", " : "", nn,
+						 v.image[0] ? v.image : "(empty)");
 	}
-	if (use && !A.o.nn_expect)
+	if (test_mask && !a_env.opts.nn_expect)
 		tc_info("not compared: pass --nn-expect to check the image version");
-	a_summary("%s", sum[0] ? sum : "no NN answered");
+	a_set_summary("%s", summary[0] ? summary : "no NN answered");
 }
 
 /* ---- nn-config (was nnconf) ---- */
@@ -83,15 +86,15 @@ static int want_config(void)
 	unsigned nn;
 
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++)
-		if (A.o.nn_config[nn])
+		if (a_env.opts.nn_config[nn])
 			return 1;
-	return A.o.nn_config_all != NULL;
+	return a_env.opts.nn_config_all != NULL;
 }
 
 static void step_nn_config(void)
 {
 	struct ramon_status st;
-	uint32_t use, nn, done = 0;
+	uint32_t test_mask, nn, done = 0;
 	const char *path;
 	uint8_t *data;
 	size_t len;
@@ -99,14 +102,14 @@ static void step_nn_config(void)
 
 	if (!want_config()) {
 		tc_fail("nn-config needs --nn-config FILE or --nn-config NN=FILE");
-		a_summary("no configuration file given");
+		a_set_summary("no configuration file given");
 		return;
 	}
-	use = nns_with_file(A.o.nn_config, A.o.nn_config_all, a_spw_setup());
+	test_mask = nns_with_file(a_env.opts.nn_config, a_env.opts.nn_config_all, a_spw_setup());
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
-		if (!(use & (1u << nn)))
+		if (!(test_mask & (1u << nn)))
 			continue;
-		path = file_for(A.o.nn_config, A.o.nn_config_all, nn);
+		path = file_for(a_env.opts.nn_config, a_env.opts.nn_config_all, nn);
 		ret = tc_read_file(path, &data, &len, RAMON_SPW_CONFIG_MAX);
 		if (ret) {
 			tc_fail("spw%u: %s: %s%s", nn, path, strerror(-ret),
@@ -119,14 +122,14 @@ static void step_nn_config(void)
 			continue;
 		}
 		tc_info("spw%u: sending %s (%zu bytes)", nn, path, len);
-		if (!a_check(ramon_spw_nn_config_push(A.c, nn, data, (uint32_t)len, 0, &st),
+		if (!a_check(ramon_spw_nn_config_push(a_env.c, nn, data, (uint32_t)len, 0, &st),
 			     "NN configuration", &st)) {
 			tc_info("spw%u: configuration acknowledged", nn);
 			done++;
 		}
 		free(data);
 	}
-	a_summary("%u NN(s) configured", done);
+	a_set_summary("%u NN(s) configured", done);
 }
 
 /* ---- nn-update (was nnupdate) ---- */
@@ -136,9 +139,9 @@ static int want_update(void)
 	unsigned nn;
 
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++)
-		if (A.o.nn_update[nn])
+		if (a_env.opts.nn_update[nn])
 			return 1;
-	return A.o.nn_update_all != NULL;
+	return a_env.opts.nn_update_all != NULL;
 }
 
 struct progress {
@@ -151,10 +154,11 @@ struct progress {
 static void update_progress(void *user, uint32_t done, uint32_t total)
 {
 	struct progress *p = user;
-	unsigned step = total ? (unsigned)((uint64_t)done * PROGRESS_STEPS / total) : PROGRESS_STEPS;
+	unsigned n_lines_reached = total ? (unsigned)((uint64_t)done * PROGRESS_LINES / total) :
+				   PROGRESS_LINES;
 
-	if (step > p->shown) {
-		p->shown = step;
+	if (n_lines_reached > p->shown) {
+		p->shown = n_lines_reached;
 		tc_info("spw%u: packet %u / %u (%.0f s)", p->nn, done, total, tc_ms_since(p->t0) / 1000);
 	}
 }
@@ -163,7 +167,7 @@ static void step_nn_update(void)
 {
 	struct ramon_status st;
 	struct progress pr;
-	uint32_t use, nn, done = 0;
+	uint32_t test_mask, nn, done = 0;
 	const char *path;
 	uint8_t *img;
 	size_t len;
@@ -171,15 +175,15 @@ static void step_nn_update(void)
 
 	if (!want_update()) {
 		tc_fail("nn-update needs --nn-update FILE or --nn-update NN=FILE");
-		a_summary("no software package given");
+		a_set_summary("no software package given");
 		return;
 	}
-	use = nns_with_file(A.o.nn_update, A.o.nn_update_all, a_spw_setup());
+	test_mask = nns_with_file(a_env.opts.nn_update, a_env.opts.nn_update_all, a_spw_setup());
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
-		if (!(use & (1u << nn)))
+		if (!(test_mask & (1u << nn)))
 			continue;
-		path = file_for(A.o.nn_update, A.o.nn_update_all, nn);
-		ret = tc_read_file(path, &img, &len, UPDATE_MAX);
+		path = file_for(a_env.opts.nn_update, a_env.opts.nn_update_all, nn);
+		ret = tc_read_file(path, &img, &len, UPDATE_MAX_BYTES);
 		if (ret || !len) {
 			tc_fail("spw%u: %s: %s", nn, path, ret ? strerror(-ret) : "empty file");
 			if (!ret)
@@ -187,12 +191,13 @@ static void step_nn_update(void)
 			continue;
 		}
 		tc_info("spw%u: updating with %s (%zu bytes, %zu packets, software type %u)", nn, path,
-			len, (len + RAMON_SPW_SWUP_CHUNK - 1) / RAMON_SPW_SWUP_CHUNK, A.o.nn_sw_type);
+			len, (len + RAMON_SPW_SWUP_CHUNK - 1) / RAMON_SPW_SWUP_CHUNK,
+			a_env.opts.nn_sw_type);
 		pr.nn = nn;
 		pr.shown = 0;
 		pr.t0 = tc_now_ns();
-		if (!a_check(ramon_spw_nn_sw_update(A.c, nn, (uint8_t)A.o.nn_sw_type, img, len,
-						    update_progress, &pr, &st),
+		if (!a_check(ramon_spw_nn_sw_update(a_env.c, nn, (uint8_t)a_env.opts.nn_sw_type,
+						    img, len, update_progress, &pr, &st),
 			     "NN software update", &st)) {
 			tc_info("spw%u: software update accepted by the NN", nn);
 			done++;
@@ -201,10 +206,10 @@ static void step_nn_update(void)
 	}
 	if (done)
 		tc_info("power-cycle the board, then check with: ramon_accept nn-version --nn-expect <version>");
-	a_summary("%u NN(s) updated%s", done, done ? "; power-cycle, then run nn-version" : "");
+	a_set_summary("%u NN(s) updated%s", done, done ? "; power-cycle, then run nn-version" : "");
 }
 
-const struct step accept_nn[] = {
+const struct step a_nn_steps[] = {
 	{ "nn-version", step_nn_version, NEEDS_DEV, "nnswver",
 	  "NN software versions (4KBL, RSBL, image, FW)", NULL },
 	{ "nn-config", step_nn_config, NEEDS_DEV, "nnconf",

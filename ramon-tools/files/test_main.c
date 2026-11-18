@@ -21,7 +21,7 @@
 #define MAX_METRICS	32
 #define SYNC_TRIES	200	/* 2 s per link; the uncabled NN never syncs */
 
-struct test_env T;
+struct test_env t_env;
 
 struct metric {
 	char name[40];
@@ -29,23 +29,25 @@ struct metric {
 };
 
 struct result {
-	const struct test *t;
+	const struct test *test;
 	const char *outcome;	/* "pass", "fail", "skip" */
 	double ms;
 	unsigned n_metrics;
-	struct metric m[MAX_METRICS];
+	struct metric metrics[MAX_METRICS];
 };
 
-static struct result *cur;
+static struct result *cur_result;
 
-static const struct test *const suites[] = { test_core, test_spw, test_spfi, test_soak };
+static const struct test *const suites[] = { t_core_tests, t_spw_tests, t_spfi_tests,
+					     t_soak_tests };
 
-void t_metric(const char *name, double value)
+void t_add_metric(const char *name, double value)
 {
-	if (!cur || cur->n_metrics == MAX_METRICS)
+	if (!cur_result || cur_result->n_metrics == MAX_METRICS)
 		return;
-	snprintf(cur->m[cur->n_metrics].name, sizeof(cur->m[0].name), "%s", name);
-	cur->m[cur->n_metrics++].value = value;
+	snprintf(cur_result->metrics[cur_result->n_metrics].name,
+		 sizeof(cur_result->metrics[0].name), "%s", name);
+	cur_result->metrics[cur_result->n_metrics++].value = value;
 }
 
 int t_check(int ret, const char *what, const struct ramon_status *st)
@@ -79,21 +81,21 @@ static const struct test *find_test(const char *name)
 }
 
 /* why a test cannot run, or NULL */
-static const char *missing(unsigned needs)
+static const char *skip_reason(unsigned needs)
 {
-	if ((needs & NEEDS_ZDMA) && !T.n_zdma)
+	if ((needs & NEEDS_ZDMA) && !t_env.n_zdma_chan)
 		return "no ZDMA channels";
-	if ((needs & (NEEDS_SPW | NEEDS_SPW_LINK)) && T.o.skip_spw)
+	if ((needs & (NEEDS_SPW | NEEDS_SPW_LINK)) && t_env.opts.skip_spw)
 		return "SPW not in use (--skip-spw, or its setup failed above)";
-	if ((needs & NEEDS_SPW) && !T.spw_present)
+	if ((needs & NEEDS_SPW) && !t_env.spw_present_mask)
 		return "no SPW NN present";
-	if ((needs & NEEDS_SPW_LINK) && T.spw_nn < 0)
+	if ((needs & NEEDS_SPW_LINK) && t_env.spw_nn < 0)
 		return "no synced SPW link";
-	if ((needs & (NEEDS_SPFI | NEEDS_SPFI_LINK)) && T.o.skip_spfi)
+	if ((needs & (NEEDS_SPFI | NEEDS_SPFI_LINK)) && t_env.opts.skip_spfi)
 		return "SPFI not in use (--skip-spfi, or its setup failed above)";
-	if ((needs & NEEDS_SPFI) && !T.spfi_present)
+	if ((needs & NEEDS_SPFI) && !t_env.spfi_present_mask)
 		return "no SPFI NN present";
-	if ((needs & NEEDS_SPFI_LINK) && T.spfi_nn < 0)
+	if ((needs & NEEDS_SPFI_LINK) && t_env.spfi_nn < 0)
 		return "no SPFI link up (bring it up with --prep)";
 	return NULL;
 }
@@ -107,67 +109,70 @@ static int setup(void)
 	char line[160];
 	int ret, up;
 
-	ret = ramon_open(T.o.dev, &T.c, &st);
+	ret = ramon_open(t_env.opts.dev, &t_env.c, &st);
 	if (ret) {
 		tc_fail_st("ramon_open", &st);
 		return ret;
 	}
-	ramon_version_line(T.c, line, sizeof(line));
+	ramon_version_line(t_env.c, line, sizeof(line));
 	printf("ramon_test %s, %s\n", RAMON_TOOLS_VERSION, line);
-	T.n_zdma = ramon_info(T.c)->n_zdma_chan;
-	T.spw_nn = T.spfi_nn = -1;
+	t_env.n_zdma_chan = ramon_info(t_env.c)->n_zdma_chan;
+	t_env.spw_nn = t_env.spfi_nn = -1;
 
 	ramon_spw_config_default(&sc);
-	sc.node_id = T.o.node;
-	sc.nn_node = T.o.target;
+	sc.node_id = t_env.opts.node;
+	sc.nn_node = t_env.opts.target;
 	sc.sync_tries = SYNC_TRIES;
 	/* a layer that cannot start fails its group, the other tests still run */
-	if (!T.o.skip_spw && ramon_info(T.c)->spw_mask && ramon_spw_init(T.c, &sc, &st)) {
+	if (!t_env.opts.skip_spw && ramon_info(t_env.c)->spw_mask &&
+	    ramon_spw_init(t_env.c, &sc, &st)) {
 		tc_fail_st("ramon_spw_init (SPW tests will be skipped)", &st);
-		T.o.skip_spw = 1;
+		t_env.opts.skip_spw = 1;
 	}
 	ramon_spfi_config_default(&fc);
-	fc.chan[0] = T.o.spfi_chan[0];
-	fc.chan[1] = T.o.spfi_chan[1];
-	if (!T.o.skip_spfi && ramon_info(T.c)->spfi_mask && ramon_spfi_init(T.c, &fc, &st)) {
+	fc.chan[0] = t_env.opts.spfi_chan[0];
+	fc.chan[1] = t_env.opts.spfi_chan[1];
+	if (!t_env.opts.skip_spfi && ramon_info(t_env.c)->spfi_mask &&
+	    ramon_spfi_init(t_env.c, &fc, &st)) {
 		tc_fail_st("ramon_spfi_init (SPFI tests will be skipped)", &st);
-		T.o.skip_spfi = 1;
+		t_env.opts.skip_spfi = 1;
 	}
 
-	for (nn = 0; nn < RAMON_NN_COUNT && !T.o.skip_spw; nn++) {
-		if (!ramon_spw_present(T.c, nn))
+	for (nn = 0; nn < RAMON_NN_COUNT && !t_env.opts.skip_spw; nn++) {
+		if (!ramon_spw_present(t_env.c, nn))
 			continue;
-		T.spw_present |= 1u << nn;
-		if (!ramon_spw_sync(T.c, nn, &tries, &st)) {
+		t_env.spw_present_mask |= 1u << nn;
+		if (!ramon_spw_sync(t_env.c, nn, &tries, &st)) {
 			printf("      spw%u: link synced after %u reset(s)\n", nn, tries);
-			if (T.spw_nn < 0)
-				T.spw_nn = (int)nn;
+			if (t_env.spw_nn < 0)
+				t_env.spw_nn = (int)nn;
 		} else {
 			printf("      spw%u: link not synced (expected for an NN without a cable)\n", nn);
 		}
 	}
-	for (nn = 0; nn < RAMON_NN_COUNT && !T.o.skip_spfi; nn++) {
-		if (!ramon_spfi_present(T.c, nn))
+	for (nn = 0; nn < RAMON_NN_COUNT && !t_env.opts.skip_spfi; nn++) {
+		if (!ramon_spfi_present(t_env.c, nn))
 			continue;
-		T.spfi_present |= 1u << nn;
-		if (T.o.prep) {
-			struct ramon_spfi_prep_opts po = { T.o.format, 0 };
+		t_env.spfi_present_mask |= 1u << nn;
+		if (t_env.opts.prep_requested) {
+			struct ramon_spfi_prep_opts po = { t_env.opts.format_requested, 0 };
 
-			printf("      spfi%u: bring-up%s\n", nn, T.o.format ? " with FORMAT" : "");
-			if (ramon_spfi_prep(T.c, nn, &po, NULL, &st))
+			printf("      spfi%u: bring-up%s\n", nn,
+			       t_env.opts.format_requested ? " with FORMAT" : "");
+			if (ramon_spfi_prep(t_env.c, nn, &po, NULL, &st))
 				tc_fail_st("spfi bring-up", &st);
 		}
-		up = ramon_spfi_link_up(T.c, nn, &raw, &st);
+		up = ramon_spfi_link_up(t_env.c, nn, &raw, &st);
 		printf("      spfi%u: link %s (0xCC = 0x%x)\n", nn, up > 0 ? "up" : "down", raw);
-		if (up > 0 && T.spfi_nn < 0)
-			T.spfi_nn = (int)nn;
+		if (up > 0 && t_env.spfi_nn < 0)
+			t_env.spfi_nn = (int)nn;
 	}
 	return 0;
 }
 
 static void print_json(const struct result *r, unsigned n)
 {
-	const struct ramon_get_info *gi = T.c ? ramon_info(T.c) : NULL;
+	const struct ramon_get_info *gi = t_env.c ? ramon_info(t_env.c) : NULL;
 	unsigned i, k;
 
 	printf("{\"tool\":\"ramon_test\",\"version\":\"%s\",\"lib\":\"%s\"", RAMON_TOOLS_VERSION,
@@ -178,9 +183,10 @@ static void print_json(const struct result *r, unsigned n)
 	printf(",\"tests\":[");
 	for (i = 0; i < n; i++) {
 		printf("%s{\"name\":\"%s\",\"result\":\"%s\",\"ms\":%.0f,\"metrics\":{", i ? "," : "",
-		       r[i].t->name, r[i].outcome, r[i].ms);
+		       r[i].test->name, r[i].outcome, r[i].ms);
 		for (k = 0; k < r[i].n_metrics; k++)
-			printf("%s\"%s\":%.3f", k ? "," : "", r[i].m[k].name, r[i].m[k].value);
+			printf("%s\"%s\":%.3f", k ? "," : "", r[i].metrics[k].name,
+			       r[i].metrics[k].value);
 		printf("}}");
 	}
 	printf("],\"failures\":%d,\"skipped\":%d}\n", tc_failures(), tc_skips());
@@ -212,7 +218,7 @@ static void usage(FILE *f)
 		RAMON_SPFI_CHAN_NN0, RAMON_SPFI_CHAN_NN1);
 }
 
-static int opt_u32(const char *s, const char *what, uint32_t max, uint32_t *v)
+static int parse_opt_u32(const char *s, const char *what, uint32_t max, uint32_t *v)
 {
 	if (!tc_parse_u32(s, v) && *v <= max)
 		return 0;
@@ -222,114 +228,119 @@ static int opt_u32(const char *s, const char *what, uint32_t max, uint32_t *v)
 
 int main(int argc, char **argv)
 {
-	enum { O_NODE = 1, O_TARGET, O_CHANS, O_SKIP_SPW, O_SKIP_SPFI, O_PREP, O_FORMAT,
-	       O_PAGES, O_RUNS, O_SPW_MAX, O_LONG, O_MINUTES, O_FAIL_FAST, O_STRICT, O_JSON };
-	static const struct option opts[] = {
+	enum { OPT_NODE = 1, OPT_TARGET, OPT_SPFI_CHANS, OPT_SKIP_SPW, OPT_SKIP_SPFI, OPT_PREP,
+	       OPT_FORMAT, OPT_SPFI_PAGES, OPT_RUNS, OPT_SPW_MAX, OPT_LONG, OPT_MINUTES,
+	       OPT_FAIL_FAST, OPT_STRICT, OPT_JSON };
+	static const struct option long_opts[] = {
 		{ "dev", required_argument, NULL, 'd' },
-		{ "node", required_argument, NULL, O_NODE },
-		{ "target", required_argument, NULL, O_TARGET },
-		{ "spfi-chans", required_argument, NULL, O_CHANS },
-		{ "skip-spw", no_argument, NULL, O_SKIP_SPW },
-		{ "skip-spfi", no_argument, NULL, O_SKIP_SPFI },
-		{ "prep", no_argument, NULL, O_PREP },
-		{ "format", no_argument, NULL, O_FORMAT },
-		{ "spfi-pages", required_argument, NULL, O_PAGES },
-		{ "runs", required_argument, NULL, O_RUNS },
-		{ "spw-max", required_argument, NULL, O_SPW_MAX },
-		{ "long", no_argument, NULL, O_LONG },
-		{ "minutes", required_argument, NULL, O_MINUTES },
-		{ "fail-fast", no_argument, NULL, O_FAIL_FAST },
-		{ "strict", no_argument, NULL, O_STRICT },
-		{ "json", no_argument, NULL, O_JSON },
+		{ "node", required_argument, NULL, OPT_NODE },
+		{ "target", required_argument, NULL, OPT_TARGET },
+		{ "spfi-chans", required_argument, NULL, OPT_SPFI_CHANS },
+		{ "skip-spw", no_argument, NULL, OPT_SKIP_SPW },
+		{ "skip-spfi", no_argument, NULL, OPT_SKIP_SPFI },
+		{ "prep", no_argument, NULL, OPT_PREP },
+		{ "format", no_argument, NULL, OPT_FORMAT },
+		{ "spfi-pages", required_argument, NULL, OPT_SPFI_PAGES },
+		{ "runs", required_argument, NULL, OPT_RUNS },
+		{ "spw-max", required_argument, NULL, OPT_SPW_MAX },
+		{ "long", no_argument, NULL, OPT_LONG },
+		{ "minutes", required_argument, NULL, OPT_MINUTES },
+		{ "fail-fast", no_argument, NULL, OPT_FAIL_FAST },
+		{ "strict", no_argument, NULL, OPT_STRICT },
+		{ "json", no_argument, NULL, OPT_JSON },
 		{ "list", no_argument, NULL, 'l' },
 		{ "version", no_argument, NULL, 'V' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
-	const struct test *t, *sel[64];
-	struct result *res;
-	unsigned n_sel = 0, i, n_run = 0;
-	char ver[160];
-	uint32_t v;
+	const struct test *t, *selected[64];
+	struct result *results;
+	unsigned n_selected = 0, i, n_run = 0;
+	char version_line[160];
+	uint32_t node_id;
 	size_t s;
-	int opt, before;
+	int opt, failures_before;
 	uint64_t t0;
 
-	T.o.node = RAMON_SPW_NODE_DEFAULT;
-	T.o.target = RAMON_SPW_NN_NODE_DEFAULT;
-	T.o.spfi_chan[0] = RAMON_SPFI_CHAN_NN0;
-	T.o.spfi_chan[1] = RAMON_SPFI_CHAN_NN1;
-	T.o.spfi_pages = 64;
-	T.o.runs = 8;
-	T.o.spw_max = RAMON_SPW_MAX_PAYLOAD;
-	while ((opt = getopt_long(argc, argv, "d:lVh", opts, NULL)) != -1) {
+	t_env.opts.node = RAMON_SPW_NODE_DEFAULT;
+	t_env.opts.target = RAMON_SPW_NN_NODE_DEFAULT;
+	t_env.opts.spfi_chan[0] = RAMON_SPFI_CHAN_NN0;
+	t_env.opts.spfi_chan[1] = RAMON_SPFI_CHAN_NN1;
+	t_env.opts.spfi_perf_max_pages = 64;
+	t_env.opts.runs = 8;
+	t_env.opts.spw_max_payload_bytes = RAMON_SPW_MAX_PAYLOAD;
+	while ((opt = getopt_long(argc, argv, "d:lVh", long_opts, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
-			T.o.dev = optarg;
+			t_env.opts.dev = optarg;
 			break;
-		case O_NODE:
-		case O_TARGET:
-			if (opt_u32(optarg, "node id", 255, &v))
+		case OPT_NODE:
+		case OPT_TARGET:
+			if (parse_opt_u32(optarg, "node id", 255, &node_id))
 				return 2;
-			if (opt == O_NODE)
-				T.o.node = (uint8_t)v;
+			if (opt == OPT_NODE)
+				t_env.opts.node = (uint8_t)node_id;
 			else
-				T.o.target = (uint8_t)v;
+				t_env.opts.target = (uint8_t)node_id;
 			break;
-		case O_CHANS:
-			if (tc_parse_pair(optarg, T.o.spfi_chan)) {
+		case OPT_SPFI_CHANS:
+			if (tc_parse_pair(optarg, t_env.opts.spfi_chan)) {
 				fprintf(stderr, "ramon_test: --spfi-chans wants A,B\n");
 				return 2;
 			}
 			break;
-		case O_SKIP_SPW:
-			T.o.skip_spw = 1;
+		case OPT_SKIP_SPW:
+			t_env.opts.skip_spw = 1;
 			break;
-		case O_SKIP_SPFI:
-			T.o.skip_spfi = 1;
+		case OPT_SKIP_SPFI:
+			t_env.opts.skip_spfi = 1;
 			break;
-		case O_PREP:
-			T.o.prep = 1;
+		case OPT_PREP:
+			t_env.opts.prep_requested = 1;
 			break;
-		case O_FORMAT:
-			T.o.format = 1;
+		case OPT_FORMAT:
+			t_env.opts.format_requested = 1;
 			break;
-		case O_PAGES:
-			if (opt_u32(optarg, "--spfi-pages", RAMON_SPFI_WRITE_MAX_PAGES, &T.o.spfi_pages) ||
-			    !T.o.spfi_pages)
+		case OPT_SPFI_PAGES:
+			if (parse_opt_u32(optarg, "--spfi-pages", RAMON_SPFI_WRITE_MAX_PAGES,
+					  &t_env.opts.spfi_perf_max_pages) ||
+			    !t_env.opts.spfi_perf_max_pages)
 				return 2;
 			break;
-		case O_RUNS:
-			if (opt_u32(optarg, "--runs", 100000, &T.o.runs) || !T.o.runs)
+		case OPT_RUNS:
+			if (parse_opt_u32(optarg, "--runs", 100000, &t_env.opts.runs) ||
+			    !t_env.opts.runs)
 				return 2;
 			break;
-		case O_SPW_MAX:
+		case OPT_SPW_MAX:
 			/* the FPGA takes at most RAMON_SPW_MAX_PAYLOAD bytes */
-			if (opt_u32(optarg, "--spw-max", RAMON_SPW_MAX_PAYLOAD, &T.o.spw_max))
+			if (parse_opt_u32(optarg, "--spw-max", RAMON_SPW_MAX_PAYLOAD,
+					  &t_env.opts.spw_max_payload_bytes))
 				return 2;
 			break;
-		case O_LONG:
-			T.o.long_tests = 1;
+		case OPT_LONG:
+			t_env.opts.long_requested = 1;
 			break;
-		case O_MINUTES:
-			if (opt_u32(optarg, "--minutes", 100000, &T.o.minutes) || !T.o.minutes)
+		case OPT_MINUTES:
+			if (parse_opt_u32(optarg, "--minutes", 100000, &t_env.opts.soak_minutes) ||
+			    !t_env.opts.soak_minutes)
 				return 2;
 			break;
-		case O_FAIL_FAST:
-			T.o.fail_fast = 1;
+		case OPT_FAIL_FAST:
+			t_env.opts.fail_fast = 1;
 			break;
-		case O_STRICT:
-			T.o.strict = 1;
+		case OPT_STRICT:
+			t_env.opts.strict = 1;
 			break;
-		case O_JSON:
-			T.o.json = 1;
+		case OPT_JSON:
+			t_env.opts.json_requested = 1;
 			break;
 		case 'l':
 			list_tests();
 			return 0;
 		case 'V':
-			ramon_version_line(NULL, ver, sizeof(ver));
-			printf("ramon_test %s, %s\n", RAMON_TOOLS_VERSION, ver);
+			ramon_version_line(NULL, version_line, sizeof(version_line));
+			printf("ramon_test %s, %s\n", RAMON_TOOLS_VERSION, version_line);
 			return 0;
 		case 'h':
 			usage(stdout);
@@ -341,7 +352,7 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
-	if (T.o.format && !T.o.prep) {
+	if (t_env.opts.format_requested && !t_env.opts.prep_requested) {
 		fprintf(stderr, "ramon_test: --format only works together with --prep\n");
 		return 2;
 	}
@@ -357,69 +368,72 @@ int main(int argc, char **argv)
 		for (s = 0; s < ARRAY_SIZE(suites); s++)
 			for (t = suites[s]; t->name; t++)
 				for (i = (unsigned)optind; i < (unsigned)argc; i++)
-					if (!strcmp(argv[i], t->name) && n_sel < ARRAY_SIZE(sel)) {
-						sel[n_sel++] = t;
+					if (!strcmp(argv[i], t->name) &&
+					    n_selected < ARRAY_SIZE(selected)) {
+						selected[n_selected++] = t;
 						break;
 					}
-		if (!T.o.minutes)
-			T.o.minutes = 1;
+		if (!t_env.opts.soak_minutes)
+			t_env.opts.soak_minutes = 1;
 	} else {
 		for (s = 0; s < ARRAY_SIZE(suites); s++)
 			for (t = suites[s]; t->name; t++)
-				if (n_sel < ARRAY_SIZE(sel) &&
-				    (t->when == RUN_DEFAULT || (t->when == RUN_LONG && T.o.long_tests) ||
-				     (t->when == RUN_SOAK && T.o.minutes)))
-					sel[n_sel++] = t;
+				if (n_selected < ARRAY_SIZE(selected) &&
+				    (t->when == RUN_DEFAULT ||
+				     (t->when == RUN_LONG && t_env.opts.long_requested) ||
+				     (t->when == RUN_SOAK && t_env.opts.soak_minutes)))
+					selected[n_selected++] = t;
 	}
 
-	res = calloc(n_sel ? n_sel : 1, sizeof(*res));
-	if (!res || setup()) {
+	results = calloc(n_selected ? n_selected : 1, sizeof(*results));
+	if (!results || setup()) {
 		printf("FAILED: could not set up\n");
-		free(res);
-		ramon_close(T.c);
+		free(results);
+		ramon_close(t_env.c);
 		return 2;
 	}
-	for (i = 0; i < n_sel; i++) {
-		const char *why = missing(sel[i]->needs);
+	for (i = 0; i < n_selected; i++) {
+		const char *why = skip_reason(selected[i]->needs);
 
-		cur = &res[n_run++];
-		cur->t = sel[i];
-		printf("== %s\n", sel[i]->name);
+		cur_result = &results[n_run++];
+		cur_result->test = selected[i];
+		printf("== %s\n", selected[i]->name);
 		fflush(stdout);
 		if (why) {
-			tc_skip("%s: %s", sel[i]->name, why);
-			cur->outcome = "skip";
+			tc_skip("%s: %s", selected[i]->name, why);
+			cur_result->outcome = "skip";
 			continue;
 		}
-		before = tc_failures();
+		failures_before = tc_failures();
 		t0 = tc_now_ns();
-		sel[i]->fn();
-		cur->ms = tc_ms_since(t0);
-		cur->outcome = tc_failures() == before ? "pass" : "fail";
-		if (tc_failures() == before)
-			tc_ok("%s (%.0f ms)", sel[i]->name, cur->ms);
-		else if (T.o.fail_fast)
+		selected[i]->fn();
+		cur_result->ms = tc_ms_since(t0);
+		cur_result->outcome = tc_failures() == failures_before ? "pass" : "fail";
+		if (tc_failures() == failures_before)
+			tc_ok("%s (%.0f ms)", selected[i]->name, cur_result->ms);
+		else if (t_env.opts.fail_fast)
 			break;
 	}
-	cur = NULL;
+	cur_result = NULL;
 
 	for (i = 0; i < n_run; i++)
-		if (res[i].n_metrics) {
+		if (results[i].n_metrics) {
 			unsigned k;
 
-			printf("   %-14s", res[i].t->name);
-			for (k = 0; k < res[i].n_metrics; k++)
-				printf(" %s=%.1f", res[i].m[k].name, res[i].m[k].value);
+			printf("   %-14s", results[i].test->name);
+			for (k = 0; k < results[i].n_metrics; k++)
+				printf(" %s=%.1f", results[i].metrics[k].name,
+				       results[i].metrics[k].value);
 			printf("\n");
 		}
-	if (T.o.json)
-		print_json(res, n_run);
-	if (tc_failures() || (T.o.strict && tc_skips()))
+	if (t_env.opts.json_requested)
+		print_json(results, n_run);
+	if (tc_failures() || (t_env.opts.strict && tc_skips()))
 		printf("FAILED: %d failure(s), %d test(s) skipped\n", tc_failures(), tc_skips());
 	else
 		printf("PASSED: %u test(s), %d skipped\n", n_run - (unsigned)tc_skips(), tc_skips());
-	i = tc_failures() || (T.o.strict && tc_skips());
-	free(res);
-	ramon_close(T.c);
+	i = tc_failures() || (t_env.opts.strict && tc_skips());
+	free(results);
+	ramon_close(t_env.c);
 	return (int)i;
 }

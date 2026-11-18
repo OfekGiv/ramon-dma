@@ -28,7 +28,7 @@
 #define LINE_MAX_LEN	1024
 
 volatile sig_atomic_t cli_interrupted;
-static volatile sig_atomic_t last_intr_sec;
+static volatile sig_atomic_t last_sigint_sec;
 static int quit_requested;
 
 #define N_MAIN_CMDS	7
@@ -44,17 +44,17 @@ static const struct cli_group groups[] = {
 
 /* ---- context helpers ---- */
 
-int cli_err(struct cli *cl, int err, const char *fmt, ...)
+int cli_set_err(struct cli *cl, int errnum, const char *fmt, ...)
 {
 	va_list ap;
 
 	cl->st.code = RAMON_EL_INVAL;
-	cl->st.err = -err;
+	cl->st.err = -errnum;
 	cl->st.arg[0] = cl->st.arg[1] = 0;
 	va_start(ap, fmt);
 	vsnprintf(cl->st.msg, sizeof(cl->st.msg), fmt, ap);
 	va_end(ap);
-	return -err;
+	return -errnum;
 }
 
 static void cli_log(void *user, int level, const char *msg)
@@ -68,7 +68,7 @@ static void cli_log(void *user, int level, const char *msg)
 	funlockfile(stdout);
 }
 
-int cli_ctx(struct cli *cl)
+int cli_open_ctx(struct cli *cl)
 {
 	int ret;
 
@@ -80,10 +80,10 @@ int cli_ctx(struct cli *cl)
 	return ret;
 }
 
-int cli_spw(struct cli *cl)
+int cli_init_spw(struct cli *cl)
 {
 	struct ramon_spw_config cfg;
-	int ret = cli_ctx(cl);
+	int ret = cli_open_ctx(cl);
 
 	if (ret || ramon_spw_is_inited(cl->c))
 		return ret;
@@ -93,10 +93,10 @@ int cli_spw(struct cli *cl)
 	return ramon_spw_init(cl->c, &cfg, &cl->st);
 }
 
-int cli_spfi(struct cli *cl)
+int cli_init_spfi(struct cli *cl)
 {
 	struct ramon_spfi_config cfg;
-	int ret = cli_ctx(cl);
+	int ret = cli_open_ctx(cl);
 
 	if (ret || ramon_spfi_is_inited(cl->c))
 		return ret;
@@ -118,49 +118,50 @@ void cli_close_ctx(struct cli *cl)
 	cl->c = NULL;
 }
 
-int cli_u64(struct cli *cl, const char *s, const char *what, uint64_t *v)
+int cli_parse_u64(struct cli *cl, const char *s, const char *what, uint64_t *v)
 {
 	if (!tc_parse_u64(s, v))
 		return 0;
-	return cli_err(cl, EINVAL, "%s: \"%s\" is not a number (decimal, or 0x.. hex)", what, s);
+	return cli_set_err(cl, EINVAL, "%s: \"%s\" is not a number (decimal, or 0x.. hex)", what,
+			   s);
 }
 
-int cli_u32(struct cli *cl, const char *s, const char *what, uint32_t *v)
+int cli_parse_u32(struct cli *cl, const char *s, const char *what, uint32_t *v)
 {
 	if (!tc_parse_u32(s, v))
 		return 0;
-	return cli_err(cl, EINVAL, "%s: \"%s\" is not a 32-bit number (decimal, or 0x.. hex)", what,
-		       s);
+	return cli_set_err(cl, EINVAL, "%s: \"%s\" is not a 32-bit number (decimal, or 0x.. hex)",
+			   what, s);
 }
 
-int cli_opt_u32(struct cli *cl, int argc, char **argv, int i, uint32_t def, const char *what,
-		uint32_t *v)
+int cli_parse_opt_u32(struct cli *cl, int argc, char **argv, int i, uint32_t def, const char *what,
+		      uint32_t *v)
 {
 	*v = def;
-	return i < argc ? cli_u32(cl, argv[i], what, v) : 0;
+	return i < argc ? cli_parse_u32(cl, argv[i], what, v) : 0;
 }
 
-int cli_nn(struct cli *cl, uint32_t nn)
+int cli_check_nn(struct cli *cl, uint32_t nn)
 {
 	if (nn < RAMON_NN_COUNT)
 		return 0;
-	return cli_err(cl, EINVAL, "nn must be 0 or 1");
+	return cli_set_err(cl, EINVAL, "nn must be 0 or 1");
 }
 
-int cli_slot(struct cli *cl, const char *s, ramon_buf **b)
+int cli_parse_slot(struct cli *cl, const char *s, ramon_buf **b)
 {
 	uint32_t i;
-	int ret = cli_u32(cl, s, "slot", &i);
+	int ret = cli_parse_u32(cl, s, "slot", &i);
 
 	if (ret)
 		return ret;
 	if (i >= CLI_SLOTS || !cl->slot[i].handle)
-		return cli_err(cl, EINVAL, "slot %u is empty (see \"bufinfo\")", i);
+		return cli_set_err(cl, EINVAL, "slot %u is empty (see \"bufinfo\")", i);
 	*b = &cl->slot[i];
 	return 0;
 }
 
-int cli_intr(void)
+int cli_is_interrupted(void)
 {
 	return cli_interrupted != 0;
 }
@@ -171,7 +172,7 @@ static void on_sigint(int sig)
 
 	(void)sig;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
-	if (cli_interrupted && ts.tv_sec - last_intr_sec <= 1) {
+	if (cli_interrupted && ts.tv_sec - last_sigint_sec <= 1) {
 		static const char msg[] = "\nramon_cli: interrupted twice, exiting\n";
 
 		if (write(STDERR_FILENO, msg, sizeof(msg) - 1) < 0)
@@ -179,7 +180,7 @@ static void on_sigint(int sig)
 		_exit(130);
 	}
 	cli_interrupted = 1;
-	last_intr_sec = (sig_atomic_t)ts.tv_sec;
+	last_sigint_sec = (sig_atomic_t)ts.tv_sec;
 }
 
 /* ---- general commands ---- */
@@ -197,13 +198,13 @@ static const struct cli_cmd *find_exact(const char *name)
 }
 
 /* exact name, else a unique prefix of a listed command */
-static const struct cli_cmd *find_cmd(const char *name, int *ambiguous)
+static const struct cli_cmd *find_cmd(const char *name, int *is_ambiguous)
 {
 	const struct cli_cmd *k, *hit = NULL;
 	size_t g, n = strlen(name);
 	int count = 0;
 
-	*ambiguous = 0;
+	*is_ambiguous = 0;
 	k = find_exact(name);
 	if (k)
 		return k;
@@ -214,7 +215,7 @@ static const struct cli_cmd *find_cmd(const char *name, int *ambiguous)
 				count++;
 			}
 	if (count > 1) {
-		*ambiguous = 1;
+		*is_ambiguous = 1;
 		return NULL;
 	}
 	return hit;
@@ -231,14 +232,14 @@ static int cmd_help(struct cli *cl, int argc, char **argv)
 {
 	const struct cli_cmd *k;
 	size_t g;
-	int amb;
+	int is_ambiguous;
 
 	(void)cl;
 	if (argc > 1) {
-		k = find_cmd(argv[1], &amb);
+		k = find_cmd(argv[1], &is_ambiguous);
 		if (!k)
-			return cli_err(cl, EINVAL, "no command \"%s\"%s", argv[1],
-				       amb ? " (ambiguous prefix)" : "");
+			return cli_set_err(cl, EINVAL, "no command \"%s\"%s", argv[1],
+					   is_ambiguous ? " (ambiguous prefix)" : "");
 		print_usage(k);
 		return 0;
 	}
@@ -285,7 +286,7 @@ static int cmd_echo(struct cli *cl, int argc, char **argv)
 static int cmd_sleep(struct cli *cl, int argc, char **argv)
 {
 	uint32_t ms;
-	int ret = cli_u32(cl, argv[1], "ms", &ms);
+	int ret = cli_parse_u32(cl, argv[1], "ms", &ms);
 
 	(void)argc;
 	if (!ret)
@@ -298,7 +299,8 @@ static const struct cli_cmd cli_main_cmds[N_MAIN_CMDS] = {
 	{ "quit", cmd_quit, 0, 0, CMD_NO_DEV, "", "leave ramon_cli (also exit, exitapp)" },
 	{ "exit", cmd_quit, 0, 0, CMD_NO_DEV | CMD_HIDDEN, "", "leave ramon_cli" },
 	{ "exitapp", cmd_quit, 0, 0, CMD_NO_DEV | CMD_HIDDEN, "", "leave ramon_cli" },
-	{ "echo", cmd_echo, 0, CLI_MAX_ARGS, CMD_NO_DEV, "[text...]", "print the text (for scripts)" },
+	{ "echo", cmd_echo, 0, CLI_MAX_WORDS, CMD_NO_DEV, "[text...]",
+	  "print the text (for scripts)" },
 	{ "sleep", cmd_sleep, 1, 1, CMD_NO_DEV, "<ms>", "pause (for scripts)" },
 	{ NULL, NULL, 0, 0, 0, NULL, NULL },
 };
@@ -316,7 +318,7 @@ static int tokenize(char *line, char **argv)
 			p++;
 		if (!*p || *p == '#')
 			break;
-		if (argc == CLI_MAX_ARGS)
+		if (argc == CLI_MAX_WORDS)
 			return -1;
 		argv[argc++] = out = p;
 		while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') {
@@ -340,23 +342,23 @@ static int tokenize(char *line, char **argv)
 /* runs one command line; 0 ok (or empty), < 0 failed */
 static int run_line(struct cli *cl, char *line)
 {
-	char *argv[CLI_MAX_ARGS + 1];
+	char *argv[CLI_MAX_WORDS + 1];
 	const struct cli_cmd *k;
 	char msg[256];
-	int argc, nargs, amb, ret;
+	int argc, nargs, is_ambiguous, ret;
 
 	argc = tokenize(line, argv);
 	if (argc < 0) {
-		printf("FAIL: more than %d words\n", CLI_MAX_ARGS);
+		printf("FAIL: more than %d words\n", CLI_MAX_WORDS);
 		return -E2BIG;
 	}
 	if (!argc)
 		return 0;
 	argv[argc] = NULL;
-	k = find_cmd(argv[0], &amb);
+	k = find_cmd(argv[0], &is_ambiguous);
 	if (!k) {
 		printf("FAIL: %s command \"%s\"; \"help\" lists them\n",
-		       amb ? "ambiguous" : "unknown", argv[0]);
+		       is_ambiguous ? "ambiguous" : "unknown", argv[0]);
 		return -EINVAL;
 	}
 	nargs = argc - 1;
@@ -378,9 +380,9 @@ static int run_line(struct cli *cl, char *line)
 	cli_interrupted = 0;
 	ret = 0;
 	if (!(k->flags & CMD_NO_DEV))
-		ret = cli_ctx(cl);
-	if (!ret && (k->flags & CMD_NEED_SPW))
-		ret = cli_spw(cl);
+		ret = cli_open_ctx(cl);
+	if (!ret && (k->flags & CMD_NEEDS_SPW))
+		ret = cli_init_spw(cl);
 	if (!ret)
 		ret = k->fn(cl, argc, argv);
 	if (!ret) {
@@ -441,45 +443,47 @@ static void completion(const char *buf, linenoiseCompletions *lc)
 {
 	const struct cli_cmd *k;
 	char first[64];
-	size_t start, len = strlen(buf), n;
+	size_t word_start, len = strlen(buf), prefix_len;
 	unsigned i;
 	size_t g;
-	int word = 0;
+	int word_index = 0;
 
 	/* which word is being completed, and where it starts */
-	for (i = 0, start = 0; i < len; i++)
+	for (i = 0, word_start = 0; i < len; i++)
 		if (buf[i] == ' ' && (i + 1 == len || buf[i + 1] != ' ')) {
-			word++;
-			start = i + 1;
+			word_index++;
+			word_start = i + 1;
 		}
-	while (start < len && buf[start] == ' ')
-		start++;
-	n = len - start;
-	if (word == 0) {
+	while (word_start < len && buf[word_start] == ' ')
+		word_start++;
+	prefix_len = len - word_start;
+	if (word_index == 0) {
 		for (g = 0; g < ARRAY_SIZE(groups); g++)
 			for (k = groups[g].cmds; k->name; k++)
-				if (!(k->flags & CMD_HIDDEN) && !strncmp(k->name, buf + start, n))
-					add_completion(lc, buf, start, k->name);
+				if (!(k->flags & CMD_HIDDEN) &&
+				    !strncmp(k->name, buf + word_start, prefix_len))
+					add_completion(lc, buf, word_start, k->name);
 		return;
 	}
 	if (sscanf(buf, "%63s", first) != 1)
 		return;
-	if (word == 1 && !strcmp(first, "help")) {
+	if (word_index == 1 && !strcmp(first, "help")) {
 		for (g = 0; g < ARRAY_SIZE(groups); g++)
 			for (k = groups[g].cmds; k->name; k++)
-				if (!(k->flags & CMD_HIDDEN) && !strncmp(k->name, buf + start, n))
-					add_completion(lc, buf, start, k->name);
+				if (!(k->flags & CMD_HIDDEN) &&
+				    !strncmp(k->name, buf + word_start, prefix_len))
+					add_completion(lc, buf, word_start, k->name);
 		return;
 	}
-	if (word == 1 && (!strcmp(first, "regio") || !strcmp(first, "regaccessioname"))) {
+	if (word_index == 1 && (!strcmp(first, "regio") || !strcmp(first, "regaccessioname"))) {
 		for (i = 0; i < n_win_names; i++)
-			if (!strncmp(win_names[i], buf + start, n))
-				add_completion(lc, buf, start, win_names[i]);
+			if (!strncmp(win_names[i], buf + word_start, prefix_len))
+				add_completion(lc, buf, word_start, win_names[i]);
 		return;
 	}
 	k = find_exact(first);
-	if (k && (k->flags & CMD_DESTRUCTIVE) && !strncmp("yes", buf + start, n))
-		add_completion(lc, buf, start, "yes");
+	if (k && (k->flags & CMD_DESTRUCTIVE) && !strncmp("yes", buf + word_start, prefix_len))
+		add_completion(lc, buf, word_start, "yes");
 }
 
 static char *hints(const char *buf, int *color, int *bold)
@@ -524,7 +528,7 @@ static void set_width(void)
 }
 
 /* --plain: a prompt and ordinary line input, for terminals without escape sequences */
-static int plain_repl(struct cli *cl)
+static int run_plain_repl(struct cli *cl)
 {
 	char line[LINE_MAX_LEN];
 	int last = 0;
@@ -547,7 +551,7 @@ static int plain_repl(struct cli *cl)
 	return last ? 1 : 0;
 }
 
-static int repl(struct cli *cl)
+static int run_repl(struct cli *cl)
 {
 	char path[512];
 	const char *home = getenv("HOME");
@@ -587,28 +591,28 @@ static int repl(struct cli *cl)
 	return last ? 1 : 0;
 }
 
-static int script(struct cli *cl, FILE *f, int keep_going, int echo)
+static int run_script(struct cli *cl, FILE *f, int keep_going, int echo_on)
 {
 	char line[LINE_MAX_LEN];
-	int failed = 0, n = 0;
+	int n_failed = 0, line_no = 0;
 
-	cl->script = 1;
+	cl->is_batch = 1;
 	while (!quit_requested && fgets(line, sizeof(line), f)) {
-		n++;
+		line_no++;
 		line[strcspn(line, "\r\n")] = 0;
 		if (!line[strspn(line, " \t")] || line[strspn(line, " \t")] == '#')
 			continue;
-		if (echo)
+		if (echo_on)
 			printf("> %s\n", line);
 		if (run_line(cl, line)) {
-			failed++;
+			n_failed++;
 			if (!keep_going) {
-				printf("stopped at line %d (use -k to keep going)\n", n);
+				printf("stopped at line %d (use -k to keep going)\n", line_no);
 				break;
 			}
 		}
 	}
-	return failed ? 1 : 0;
+	return n_failed ? 1 : 0;
 }
 
 static void usage(FILE *f)
@@ -635,16 +639,17 @@ static void usage(FILE *f)
 
 int main(int argc, char **argv)
 {
-	static const struct option opts[] = {
+	enum { OPT_NODE = 1, OPT_TARGET, OPT_SPFI_CHANS, OPT_NN, OPT_PLAIN };
+	static const struct option long_opts[] = {
 		{ "dev", required_argument, NULL, 'd' },
-		{ "node", required_argument, NULL, 1 },
-		{ "target", required_argument, NULL, 2 },
-		{ "spfi-chans", required_argument, NULL, 3 },
-		{ "nn", required_argument, NULL, 4 },
+		{ "node", required_argument, NULL, OPT_NODE },
+		{ "target", required_argument, NULL, OPT_TARGET },
+		{ "spfi-chans", required_argument, NULL, OPT_SPFI_CHANS },
+		{ "nn", required_argument, NULL, OPT_NN },
 		{ "file", required_argument, NULL, 'f' },
 		{ "keep-going", no_argument, NULL, 'k' },
 		{ "quiet", no_argument, NULL, 'q' },
-		{ "plain", no_argument, NULL, 5 },
+		{ "plain", no_argument, NULL, OPT_PLAIN },
 		{ "version", no_argument, NULL, 'V' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
@@ -652,9 +657,9 @@ int main(int argc, char **argv)
 	struct sigaction sa;
 	struct cli cl;
 	const char *file = NULL;
-	char line[LINE_MAX_LEN], ver[160];
-	int opt, keep_going = 0, echo = 1, plain = 0, ret, i;
-	uint32_t v;
+	char line[LINE_MAX_LEN], version_line[160];
+	int opt, keep_going = 0, echo_on = 1, plain = 0, ret, i;
+	uint32_t node_id;
 
 	memset(&cl, 0, sizeof(cl));
 	cl.node = RAMON_SPW_NODE_DEFAULT;
@@ -662,30 +667,30 @@ int main(int argc, char **argv)
 	cl.spfi_chan[0] = RAMON_SPFI_CHAN_NN0;
 	cl.spfi_chan[1] = RAMON_SPFI_CHAN_NN1;
 	/* "+": stop at the first non-option, which is the command */
-	while ((opt = getopt_long(argc, argv, "+d:f:kqVh", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "+d:f:kqVh", long_opts, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			cl.dev = optarg;
 			break;
-		case 1:
-		case 2:
-			if (tc_parse_u32(optarg, &v) || v > 255) {
+		case OPT_NODE:
+		case OPT_TARGET:
+			if (tc_parse_u32(optarg, &node_id) || node_id > 255) {
 				fprintf(stderr, "ramon_cli: bad node id \"%s\"\n", optarg);
 				return 2;
 			}
-			if (opt == 1)
-				cl.node = (uint8_t)v;
+			if (opt == OPT_NODE)
+				cl.node = (uint8_t)node_id;
 			else
-				cl.target = (uint8_t)v;
+				cl.target = (uint8_t)node_id;
 			break;
-		case 3:
+		case OPT_SPFI_CHANS:
 			if (tc_parse_pair(optarg, cl.spfi_chan)) {
 				fprintf(stderr, "ramon_cli: --spfi-chans wants A,B\n");
 				return 2;
 			}
 			break;
-		case 4:
-			if (tc_parse_u32(optarg, &cl.nn) || cl.nn >= RAMON_NN_COUNT) {
+		case OPT_NN:
+			if (tc_parse_u32(optarg, &cl.spfi_nn) || cl.spfi_nn >= RAMON_NN_COUNT) {
 				fprintf(stderr, "ramon_cli: --nn must be 0 or 1\n");
 				return 2;
 			}
@@ -697,14 +702,14 @@ int main(int argc, char **argv)
 			keep_going = 1;
 			break;
 		case 'q':
-			echo = 0;
+			echo_on = 0;
 			break;
-		case 5:
+		case OPT_PLAIN:
 			plain = 1;
 			break;
 		case 'V':
-			ramon_version_line(NULL, ver, sizeof(ver));
-			printf("ramon_cli %s, %s\n", RAMON_TOOLS_VERSION, ver);
+			ramon_version_line(NULL, version_line, sizeof(version_line));
+			printf("ramon_cli %s, %s\n", RAMON_TOOLS_VERSION, version_line);
 			return 0;
 		case 'h':
 			usage(stdout);
@@ -734,7 +739,7 @@ int main(int argc, char **argv)
 			strcat(line, argv[i]);
 			strcat(line, quote ? "\" " : " ");
 		}
-		cl.script = 1;
+		cl.is_batch = 1;
 		ret = run_line(&cl, line) ? 1 : 0;
 		cli_close_ctx(&cl);
 		return ret;
@@ -746,29 +751,31 @@ int main(int argc, char **argv)
 			fprintf(stderr, "ramon_cli: %s: %s\n", file, strerror(errno));
 			return 2;
 		}
-		ret = script(&cl, f, keep_going, echo);
+		ret = run_script(&cl, f, keep_going, echo_on);
 		if (f != stdin)
 			fclose(f);
 		cli_close_ctx(&cl);
 		return ret;
 	}
 	if (!isatty(STDIN_FILENO)) {
-		ret = script(&cl, stdin, keep_going, echo);
+		ret = run_script(&cl, stdin, keep_going, echo_on);
 		cli_close_ctx(&cl);
 		return ret;
 	}
 
-	if (!cli_ctx(&cl)) {
-		ramon_version_line(cl.c, ver, sizeof(ver));
-		printf("ramon_cli %s, %s. \"help\" lists the commands.\n", RAMON_TOOLS_VERSION, ver);
+	if (!cli_open_ctx(&cl)) {
+		ramon_version_line(cl.c, version_line, sizeof(version_line));
+		printf("ramon_cli %s, %s. \"help\" lists the commands.\n", RAMON_TOOLS_VERSION,
+		       version_line);
 	} else {
 		char msg[256];
 
 		ramon_strerror(&cl.st, msg, sizeof(msg));
-		ramon_version_line(NULL, ver, sizeof(ver));
-		printf("ramon_cli %s, %s. The device is not open: %s\n", RAMON_TOOLS_VERSION, ver, msg);
+		ramon_version_line(NULL, version_line, sizeof(version_line));
+		printf("ramon_cli %s, %s. The device is not open: %s\n", RAMON_TOOLS_VERSION,
+		       version_line, msg);
 	}
-	ret = plain ? plain_repl(&cl) : repl(&cl);
+	ret = plain ? run_plain_repl(&cl) : run_repl(&cl);
 	cli_close_ctx(&cl);
 	return ret;
 }

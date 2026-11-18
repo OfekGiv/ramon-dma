@@ -17,28 +17,28 @@
 
 static void step_rstop_version(void)
 {
-	const uint32_t *want = A.o.rstop_expect;
+	const uint32_t *want = a_env.opts.rstop_version;
 	struct ramon_status st;
 	uint32_t v[3], cfg;
 
-	if (a_check(ramon_rstop_version(A.c, v, &st), "RS-TOP version registers 0x00/0x04/0x08",
+	if (a_check(ramon_rstop_version(a_env.c, v, &st), "RS-TOP version registers 0x00/0x04/0x08",
 		    &st) ||
-	    a_check(ramon_reg_read(A.c, "rs_top", RAMON_RSTOP_CONFIG, &cfg, &st),
+	    a_check(ramon_reg_read(a_env.c, "rs_top", RAMON_RSTOP_CONFIG, &cfg, &st),
 		    "RS-TOP configuration register 0x0C", &st))
 		return;
 	tc_info("RS TOP version: %u.%u.%u (0x%x 0x%x 0x%x)", v[0], v[1], v[2], v[0], v[1], v[2]);
 	tc_info("master/slave configuration (0x0C): 0x%x", cfg);
-	a_summary("RS-TOP %u.%u.%u, configuration 0x%x", v[0], v[1], v[2], cfg);
+	a_set_summary("RS-TOP %u.%u.%u, configuration 0x%x", v[0], v[1], v[2], cfg);
 
 	if (v[0] == BAD_REG || v[1] == BAD_REG || v[2] == BAD_REG)
 		tc_fail("a version register reads 0xffffffff: RS-TOP does not answer");
 	else if (!v[0] && !v[1] && !v[2])
 		tc_fail("version 0.0.0: RS-TOP is not loaded or not clocked");
-	if (A.o.have_rstop_expect &&
+	if (a_env.opts.rstop_version_given &&
 	    (v[0] != want[0] || v[1] != want[1] || v[2] != want[2]))
 		tc_fail("RS-TOP version %u.%u.%u, expected %u.%u.%u (--rstop-version)", v[0], v[1], v[2],
 			want[0], want[1], want[2]);
-	else if (!A.o.have_rstop_expect)
+	else if (!a_env.opts.rstop_version_given)
 		tc_info("not compared: pass --rstop-version to check it against the delivery");
 }
 
@@ -56,11 +56,11 @@ static void step_rstop_timetag(void)
 	struct ramon_status st;
 	uint32_t a, b;
 
-	if (a_check(ramon_reg_read(A.c, "rs_top", RAMON_RSTOP_TIMESTAMP, &a, &st),
+	if (a_check(ramon_reg_read(a_env.c, "rs_top", RAMON_RSTOP_TIMESTAMP, &a, &st),
 		    "RS-TOP time tag register 0x10", &st))
 		return;
 	tc_sleep_ms(TIMETAG_GAP_MS);
-	if (a_check(ramon_reg_read(A.c, "rs_top", RAMON_RSTOP_TIMESTAMP, &b, &st),
+	if (a_check(ramon_reg_read(a_env.c, "rs_top", RAMON_RSTOP_TIMESTAMP, &b, &st),
 		    "RS-TOP time tag register 0x10", &st))
 		return;
 	ramon_rstop_decode_time(a, &t);
@@ -72,8 +72,8 @@ static void step_rstop_timetag(void)
 	else
 		tc_info("after %u ms: 0x%08x, %02u/%02u/%02u %02u:%02u:%02u (counting)", TIMETAG_GAP_MS,
 			b, t2.day, t2.month, t2.year, t2.hour, t2.min, t2.sec);
-	a_summary("%02u/%02u/%02u %02u:%02u:%02u (%s)", t.day, t.month, t.year, t.hour, t.min, t.sec,
-		  a == b ? "fixed" : "counting");
+	a_set_summary("%02u/%02u/%02u %02u:%02u:%02u (%s)", t.day, t.month, t.year, t.hour, t.min,
+		      t.sec, a == b ? "fixed" : "counting");
 
 	if (a == BAD_REG)
 		tc_fail("the time tag reads 0xffffffff: RS-TOP does not answer");
@@ -103,7 +103,7 @@ static void key_name(unsigned k, char *buf, size_t len)
 	snprintf(buf, len, "%s.%s", r->win == RAMON_WIN_SYSMON_PS ? "ps" : "pl", r->name);
 }
 
-static int key_find(const char *name)
+static int find_key(const char *name)
 {
 	char buf[48];
 	unsigned k;
@@ -144,7 +144,7 @@ static int load_limits(const char *path, struct limit *lim)
 			ret = -1;
 			continue;
 		}
-		k = key_find(key);
+		k = find_key(key);
 		if (k < 0) {
 			tc_fail("%s:%u: unknown name \"%s\" (temp_ps, temp_pl, ps.<rail>, pl.<rail>)",
 				path, lineno, key);
@@ -160,18 +160,18 @@ static int load_limits(const char *path, struct limit *lim)
 }
 
 /* prints one reading with its limit; returns 1 if it is out of range */
-static int show(unsigned k, double value, const char *unit, const char *desc,
-		const struct limit *l)
+static int show_reading(unsigned k, double value, const char *unit, const char *desc,
+			const struct limit *lim)
 {
 	char name[48], range[48] = "";
-	int bad = l->set && (value < l->min || value > l->max);
+	int bad = lim->set && (value < lim->min || value > lim->max);
 
 	key_name(k, name, sizeof(name));
-	if (!l->set) {
+	if (!lim->set) {
 		tc_info("%-16s %8.3f %s  %s", name, value, unit, desc);
 		return 0;
 	}
-	snprintf(range, sizeof(range), "[%.3f .. %.3f] %s", l->min, l->max,
+	snprintf(range, sizeof(range), "[%.3f .. %.3f] %s", lim->min, lim->max,
 		 bad ? "OUT OF RANGE" : "ok");
 	tc_info("%-16s %8.3f %s  %-40s %s", name, value, unit, desc, range);
 	return bad;
@@ -186,32 +186,33 @@ static void step_sysmon(void)
 
 	memset(lim, 0, sizeof(lim));
 	lim[0] = lim[1] = (struct limit){ 1, TEMP_MIN_C, TEMP_MAX_C };
-	if (A.o.limits) {
-		tc_info("limits from %s", A.o.limits);
-		if (load_limits(A.o.limits, lim)) {
-			a_summary("bad limits file (see above)");
+	if (a_env.opts.limits) {
+		tc_info("limits from %s", a_env.opts.limits);
+		if (load_limits(a_env.opts.limits, lim)) {
+			a_set_summary("bad limits file (see above)");
 			return;
 		}
 	}
-	if (a_check(ramon_sysmon_read(A.c, &s, &st), "SYSMON", &st))
+	if (a_check(ramon_sysmon_read(a_env.c, &s, &st), "SYSMON", &st))
 		return;
 
-	bad += show(0, s.ps_temp_c, "C", "PS temperature", &lim[0]);
-	bad += show(1, s.pl_temp_c, "C", "PL temperature", &lim[1]);
+	bad += show_reading(0, s.ps_temp_c, "C", "PS temperature", &lim[0]);
+	bad += show_reading(1, s.pl_temp_c, "C", "PL temperature", &lim[1]);
 	for (k = 2; k < N_KEYS; k++) {
-		bad += show(k, s.volts[k - 2], "V", ramon_sysmon_rails[k - 2].desc, &lim[k]);
+		bad += show_reading(k, s.volts[k - 2], "V", ramon_sysmon_rails[k - 2].desc,
+				    &lim[k]);
 		checked += lim[k].set;
 	}
 	if (!checked)
 		tc_info("no rail limits configured: rails printed only (--limits, or %s)",
 			ACCEPT_LIMITS_DEFAULT);
-	a_summary("PS %.1f C, PL %.1f C; %u of %u rails checked", s.ps_temp_c, s.pl_temp_c, checked,
-		  RAMON_SYSMON_RAILS);
+	a_set_summary("PS %.1f C, PL %.1f C; %u of %u rails checked", s.ps_temp_c, s.pl_temp_c,
+		      checked, RAMON_SYSMON_RAILS);
 	if (bad)
 		tc_fail("%u reading(s) out of range", bad);
 }
 
-const struct step accept_board[] = {
+const struct step a_board_steps[] = {
 	{ "rstop-version", step_rstop_version, NEEDS_DEV, "rdrstopver",
 	  "RS-TOP version 0x00/0x04/0x08 and configuration 0x0C", NULL },
 	{ "rstop-timetag", step_rstop_timetag, NEEDS_DEV, "readtimetag",

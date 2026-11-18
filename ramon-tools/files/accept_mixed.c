@@ -27,36 +27,36 @@
 #include <string.h>
 #include <time.h>
 
-#define PAGE		RAMON_SPFI_PAGE
+#define SPFI_PAGE_BYTES	RAMON_SPFI_PAGE
 #define MIB		1048576.0
 #define MAX_USERS	8
 #define SPW_TAG		0x6D000000u	/* attribute_id: SPW_TAG + user index */
 #define SPW_IDLE_MS	2000		/* stragglers after the end */
 
-enum ukind { U_SPW, U_SPFI_WRITE, U_SPFI_READ };
+enum user_kind { U_SPW, U_SPFI_WRITE, U_SPFI_READ };
 
-struct ujob {
+struct user_job {
 	const char *name;
-	enum ukind kind;
+	enum user_kind kind;
 	uint32_t period_ms;
 	uint32_t pages;			/* SPFI; SPW sends --mixed-spw-bytes */
 };
 
 struct user {
-	const struct ujob *j;
+	const struct user_job *job;
 	unsigned idx;
 	uint32_t nn;
 	pthread_t th;
 	/* SPFI */
 	uint32_t sid;
-	struct ramon_spfi_stream s;
-	struct a_pages buf, ref;	/* ref: the read stream's pattern */
+	struct ramon_spfi_stream stream;
+	struct a_pages buf, reference;	/* the read stream's pattern, or the SPW payload */
 	uint32_t reported;
-	/* results; the user thread updates them under slock, the reports read them */
-	pthread_mutex_t slock;
+	/* results; the user thread updates them under stats_lock, the reports read them */
+	pthread_mutex_t stats_lock;
 	uint64_t ops, late, bytes, op_ns_max, op_ns_sum;
-	uint64_t ival_op_ns_max;	/* longest operation since the last interim report */
-	uint64_t p_ops, p_late, p_bytes, p_back;	/* at the last interim report */
+	uint64_t interval_op_max_ns;	/* longest operation since the last interim report */
+	uint64_t prev_ops, prev_late, prev_bytes, prev_back;	/* at the last interim report */
 	uint64_t spw_back, spw_bad;	/* under the RX lock */
 	uint32_t bad_pages;
 	int failed;
@@ -64,12 +64,12 @@ struct user {
 };
 
 static struct {
-	struct user u[MAX_USERS];
-	unsigned n;
-	uint64_t t_start, t_end;
-	pthread_mutex_t lock;		/* the SPW counters, from the RX thread */
+	struct user users[MAX_USERS];
+	unsigned n_users;
+	uint64_t start_ns, end_ns;
+	pthread_mutex_t rx_lock;	/* the SPW counters, from the RX thread */
 	uint64_t spw_foreign, last_rx_ns;
-} M = { .lock = PTHREAD_MUTEX_INITIALIZER };
+} mixed = { .rx_lock = PTHREAD_MUTEX_INITIALIZER };
 
 static uint32_t spw_seed(unsigned idx, uint16_t id)
 {
@@ -87,19 +87,20 @@ static void mixed_spw_cb(void *user, const struct ramon_spw_rx *rx)
 	(void)user;
 	if (!h || (rx->flags & (RAMON_SPW_RX_HDR_CRC_BAD | RAMON_SPW_RX_TRUNCATED)) ||
 	    (h->attribute_id & 0xFF000000u) != SPW_TAG ||
-	    (idx = h->attribute_id & 0xFF) >= M.n || M.u[idx].j->kind != U_SPW) {
-		pthread_mutex_lock(&M.lock);
-		M.spw_foreign++;
-		pthread_mutex_unlock(&M.lock);
+	    (idx = h->attribute_id & 0xFF) >= mixed.n_users ||
+	    mixed.users[idx].job->kind != U_SPW) {
+		pthread_mutex_lock(&mixed.rx_lock);
+		mixed.spw_foreign++;
+		pthread_mutex_unlock(&mixed.rx_lock);
 		return;
 	}
-	ok = !rx->flags && rx->payload_len == A.o.mixed_spw_bytes &&
-	     tc_verify(rx->payload, rx->payload_len, spw_seed(idx, h->packet_id)) < 0;
-	pthread_mutex_lock(&M.lock);
-	M.u[idx].spw_back++;
-	M.u[idx].spw_bad += !ok;
-	M.last_rx_ns = tc_now_ns();
-	pthread_mutex_unlock(&M.lock);
+	ok = !rx->flags && rx->payload_len == a_env.opts.mixed_spw_bytes &&
+	     tc_find_mismatch(rx->payload, rx->payload_len, spw_seed(idx, h->packet_id)) < 0;
+	pthread_mutex_lock(&mixed.rx_lock);
+	mixed.users[idx].spw_back++;
+	mixed.users[idx].spw_bad += !ok;
+	mixed.last_rx_ns = tc_now_ns();
+	pthread_mutex_unlock(&mixed.rx_lock);
 }
 
 /* ---- one operation per user kind ---- */
@@ -110,20 +111,21 @@ static int op_spw(struct user *u, uint64_t seq)
 	struct ramon_iov iov;
 
 	memset(&m, 0, sizeof(m));
-	m.dst = A.o.spw_node;
-	m.app_type = A.o.spw_app;
+	m.dst = a_env.opts.spw_node;
+	m.app_type = a_env.opts.spw_app;
 	m.attribute_id = SPW_TAG + u->idx;
 	m.packet_id = (uint16_t)seq;
 	m.flags = RAMON_SPW_MSG_KEEP_ID;
-	tc_fill(u->ref.ref, A.o.mixed_spw_bytes, spw_seed(u->idx, m.packet_id));
-	iov.base = u->ref.ref;
-	iov.len = A.o.mixed_spw_bytes;
-	return ramon_spw_send(A.c, u->nn, &m, &iov, 1, 0, &u->st);
+	tc_fill(u->reference.pattern, a_env.opts.mixed_spw_bytes, spw_seed(u->idx, m.packet_id));
+	iov.base = u->reference.pattern;
+	iov.len = a_env.opts.mixed_spw_bytes;
+	return ramon_spw_send(a_env.c, u->nn, &m, &iov, 1, 0, &u->st);
 }
 
 static int op_spfi_write(struct user *u)
 {
-	return ramon_spfi_stream_append(A.c, &u->s, &u->buf.b, 0, u->j->pages, 0, &u->st);
+	return ramon_spfi_stream_append(a_env.c, &u->stream, &u->buf.dma, 0, u->job->pages, 0,
+					&u->st);
 }
 
 static int op_spfi_read(struct user *u, uint64_t seq)
@@ -131,27 +133,30 @@ static int op_spfi_read(struct user *u, uint64_t seq)
 	struct stamp {
 		uint32_t magic, sid, run, page;
 	} want, have;
-	uint32_t i, full = (uint32_t)(seq % u->j->pages);
+	uint32_t i, full_page = (uint32_t)(seq % u->job->pages);
 	const uint8_t *g;
 	int ret;
 
-	ret = ramon_spfi_read_seq(A.c, u->nn, u->sid, u->s.first_page, u->j->pages, &u->buf.b, 0, 0,
-				  &u->st);
+	ret = ramon_spfi_read_seq(a_env.c, u->nn, u->sid, u->stream.first_page, u->job->pages,
+				  &u->buf.dma, 0, 0, &u->st);
 	if (ret)
 		return ret;
 	/* every page's stamp, and one whole page per read */
-	memcpy(&want, u->ref.b.ptr, sizeof(want));
-	for (i = 0; i < u->j->pages; i++) {
-		g = (const uint8_t *)u->buf.b.ptr + (size_t)i * PAGE;
+	memcpy(&want, u->reference.dma.ptr, sizeof(want));
+	for (i = 0; i < u->job->pages; i++) {
+		g = (const uint8_t *)u->buf.dma.ptr + (size_t)i * SPFI_PAGE_BYTES;
 		want.page = i;
 		memcpy(&have, g, sizeof(have));
 		if (memcmp(&have, &want, sizeof(want)) ||
-		    (i == full && memcmp(g + sizeof(want), u->ref.ref + (size_t)i * PAGE + sizeof(want),
-					 PAGE - sizeof(want)))) {
+		    (i == full_page &&
+		     memcmp(g + sizeof(want),
+			    u->reference.pattern + (size_t)i * SPFI_PAGE_BYTES + sizeof(want),
+			    SPFI_PAGE_BYTES - sizeof(want)))) {
 			u->bad_pages++;
 			if (u->reported++ < 3)
 				tc_info("  %s: read %llu page %u differs (stamp read: page %u, stream %u)",
-					u->j->name, (unsigned long long)seq, i, have.page, have.sid);
+					u->job->name, (unsigned long long)seq, i, have.page,
+					have.sid);
 		}
 	}
 	return 0;
@@ -170,22 +175,22 @@ static void sleep_until(uint64_t t_ns)
 static void *user_thread(void *arg)
 {
 	struct user *u = arg;
-	const uint64_t period = (uint64_t)u->j->period_ms * 1000000ull;
-	const uint64_t op_bytes = u->j->kind == U_SPW ? A.o.mixed_spw_bytes :
-				  (uint64_t)u->j->pages * PAGE;
-	uint64_t slot = 0, next = M.t_start, t0, dt, now;
+	const uint64_t period_ns = (uint64_t)u->job->period_ms * 1000000ull;
+	const uint64_t op_bytes = u->job->kind == U_SPW ? a_env.opts.mixed_spw_bytes :
+				  (uint64_t)u->job->pages * SPFI_PAGE_BYTES;
+	uint64_t slot = 0, next = mixed.start_ns, t0, dt, now;
 	int ret;
 
-	while (next < M.t_end) {
+	while (next < mixed.end_ns) {
 		sleep_until(next);
 		t0 = tc_now_ns();
-		ret = u->j->kind == U_SPW ? op_spw(u, slot) :
-		      u->j->kind == U_SPFI_WRITE ? op_spfi_write(u) : op_spfi_read(u, slot);
+		ret = u->job->kind == U_SPW ? op_spw(u, slot) :
+		      u->job->kind == U_SPFI_WRITE ? op_spfi_write(u) : op_spfi_read(u, slot);
 		dt = tc_now_ns() - t0;
-		pthread_mutex_lock(&u->slock);
+		pthread_mutex_lock(&u->stats_lock);
 		if (ret) {
 			u->failed = 1;
-			pthread_mutex_unlock(&u->slock);
+			pthread_mutex_unlock(&u->stats_lock);
 			break;
 		}
 		u->ops++;
@@ -193,74 +198,76 @@ static void *user_thread(void *arg)
 		u->op_ns_sum += dt;
 		if (dt > u->op_ns_max)
 			u->op_ns_max = dt;
-		if (dt > u->ival_op_ns_max)
-			u->ival_op_ns_max = dt;
+		if (dt > u->interval_op_max_ns)
+			u->interval_op_max_ns = dt;
 		/* the next slot that is still ahead; the ones passed are missed */
 		slot++;
-		next = M.t_start + slot * period;
+		next = mixed.start_ns + slot * period_ns;
 		now = tc_now_ns();
 		if (now > next) {
-			uint64_t behind = (now - next) / period + 1;
+			uint64_t behind = (now - next) / period_ns + 1;
 
 			u->late += behind;
 			slot += behind;
-			next = M.t_start + slot * period;
+			next = mixed.start_ns + slot * period_ns;
 		}
-		pthread_mutex_unlock(&u->slock);
+		pthread_mutex_unlock(&u->stats_lock);
 	}
 	return NULL;
 }
 
 /* ---- interim reports while the users run ---- */
 
-static void interim_report(uint64_t t_ns, uint64_t ival_ns)
+static void interim_report(uint64_t t_ns, uint64_t interval_ns)
 {
 	uint64_t ops, late, bytes, max_ns, back = 0;
-	double secs = ival_ns / 1e9;
+	double secs = interval_ns / 1e9;
 	int failed;
-	unsigned i, min = (unsigned)((t_ns - M.t_start) / 60000000000ull);
+	unsigned i, minutes = (unsigned)((t_ns - mixed.start_ns) / 60000000000ull);
 
-	for (i = 0; i < M.n; i++) {
-		struct user *u = &M.u[i];
-		int spw = u->j->kind == U_SPW;
+	for (i = 0; i < mixed.n_users; i++) {
+		struct user *u = &mixed.users[i];
+		int is_spw = u->job->kind == U_SPW;
 
-		pthread_mutex_lock(&u->slock);
+		pthread_mutex_lock(&u->stats_lock);
 		ops = u->ops;
 		late = u->late;
 		bytes = u->bytes;
-		max_ns = u->ival_op_ns_max;
-		u->ival_op_ns_max = 0;
+		max_ns = u->interval_op_max_ns;
+		u->interval_op_max_ns = 0;
 		failed = u->failed;
-		pthread_mutex_unlock(&u->slock);
-		if (spw) {
-			pthread_mutex_lock(&M.lock);
+		pthread_mutex_unlock(&u->stats_lock);
+		if (is_spw) {
+			pthread_mutex_lock(&mixed.rx_lock);
 			back = u->spw_back;
-			pthread_mutex_unlock(&M.lock);
+			pthread_mutex_unlock(&mixed.rx_lock);
 		}
 		tc_info("[%3u min] %-7s %llu done (+%llu), %llu missed (+%llu), op max %.1f ms, %.1f %s%s",
-			min, u->j->name, (unsigned long long)ops, (unsigned long long)(ops - u->p_ops),
-			(unsigned long long)late, (unsigned long long)(late - u->p_late), max_ns / 1e6,
-			secs > 0 ? (bytes - u->p_bytes) / (spw ? 1024.0 : MIB) / secs : 0,
-			spw ? "KiB/s" : "MiB/s", failed ? ", STOPPED (error)" : "");
-		if (spw)
-			tc_info("[%3u min] %-7s   %llu back (+%llu)", min, u->j->name,
-				(unsigned long long)back, (unsigned long long)(back - u->p_back));
-		u->p_ops = ops;
-		u->p_late = late;
-		u->p_bytes = bytes;
-		u->p_back = back;
+			minutes, u->job->name, (unsigned long long)ops,
+			(unsigned long long)(ops - u->prev_ops), (unsigned long long)late,
+			(unsigned long long)(late - u->prev_late), max_ns / 1e6,
+			secs > 0 ? (bytes - u->prev_bytes) / (is_spw ? 1024.0 : MIB) / secs : 0,
+			is_spw ? "KiB/s" : "MiB/s", failed ? ", STOPPED (error)" : "");
+		if (is_spw)
+			tc_info("[%3u min] %-7s   %llu back (+%llu)", minutes, u->job->name,
+				(unsigned long long)back,
+				(unsigned long long)(back - u->prev_back));
+		u->prev_ops = ops;
+		u->prev_late = late;
+		u->prev_bytes = bytes;
+		u->prev_back = back;
 	}
 }
 
 /* while the users run: a report every --mixed-report-minutes that falls before the end */
-static void interim_reports(void)
+static void run_interim_reports(void)
 {
-	const uint64_t period = (uint64_t)A.o.mixed_report_min * 60000000000ull;
-	uint64_t next, last = M.t_start;
+	const uint64_t period_ns = (uint64_t)a_env.opts.mixed_report_minutes * 60000000000ull;
+	uint64_t next, last = mixed.start_ns;
 
-	if (!period)
+	if (!period_ns)
 		return;
-	for (next = M.t_start + period; next < M.t_end; next += period) {
+	for (next = mixed.start_ns + period_ns; next < mixed.end_ns; next += period_ns) {
 		sleep_until(next);
 		interim_report(next, next - last);
 		last = next;
@@ -272,32 +279,36 @@ static void interim_reports(void)
 static int user_prepare(struct user *u)
 {
 	struct ramon_status st;
-	uint64_t slots = (uint64_t)A.o.mixed_seconds * 1000 / u->j->period_ms + 1;
+	uint64_t slots = (uint64_t)a_env.opts.mixed_seconds * 1000 / u->job->period_ms + 1;
 
-	switch (u->j->kind) {
+	switch (u->job->kind) {
 	case U_SPW:
 		/* the payload is built in ordinary memory */
-		u->ref.ref = malloc(A.o.mixed_spw_bytes ? A.o.mixed_spw_bytes : 1);
-		if (!u->ref.ref) {
+		u->reference.pattern = malloc(a_env.opts.mixed_spw_bytes ?
+					     a_env.opts.mixed_spw_bytes : 1);
+		if (!u->reference.pattern) {
 			tc_fail("out of memory");
 			return -1;
 		}
 		return 0;
 	case U_SPFI_WRITE:
-		if (a_pages_alloc(&u->buf, u->j->pages, 0))
+		if (a_pages_alloc(&u->buf, u->job->pages, 0))
 			return -1;
-		return a_check(ramon_spfi_stream_open(A.c, u->nn, u->sid, (uint32_t)(slots * u->j->pages),
-						      &u->s, &st), "OPEN", &st);
+		return a_check(ramon_spfi_stream_open(a_env.c, u->nn, u->sid,
+						      (uint32_t)(slots * u->job->pages),
+						      &u->stream, &st), "OPEN", &st);
 	case U_SPFI_READ:
 		/* the stream to read: its pages written once, stamped, flushed */
-		if (a_pages_alloc(&u->ref, u->j->pages, 1) || a_pages_alloc(&u->buf, u->j->pages, 0))
+		if (a_pages_alloc(&u->reference, u->job->pages, 1) ||
+		    a_pages_alloc(&u->buf, u->job->pages, 0))
 			return -1;
-		a_stamp_pages(&u->ref, u->j->pages, u->sid, 0);
-		if (a_check(ramon_spfi_stream_open(A.c, u->nn, u->sid, u->j->pages, &u->s, &st), "OPEN",
-			    &st) ||
-		    a_check(ramon_spfi_stream_append(A.c, &u->s, &u->ref.b, 0, u->j->pages, 0, &st),
+		a_stamp_pages(&u->reference, u->job->pages, u->sid, 0);
+		if (a_check(ramon_spfi_stream_open(a_env.c, u->nn, u->sid, u->job->pages,
+						   &u->stream, &st), "OPEN", &st) ||
+		    a_check(ramon_spfi_stream_append(a_env.c, &u->stream, &u->reference.dma, 0,
+						     u->job->pages, 0, &st),
 			    "fill the read stream", &st) ||
-		    a_check(ramon_spfi_stream_flush(A.c, &u->s, &st), "FLUSH", &st))
+		    a_check(ramon_spfi_stream_flush(a_env.c, &u->stream, &st), "FLUSH", &st))
 			return -1;
 		return 0;
 	}
@@ -308,25 +319,26 @@ static void user_cleanup(struct user *u)
 {
 	struct ramon_status st;
 
-	if (u->j->kind != U_SPW && (u->s.open || u->s.pages_written))
-		a_check(ramon_spfi_stream_close(A.c, &u->s, 1, &st), "CLOSE and DELETE", &st);
+	if (u->job->kind != U_SPW && (u->stream.open || u->stream.pages_written))
+		a_check(ramon_spfi_stream_close(a_env.c, &u->stream, 1, &st), "CLOSE and DELETE",
+			&st);
 	a_pages_free(&u->buf);
-	if (u->j->kind == U_SPW)
-		free(u->ref.ref);
+	if (u->job->kind == U_SPW)
+		free(u->reference.pattern);
 	else
-		a_pages_free(&u->ref);
-	memset(&u->ref, 0, sizeof(u->ref));
+		a_pages_free(&u->reference);
+	memset(&u->reference, 0, sizeof(u->reference));
 }
 
-static void report(struct user *u, double secs, int *any_late)
+static void report_user(struct user *u, double secs, int *any_late)
 {
-	const struct ujob *j = u->j;
+	const struct user_job *j = u->job;
 	double avg = u->ops ? u->op_ns_sum / 1e6 / u->ops : 0;
 	char what[64];
 	uint64_t lost = 0;
 
 	if (j->kind == U_SPW) {
-		snprintf(what, sizeof(what), "%u-byte SPW message", A.o.mixed_spw_bytes);
+		snprintf(what, sizeof(what), "%u-byte SPW message", a_env.opts.mixed_spw_bytes);
 		lost = u->ops > u->spw_back ? u->ops - u->spw_back : 0;
 	} else {
 		snprintf(what, sizeof(what), "SPFI %s of %u page(s)",
@@ -350,140 +362,145 @@ static void report(struct user *u, double secs, int *any_late)
 		tc_fail("%s: %u bad page(s) read", j->name, u->bad_pages);
 	if (u->late) {
 		*any_late = 1;
-		if (!A.o.mixed_late_ok)
+		if (!a_env.opts.mixed_late_ok)
 			tc_fail("%s: %llu deadline(s) of %u ms missed (longest operation %.1f ms)",
 				j->name, (unsigned long long)u->late, j->period_ms, u->op_ns_max / 1e6);
 	}
 }
 
-static void run_mixed(const struct ujob *jobs, unsigned n)
+static void run_mixed(const struct user_job *jobs, unsigned n_jobs)
 {
-	uint32_t spw_use, spfi_use, spw_nn, spfi_nn, ids[MAX_USERS], n_spfi = 0, k = 0;
-	char sum[160] = "";
+	uint32_t spw_test_mask, spfi_test_mask, spw_nn, spfi_nn, ids[MAX_USERS], n_spfi_users = 0,
+		 k = 0;
+	char summary[160] = "";
 	size_t used = 0;
 	unsigned i, started = 0;
 	uint64_t late = 0, slots = 0;
-	int any_late = 0, spw_users = 0, rx_on = 0;
+	int any_late = 0, n_spw_users = 0, rx_on = 0;
 	struct ramon_status st;
 	double secs;
 
-	memset(M.u, 0, sizeof(M.u));
-	M.n = n;
-	M.spw_foreign = 0;
-	for (i = 0; i < n; i++) {
-		spw_users += jobs[i].kind == U_SPW;
-		n_spfi += jobs[i].kind != U_SPW;
+	memset(mixed.users, 0, sizeof(mixed.users));
+	mixed.n_users = n_jobs;
+	mixed.spw_foreign = 0;
+	for (i = 0; i < n_jobs; i++) {
+		n_spw_users += jobs[i].kind == U_SPW;
+		n_spfi_users += jobs[i].kind != U_SPW;
 	}
-	spfi_use = n_spfi ? a_spfi_setup() : 0;
-	spw_use = a_spw_setup();
-	if ((n_spfi && !spfi_use) || (spw_users && !spw_use)) {
-		a_summary("no %s link", !spw_use ? "SPW" : "SPFI");
+	spfi_test_mask = n_spfi_users ? a_spfi_setup() : 0;
+	spw_test_mask = a_spw_setup();
+	if ((n_spfi_users && !spfi_test_mask) || (n_spw_users && !spw_test_mask)) {
+		a_set_summary("no %s link", !spw_test_mask ? "SPW" : "SPFI");
 		return;
 	}
 	/* the first NN of each */
-	for (spw_nn = 0; spw_nn < RAMON_NN_COUNT && !((spw_use >> spw_nn) & 1); spw_nn++)
+	for (spw_nn = 0; spw_nn < RAMON_NN_COUNT && !((spw_test_mask >> spw_nn) & 1); spw_nn++)
 		;
-	for (spfi_nn = 0; spfi_nn < RAMON_NN_COUNT && !((spfi_use >> spfi_nn) & 1); spfi_nn++)
+	for (spfi_nn = 0; spfi_nn < RAMON_NN_COUNT && !((spfi_test_mask >> spfi_nn) & 1); spfi_nn++)
 		;
-	if (n_spfi && a_spfi_free_ids(spfi_nn, ids, n_spfi)) {
-		a_summary("no room for %u streams", n_spfi);
+	if (n_spfi_users && a_spfi_find_free_ids(spfi_nn, ids, n_spfi_users)) {
+		a_set_summary("no room for %u streams", n_spfi_users);
 		return;
 	}
-	tc_info("%u s, SPW on spw%u (to node %u, %u-byte messages), SPFI on spfi%u", A.o.mixed_seconds,
-		spw_nn, A.o.spw_node, A.o.mixed_spw_bytes, spfi_nn);
+	tc_info("%u s, SPW on spw%u (to node %u, %u-byte messages), SPFI on spfi%u",
+		a_env.opts.mixed_seconds, spw_nn, a_env.opts.spw_node, a_env.opts.mixed_spw_bytes,
+		spfi_nn);
 
-	for (i = 0; i < n; i++) {
-		struct user *u = &M.u[i];
+	for (i = 0; i < n_jobs; i++) {
+		struct user *u = &mixed.users[i];
 
-		u->j = &jobs[i];
+		u->job = &jobs[i];
 		u->idx = i;
-		pthread_mutex_init(&u->slock, NULL);
+		pthread_mutex_init(&u->stats_lock, NULL);
 		u->nn = jobs[i].kind == U_SPW ? spw_nn : spfi_nn;
 		if (jobs[i].kind != U_SPW)
 			u->sid = ids[k++];
 		if (user_prepare(u))
 			goto out;
 	}
-	if (spw_users) {
-		if (a_check(ramon_spw_drain(A.c, spw_nn, 20, NULL, &st), "SPW drain", &st) ||
-		    a_check(ramon_spw_rx_start(A.c, spw_nn, mixed_spw_cb, NULL, &st), "SPW RX thread",
-			    &st))
+	if (n_spw_users) {
+		if (a_check(ramon_spw_drain(a_env.c, spw_nn, 20, NULL, &st), "SPW drain", &st) ||
+		    a_check(ramon_spw_rx_start(a_env.c, spw_nn, mixed_spw_cb, NULL, &st),
+			    "SPW RX thread", &st))
 			goto out;
 		rx_on = 1;
 	}
 
-	M.t_start = tc_now_ns() + 50000000ull;		/* all users start together */
-	M.t_end = M.t_start + (uint64_t)A.o.mixed_seconds * 1000000000ull;
-	for (i = 0; i < n; i++, started++)
-		if (pthread_create(&M.u[i].th, NULL, user_thread, &M.u[i])) {
+	mixed.start_ns = tc_now_ns() + 50000000ull;	/* all users start together */
+	mixed.end_ns = mixed.start_ns + (uint64_t)a_env.opts.mixed_seconds * 1000000000ull;
+	for (i = 0; i < n_jobs; i++, started++)
+		if (pthread_create(&mixed.users[i].th, NULL, user_thread, &mixed.users[i])) {
 			tc_fail("pthread_create failed");
 			break;
 		}
-	if (started == n)
-		interim_reports();
+	if (started == n_jobs)
+		run_interim_reports();
 	for (i = 0; i < started; i++)
-		pthread_join(M.u[i].th, NULL);
-	secs = (tc_now_ns() - M.t_start) / 1e9;
+		pthread_join(mixed.users[i].th, NULL);
+	secs = (tc_now_ns() - mixed.start_ns) / 1e9;
 	if (rx_on) {
 		/* the last messages may still be on their way back: wait while they arrive */
-		pthread_mutex_lock(&M.lock);
-		M.last_rx_ns = tc_now_ns();
-		pthread_mutex_unlock(&M.lock);
+		pthread_mutex_lock(&mixed.rx_lock);
+		mixed.last_rx_ns = tc_now_ns();
+		pthread_mutex_unlock(&mixed.rx_lock);
 		for (;;) {
 			uint64_t sent = 0, back = 0, idle;
 
-			pthread_mutex_lock(&M.lock);
-			for (i = 0; i < n; i++)
+			pthread_mutex_lock(&mixed.rx_lock);
+			for (i = 0; i < n_jobs; i++)
 				if (jobs[i].kind == U_SPW) {
-					sent += M.u[i].ops;
-					back += M.u[i].spw_back;
+					sent += mixed.users[i].ops;
+					back += mixed.users[i].spw_back;
 				}
-			idle = tc_now_ns() - M.last_rx_ns;
-			pthread_mutex_unlock(&M.lock);
+			idle = tc_now_ns() - mixed.last_rx_ns;
+			pthread_mutex_unlock(&mixed.rx_lock);
 			if (back >= sent || idle >= (uint64_t)SPW_IDLE_MS * 1000000ull)
 				break;
 			tc_sleep_ms(20);
 		}
-		ramon_spw_rx_stop(A.c, spw_nn);
+		ramon_spw_rx_stop(a_env.c, spw_nn);
 		rx_on = 0;
 	}
 	/* the reader's last read, completely */
-	for (i = 0; i < n; i++)
-		if (jobs[i].kind == U_SPFI_READ && M.u[i].ops)
-			M.u[i].bad_pages += a_check_pages(&M.u[i].buf, &M.u[i].ref, jobs[i].pages,
-							  M.u[i].sid, 0, &M.u[i].reported);
+	for (i = 0; i < n_jobs; i++)
+		if (jobs[i].kind == U_SPFI_READ && mixed.users[i].ops)
+			mixed.users[i].bad_pages += a_check_pages(&mixed.users[i].buf,
+								  &mixed.users[i].reference,
+								  jobs[i].pages, mixed.users[i].sid,
+								  0, &mixed.users[i].reported);
 
-	for (i = 0; i < n; i++) {
-		report(&M.u[i], secs, &any_late);
-		late += M.u[i].late;
-		slots += M.u[i].ops + M.u[i].late;
+	for (i = 0; i < n_jobs; i++) {
+		report_user(&mixed.users[i], secs, &any_late);
+		late += mixed.users[i].late;
+		slots += mixed.users[i].ops + mixed.users[i].late;
 	}
-	used = (size_t)snprintf(sum, sizeof(sum), "%llu of %llu deadlines missed",
+	used = (size_t)snprintf(summary, sizeof(summary), "%llu of %llu deadlines missed",
 				(unsigned long long)late, (unsigned long long)slots);
 	/* the heavy SPFI users' rates */
-	for (i = 0; i < n && used < sizeof(sum); i++)
+	for (i = 0; i < n_jobs && used < sizeof(summary); i++)
 		if (jobs[i].kind != U_SPW && jobs[i].period_ms < 1000)
-			used += (size_t)snprintf(sum + used, sizeof(sum) - used, "; %s %.0f MiB/s",
-						 jobs[i].name, secs > 0 ? M.u[i].bytes / MIB / secs : 0);
-	if (M.spw_foreign)
+			used += (size_t)snprintf(summary + used, sizeof(summary) - used,
+						 "; %s %.0f MiB/s", jobs[i].name,
+						 secs > 0 ? mixed.users[i].bytes / MIB / secs : 0);
+	if (mixed.spw_foreign)
 		tc_info("%llu other SPW packet(s) to node %u were ignored",
-			(unsigned long long)M.spw_foreign, A.o.spw_node);
-	if (any_late && A.o.mixed_late_ok)
+			(unsigned long long)mixed.spw_foreign, a_env.opts.spw_node);
+	if (any_late && a_env.opts.mixed_late_ok)
 		tc_info("deadlines were missed; not counted as a failure (--mixed-late-ok)");
-	a_summary("%s", sum);
+	a_set_summary("%s", summary);
 out:
 	if (rx_on)
-		ramon_spw_rx_stop(A.c, spw_nn);
-	for (i = 0; i < n; i++)
-		if (M.u[i].j) {
-			user_cleanup(&M.u[i]);
-			pthread_mutex_destroy(&M.u[i].slock);
+		ramon_spw_rx_stop(a_env.c, spw_nn);
+	for (i = 0; i < n_jobs; i++)
+		if (mixed.users[i].job) {
+			user_cleanup(&mixed.users[i]);
+			pthread_mutex_destroy(&mixed.users[i].stats_lock);
 		}
 }
 
 static void step_mixed_write(void)
 {
-	static const struct ujob jobs[] = {
+	static const struct user_job jobs[] = {
 		{ "spw-a", U_SPW, 1000, 0 },
 		{ "spw-b", U_SPW, 1000, 0 },
 		{ "spw-c", U_SPW, 100, 0 },
@@ -497,7 +514,7 @@ static void step_mixed_write(void)
 
 static void step_mixed_rw(void)
 {
-	static const struct ujob jobs[] = {
+	static const struct user_job jobs[] = {
 		{ "spw-a", U_SPW, 1000, 0 },
 		{ "spw-b", U_SPW, 1000, 0 },
 		{ "spw-c", U_SPW, 100, 0 },
@@ -510,7 +527,7 @@ static void step_mixed_rw(void)
 	run_mixed(jobs, ARRAY_SIZE(jobs));
 }
 
-const struct step accept_mixed[] = {
+const struct step a_mixed_steps[] = {
 	{ "mixed-write", step_mixed_write, NEEDS_DEV, NULL,
 	  "test #1: 3 SPW users (1 s, 1 s, 0.1 s) + SPFI writes of 12, 2, 4096 pages (1 s, 1 s, 0.1 s)",
 	  NULL },

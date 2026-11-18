@@ -42,7 +42,7 @@ static int dt_read(const char *node, const char *prop, uint8_t **data, size_t *l
 {
 	char path[2 * PATH_LEN];
 
-	snprintf(path, sizeof(path), "%s%s/%s", A.o.dt_root, node, prop);
+	snprintf(path, sizeof(path), "%s%s/%s", a_env.opts.dt_root, node, prop);
 	return tc_read_file(path, data, len, 4096);
 }
 
@@ -51,7 +51,7 @@ static uint32_t be32(const uint8_t *p)
 	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
 
-static uint64_t cells(const uint8_t *p, uint32_t n)
+static uint64_t read_cells(const uint8_t *p, uint32_t n)
 {
 	uint64_t v = 0;
 
@@ -85,7 +85,7 @@ static uint32_t parent_cells(const char *node, const char *prop, uint32_t dflt)
 }
 
 /* the node path for a __symbols__ label; 0 or -errno */
-static int dt_label(const char *label, char *path, size_t len)
+static int dt_label_path(const char *label, char *path, size_t len)
 {
 	uint8_t *d;
 	size_t n;
@@ -107,7 +107,7 @@ static int dt_search(struct region *r)
 	struct dirent *e;
 	DIR *d;
 
-	snprintf(dir, sizeof(dir), "%s/__symbols__", A.o.dt_root);
+	snprintf(dir, sizeof(dir), "%s/__symbols__", a_env.opts.dt_root);
 	d = opendir(dir);
 	if (!d) {
 		tc_fail("%s: %s (no device tree symbols; pass --ddr4-base and --ddr4-size)", dir,
@@ -115,7 +115,7 @@ static int dt_search(struct region *r)
 		return -1;
 	}
 	while ((e = readdir(d))) {
-		if (!strstr(e->d_name, "ddr4") || dt_label(e->d_name, path, sizeof(path)))
+		if (!strstr(e->d_name, "ddr4") || dt_label_path(e->d_name, path, sizeof(path)))
 			continue;
 		for (i = 0; i < n && strcmp(found[i], path); i++)
 			;
@@ -151,15 +151,16 @@ static int find_region(struct region *r)
 	int ret;
 
 	memset(r, 0, sizeof(*r));
-	if (A.o.ddr4_base) {
-		r->base = A.o.ddr4_base;
-		r->size = A.o.ddr4_size;
+	if (a_env.opts.ddr4_base) {
+		r->base = a_env.opts.ddr4_base;
+		r->size = a_env.opts.ddr4_size;
 		snprintf(r->label, sizeof(r->label), "command line");
 		return 0;
 	}
-	snprintf(r->label, sizeof(r->label), "%s", A.o.ddr4_label ? A.o.ddr4_label : DDR4_LABEL);
-	ret = dt_label(r->label, r->path, sizeof(r->path));
-	if (ret && A.o.ddr4_label) {
+	snprintf(r->label, sizeof(r->label), "%s",
+		 a_env.opts.ddr4_label ? a_env.opts.ddr4_label : DDR4_LABEL);
+	ret = dt_label_path(r->label, r->path, sizeof(r->path));
+	if (ret && a_env.opts.ddr4_label) {
 		tc_fail("DT label \"%s\": %s", r->label, strerror(-ret));
 		return -1;
 	}
@@ -179,8 +180,8 @@ static int find_region(struct region *r)
 		free(d);
 		return -1;
 	}
-	r->base = cells(d, ac);
-	r->size = cells(d + ac * 4, sc);
+	r->base = read_cells(d, ac);
+	r->size = read_cells(d + ac * 4, sc);
 	free(d);
 	if (!dt_read(r->path, "compatible", &d, &len)) {
 		tc_info("DT node %s (label %s, compatible \"%.*s\")", r->path, r->label,
@@ -195,7 +196,7 @@ static int find_region(struct region *r)
 /* ---- safety ---- */
 
 /* An access to an unprogrammed PL can hang the CPU or end in an SError panic. */
-static int fpga_programmed(void)
+static int check_fpga_programmed(void)
 {
 	char state[64];
 
@@ -223,7 +224,7 @@ static unsigned log2u64(uint64_t v)
 }
 
 /* walking ones and zeros on the first word: every data line toggles */
-static int data_bus(vu64 *p, uint64_t base)
+static int check_data_bus(vu64 *p, uint64_t base)
 {
 	uint64_t stuck = 0, v;
 	unsigned bit;
@@ -248,47 +249,47 @@ static int data_bus(vu64 *p, uint64_t base)
  * Address lines: one word at each power-of-two offset. A line stuck high or
  * low, or two lines shorted, make two of these words alias.
  */
-static int address_bus(vu64 *p, uint64_t words, uint64_t base)
+static int check_address_bus(vu64 *p, uint64_t words, uint64_t base)
 {
 	const uint64_t pat = 0xAAAAAAAAAAAAAAAAull, anti = 0x5555555555555555ull;
-	uint64_t off, off2;
+	uint64_t word, word2;
 	int bad = 0;
 
-	for (off = 1; off < words; off <<= 1)
-		p[off] = pat;
+	for (word = 1; word < words; word <<= 1)
+		p[word] = pat;
 	p[0] = anti;
-	for (off = 1; off < words; off <<= 1)
-		if (p[off] != pat) {
+	for (word = 1; word < words; word <<= 1)
+		if (p[word] != pat) {
 			tc_fail("address bit %u (0x%llx) aliases address 0x%llx: stuck",
-				log2u64(off * 8), (unsigned long long)(base + off * 8),
+				log2u64(word * 8), (unsigned long long)(base + word * 8),
 				(unsigned long long)base);
 			bad = 1;
 		}
 	p[0] = pat;
-	for (off = 1; off < words && !bad; off <<= 1) {
-		p[off] = anti;
+	for (word = 1; word < words && !bad; word <<= 1) {
+		p[word] = anti;
 		if (p[0] != pat) {
 			tc_fail("address bit %u (0x%llx) aliases address 0x%llx: stuck",
-				log2u64(off * 8), (unsigned long long)(base + off * 8),
+				log2u64(word * 8), (unsigned long long)(base + word * 8),
 				(unsigned long long)base);
 			bad = 1;
 		}
-		for (off2 = 1; off2 < words && !bad; off2 <<= 1)
-			if (off2 != off && p[off2] != pat) {
+		for (word2 = 1; word2 < words && !bad; word2 <<= 1)
+			if (word2 != word && p[word2] != pat) {
 				tc_fail("address bits %u and %u are shorted (0x%llx aliases 0x%llx)",
-					log2u64(off * 8), log2u64(off2 * 8),
-					(unsigned long long)(base + off * 8),
-					(unsigned long long)(base + off2 * 8));
+					log2u64(word * 8), log2u64(word2 * 8),
+					(unsigned long long)(base + word * 8),
+					(unsigned long long)(base + word2 * 8));
 				bad = 1;
 			}
-		p[off] = pat;
+		p[word] = pat;
 	}
 	if (!bad)
 		tc_info("address bus: %u address lines, no aliasing", log2u64(words * 8));
 	return bad ? -1 : 0;
 }
 
-static void progress(const char *what, uint64_t done, uint64_t total, uint64_t t0)
+static void print_progress(const char *what, uint64_t done, uint64_t total, uint64_t t0)
 {
 	tc_info("  %s %llu / %llu MiB, %.0f MiB/s", what, (unsigned long long)(done / MIB),
 		(unsigned long long)(total / MIB), tc_mibps(done, tc_now_ns() - t0));
@@ -296,24 +297,24 @@ static void progress(const char *what, uint64_t done, uint64_t total, uint64_t t
 
 /*
  * Writes every word, then reads every word back. The pattern is the word's
- * own physical address (inverted when invert is set), so an address fault
+ * own physical address (inverted when `inverted` is set), so an address fault
  * shows as a value from the wrong place.
  */
-static int full_pass(vu64 *p, uint64_t words, uint64_t base, int invert, double *w_mibps,
-		     double *r_mibps)
+static int run_full_pass(vu64 *p, uint64_t words, uint64_t base, int inverted, double *write_mibps,
+			 double *read_mibps)
 {
-	const uint64_t mask = invert ? ~0ull : 0, bytes = words * 8;
-	const uint64_t step = bytes > 2 * GIB ? GIB / 8 : words + 1;	/* progress lines */
+	const uint64_t mask = inverted ? ~0ull : 0, bytes = words * 8;
+	const uint64_t progress_words = bytes > 2 * GIB ? GIB / 8 : words + 1;	/* progress lines */
 	uint64_t i, t0, bad = 0, want, got;
-	const char *name = invert ? "inverted address" : "address";
+	const char *name = inverted ? "inverted address" : "address";
 
 	t0 = tc_now_ns();
 	for (i = 0; i < words; i++) {
 		p[i] = (base + i * 8) ^ mask;
-		if (i && i % step == 0)
-			progress("write", i * 8, bytes, t0);
+		if (i && i % progress_words == 0)
+			print_progress("write", i * 8, bytes, t0);
 	}
-	*w_mibps = tc_mibps(bytes, tc_now_ns() - t0);
+	*write_mibps = tc_mibps(bytes, tc_now_ns() - t0);
 
 	t0 = tc_now_ns();
 	for (i = 0; i < words; i++) {
@@ -323,83 +324,86 @@ static int full_pass(vu64 *p, uint64_t words, uint64_t base, int invert, double 
 			tc_info("  0x%010llx: read 0x%016llx, expected 0x%016llx (bits 0x%016llx)",
 				(unsigned long long)(base + i * 8), (unsigned long long)got,
 				(unsigned long long)want, (unsigned long long)(got ^ want));
-		if (i && i % step == 0)
-			progress("read", i * 8, bytes, t0);
+		if (i && i % progress_words == 0)
+			print_progress("read", i * 8, bytes, t0);
 	}
-	*r_mibps = tc_mibps(bytes, tc_now_ns() - t0);
+	*read_mibps = tc_mibps(bytes, tc_now_ns() - t0);
 	if (bad)
 		tc_fail("%s pattern: %llu of %llu words wrong", name, (unsigned long long)bad,
 			(unsigned long long)words);
 	else
 		tc_info("%s pattern: %llu MiB written at %.0f MiB/s, read back at %.0f MiB/s", name,
-			(unsigned long long)(bytes / MIB), *w_mibps, *r_mibps);
+			(unsigned long long)(bytes / MIB), *write_mibps, *read_mibps);
 	return bad ? -1 : 0;
 }
 
 static void step_ddr4(void)
 {
-	long page = sysconf(_SC_PAGESIZE);
-	double w[2] = { 0, 0 }, r[2] = { 0, 0 };
+	long page_size = sysconf(_SC_PAGESIZE);
+	double write_mibps[2] = { 0, 0 }, read_mibps[2] = { 0, 0 };
 	uint64_t len, words;
-	struct region reg;
+	struct region region;
 	void *map;
 	int fd;
 
-	if (find_region(&reg)) {
-		a_summary("PL DDR4 region not found");
+	if (find_region(&region)) {
+		a_set_summary("PL DDR4 region not found");
 		return;
 	}
-	tc_info("PL DDR4: 0x%llx, %llu MiB (from %s)", (unsigned long long)reg.base,
-		(unsigned long long)(reg.size / MIB), reg.label);
-	len = A.o.ddr4_limit && A.o.ddr4_limit < reg.size ? A.o.ddr4_limit : reg.size;
-	len &= ~((uint64_t)page - 1);
-	if (!len || reg.base % (uint64_t)page) {
-		tc_fail("region 0x%llx + 0x%llx is not page aligned", (unsigned long long)reg.base,
-			(unsigned long long)reg.size);
-		a_summary("bad region");
+	tc_info("PL DDR4: 0x%llx, %llu MiB (from %s)", (unsigned long long)region.base,
+		(unsigned long long)(region.size / MIB), region.label);
+	len = a_env.opts.ddr4_limit_bytes && a_env.opts.ddr4_limit_bytes < region.size ?
+	      a_env.opts.ddr4_limit_bytes : region.size;
+	len &= ~((uint64_t)page_size - 1);
+	if (!len || region.base % (uint64_t)page_size) {
+		tc_fail("region 0x%llx + 0x%llx is not page aligned",
+			(unsigned long long)region.base, (unsigned long long)region.size);
+		a_set_summary("bad region");
 		return;
 	}
-	if (len < reg.size)
+	if (len < region.size)
 		tc_info("testing the first %llu MiB only (--ddr4-mb)", (unsigned long long)(len / MIB));
-	if (!fpga_programmed()) {
-		a_summary("PL not programmed");
+	if (!check_fpga_programmed()) {
+		a_set_summary("PL not programmed");
 		return;
 	}
 
-	fd = open(A.o.mem_dev, O_RDWR | O_SYNC);
+	fd = open(a_env.opts.mem_dev, O_RDWR | O_SYNC);
 	if (fd < 0) {
-		tc_fail("open %s: %s%s", A.o.mem_dev, strerror(errno),
+		tc_fail("open %s: %s%s", a_env.opts.mem_dev, strerror(errno),
 			errno == ENOENT ? " (kernel built without CONFIG_DEVMEM?)" :
 			errno == EACCES || errno == EPERM ? " (run as root)" : "");
-		a_summary("cannot open %s", A.o.mem_dev);
+		a_set_summary("cannot open %s", a_env.opts.mem_dev);
 		return;
 	}
-	map = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)reg.base);
+	map = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)region.base);
 	close(fd);
 	if (map == MAP_FAILED) {
-		tc_fail("mmap of 0x%llx + %llu MiB through %s: %s%s", (unsigned long long)reg.base,
-			(unsigned long long)(len / MIB), A.o.mem_dev, strerror(errno),
+		tc_fail("mmap of 0x%llx + %llu MiB through %s: %s%s",
+			(unsigned long long)region.base, (unsigned long long)(len / MIB),
+			a_env.opts.mem_dev, strerror(errno),
 			errno == EPERM ? " (refused by CONFIG_STRICT_DEVMEM / CONFIG_IO_STRICT_DEVMEM)" :
 			"");
-		a_summary("cannot map the PL DDR4");
+		a_set_summary("cannot map the PL DDR4");
 		return;
 	}
 	tc_info("overwrites the tested PL DDR4 range; its old contents are lost");
 
 	words = len / 8;
-	if (data_bus(map, reg.base) || address_bus(map, words, reg.base)) {
+	if (check_data_bus(map, region.base) || check_address_bus(map, words, region.base)) {
 		tc_info("the full-region passes are skipped after a bus fault");
 	} else {
-		full_pass(map, words, reg.base, 0, &w[0], &r[0]);
-		full_pass(map, words, reg.base, 1, &w[1], &r[1]);
+		run_full_pass(map, words, region.base, 0, &write_mibps[0], &read_mibps[0]);
+		run_full_pass(map, words, region.base, 1, &write_mibps[1], &read_mibps[1]);
 	}
 	munmap(map, len);
-	a_summary("%llu MiB at 0x%llx%s, write %.0f MiB/s, read %.0f MiB/s",
-		  (unsigned long long)(len / MIB), (unsigned long long)reg.base,
-		  len < reg.size ? " (partial)" : "", (w[0] + w[1]) / 2, (r[0] + r[1]) / 2);
+	a_set_summary("%llu MiB at 0x%llx%s, write %.0f MiB/s, read %.0f MiB/s",
+		      (unsigned long long)(len / MIB), (unsigned long long)region.base,
+		      len < region.size ? " (partial)" : "", (write_mibps[0] + write_mibps[1]) / 2,
+		      (read_mibps[0] + read_mibps[1]) / 2);
 }
 
-const struct step accept_ddr4[] = {
+const struct step a_ddr4_steps[] = {
 	{ "ddr4", step_ddr4, 0, "ddr4test",
 	  "PL DDR4: data bus, address bus, address and inverted patterns over the region", NULL },
 	{ NULL, NULL, 0, NULL, NULL, NULL },

@@ -8,69 +8,70 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define FDIR_WORDS	73
-#define FDIR_FILL	0xCAFECAFEu
-#define FDIR_NODE	33
-#define FDIR_APP	0x100
-#define SPW_RECV_CAP	(RAMON_SPW_BUF_DEFAULT + 64)
-#define LOOP_WAIT_MS	3000
-#define AXILOOP_SEED	0xA5A50000u
+#define FDIR_WORDS		73
+#define FDIR_PLACEHOLDER	0xCAFECAFEu
+#define FDIR_NODE		33
+#define FDIR_APP		0x100
+#define SPW_RECV_CAP		(RAMON_SPW_BUF_DEFAULT + 64)
+#define LOOP_WAIT_MS		3000
+#define AXILOOP_SEED		0xA5A50000u
 
 
 /* ---- FDIR snapshot, as the old fdir_get_payload_values() ---- */
 
-static void fdir_regs(struct cli *cl, const char *win, const uint32_t *offs, unsigned n,
-		      uint32_t *w, unsigned *k)
+static void fdir_read_regs(struct cli *cl, const char *win, const uint32_t *offs, unsigned n,
+			   uint32_t *words, unsigned *n_words)
 {
 	unsigned i;
 
 	for (i = 0; i < n; i++)
-		if (ramon_reg_read(cl->c, win, offs[i], &w[(*k)++], NULL))
-			w[*k - 1] = FDIR_FILL;
+		if (ramon_reg_read(cl->c, win, offs[i], &words[(*n_words)++], NULL))
+			words[*n_words - 1] = FDIR_PLACEHOLDER;
 }
 
-static void fdir_fill(uint32_t *w, unsigned *k, unsigned n)
+static void fdir_add_placeholders(uint32_t *words, unsigned *n_words, unsigned n)
 {
 	while (n--)
-		w[(*k)++] = FDIR_FILL;
+		words[(*n_words)++] = FDIR_PLACEHOLDER;
 }
 
-static void fdir_snapshot(struct cli *cl, uint32_t w[FDIR_WORDS])
+static void fdir_snapshot(struct cli *cl, uint32_t words[FDIR_WORDS])
 {
 	static const uint32_t rstop[] = { 0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18 };
 	static const uint32_t spfi[] = { 0x40, 0x44, 0x48, 0xC8, 0xCC };
 	static const uint32_t spw[] = { 0x00, 0x04, 0x08, 0x20, 0x24 };
 	const struct ramon_get_info *gi = ramon_info(cl->c);
 	struct ramon_sysmon s;
-	unsigned k = 0, i;
+	unsigned n_words = 0, i;
 
-	fdir_regs(cl, "rs_top", rstop, ARRAY_SIZE(rstop), w, &k);
-	fdir_fill(w, &k, 3);			/* RFSoC status, reserved */
-	fdir_regs(cl, "spfi0", spfi, ARRAY_SIZE(spfi), w, &k);
-	fdir_fill(w, &k, 3);
+	fdir_read_regs(cl, "rs_top", rstop, ARRAY_SIZE(rstop), words, &n_words);
+	fdir_add_placeholders(words, &n_words, 3);	/* RFSoC status, reserved */
+	fdir_read_regs(cl, "spfi0", spfi, ARRAY_SIZE(spfi), words, &n_words);
+	fdir_add_placeholders(words, &n_words, 3);
 	/* SPFI1 is not used on this board: placeholders unless the driver enables it */
 	if (gi->spfi_mask & 2)
-		fdir_regs(cl, "spfi1", spfi, ARRAY_SIZE(spfi), w, &k);
+		fdir_read_regs(cl, "spfi1", spfi, ARRAY_SIZE(spfi), words, &n_words);
 	else
-		fdir_fill(w, &k, ARRAY_SIZE(spfi));
-	fdir_fill(w, &k, 3);
-	fdir_regs(cl, "spw0", spw, ARRAY_SIZE(spw), w, &k);
-	fdir_fill(w, &k, ARRAY_SIZE(spw));	/* SPW NN1 placeholders, as the old code */
+		fdir_add_placeholders(words, &n_words, ARRAY_SIZE(spfi));
+	fdir_add_placeholders(words, &n_words, 3);
+	fdir_read_regs(cl, "spw0", spw, ARRAY_SIZE(spw), words, &n_words);
+	/* SPW NN1 placeholders, as the old code */
+	fdir_add_placeholders(words, &n_words, ARRAY_SIZE(spw));
 	if (ramon_sysmon_read(cl->c, &s, NULL))
 		memset(&s, 0xCA, sizeof(s));
 	for (i = 10; i < RAMON_SYSMON_RAILS; i++)
-		w[k++] = s.raw[i];
+		words[n_words++] = s.raw[i];
 	for (i = 0; i < 10; i++)
-		w[k++] = s.raw[i];
+		words[n_words++] = s.raw[i];
 }
 
 static int fdir_send(struct cli *cl, uint32_t nn, uint32_t dst, uint32_t app)
 {
-	uint32_t w[FDIR_WORDS];
-	struct ramon_iov iov = { w, sizeof(w) };
+	uint32_t words[FDIR_WORDS];
+	struct ramon_iov iov = { words, sizeof(words) };
 	struct ramon_spw_msg m;
 
-	fdir_snapshot(cl, w);
+	fdir_snapshot(cl, words);
 	memset(&m, 0, sizeof(m));
 	m.dst = (uint8_t)dst;
 	m.app_type = (uint16_t)app;
@@ -123,17 +124,17 @@ void cli_spw_rx_cb(void *user, const struct ramon_spw_rx *rx)
 	if (bad)
 		__atomic_add_fetch(&cl->rx_errors, 1, __ATOMIC_RELAXED);
 	flockfile(stdout);
-	if (cl->log_rx || cl->dump_level >= 2 || (cl->dump_level == 1 && bad))
+	if (cl->rx_log_on || cl->dump_level >= 2 || (cl->dump_level == 1 && bad))
 		print_rx(rx, cl->dump_level >= 3);
 	fflush(stdout);
 	funlockfile(stdout);
-	if (cl->fdir_auto && rx->hdr && rx->hdr->attribute_id == RAMON_SPW_FDIR_REQUEST_ATTR) {
+	if (cl->fdir_auto_on && rx->hdr && rx->hdr->attribute_id == RAMON_SPW_FDIR_REQUEST_ATTR) {
 		struct ramon_status st;
-		struct cli tmp = *cl;
+		struct cli rx_cl = *cl;
 
 		printf("      FDIR requested on spw%u, sending the snapshot\n", rx->nn);
-		if (fdir_send(&tmp, rx->nn, FDIR_NODE, FDIR_APP)) {
-			st = tmp.st;
+		if (fdir_send(&rx_cl, rx->nn, FDIR_NODE, FDIR_APP)) {
+			st = rx_cl.st;
 			tc_fail_st("FDIR reply", &st);
 		}
 	}
@@ -141,7 +142,8 @@ void cli_spw_rx_cb(void *user, const struct ramon_spw_rx *rx)
 
 /* ---- commands ---- */
 
-static int nn_or_all(struct cli *cl, int argc, char **argv, int i, uint32_t *first, uint32_t *last)
+static int parse_nn_range(struct cli *cl, int argc, char **argv, int i, uint32_t *first,
+			  uint32_t *last)
 {
 	uint32_t nn;
 	int ret;
@@ -150,9 +152,9 @@ static int nn_or_all(struct cli *cl, int argc, char **argv, int i, uint32_t *fir
 	*last = RAMON_NN_COUNT - 1;
 	if (i >= argc)
 		return 0;
-	ret = cli_u32(cl, argv[i], "nn", &nn);
+	ret = cli_parse_u32(cl, argv[i], "nn", &nn);
 	if (!ret)
-		ret = cli_nn(cl, nn);
+		ret = cli_check_nn(cl, nn);
 	if (!ret)
 		*first = *last = nn;
 	return ret;
@@ -160,7 +162,7 @@ static int nn_or_all(struct cli *cl, int argc, char **argv, int i, uint32_t *fir
 
 static int cmd_spwinit(struct cli *cl, int argc, char **argv)
 {
-	uint32_t nn, tries, synced = 0, present = 0;
+	uint32_t nn, tries, n_synced = 0, n_present = 0;
 	int ret;
 
 	(void)argc;
@@ -168,11 +170,11 @@ static int cmd_spwinit(struct cli *cl, int argc, char **argv)
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
 		if (!ramon_spw_present(cl->c, nn))
 			continue;
-		present++;
+		n_present++;
 		ret = ramon_spw_sync(cl->c, nn, &tries, &cl->st);
 		if (!ret) {
 			printf("      spw%u: link synced after %u reset(s)\n", nn, tries);
-			synced++;
+			n_synced++;
 		} else if (cl->st.code == RAMON_EL_SPW_LINK_DOWN) {
 			printf("      spw%u: not synced (expected on an NN without a cable)\n", nn);
 		} else {
@@ -180,8 +182,8 @@ static int cmd_spwinit(struct cli *cl, int argc, char **argv)
 		}
 	}
 	printf("      our node %u, NN node 0x%x\n", cl->node, cl->target);
-	if (present && !synced)
-		return cli_err(cl, ENOLINK, "no SPW link synced");
+	if (n_present && !n_synced)
+		return cli_set_err(cl, ENOLINK, "no SPW link synced");
 	return 0;
 }
 
@@ -196,17 +198,17 @@ static int cmd_spwterm(struct cli *cl, int argc, char **argv)
 static int cmd_spwnode(struct cli *cl, int argc, char **argv)
 {
 	uint32_t v;
-	int ret = cli_u32(cl, argv[1], "node", &v);
+	int ret = cli_parse_u32(cl, argv[1], "node", &v);
 
 	(void)argc;
 	if (!ret && v > 255)
-		ret = cli_err(cl, EINVAL, "node ids are 0..255");
+		ret = cli_set_err(cl, EINVAL, "node ids are 0..255");
 	if (ret)
 		return ret;
 	cl->node = (uint8_t)v;
 	if (ramon_spw_is_inited(cl->c)) {
 		ramon_spw_fini(cl->c);
-		return cli_spw(cl);
+		return cli_init_spw(cl);
 	}
 	return 0;
 }
@@ -217,20 +219,20 @@ static int cmd_loopback(struct cli *cl, int argc, char **argv)
 	int ret;
 
 	(void)argc;
-	ret = cli_u32(cl, argv[1], "nn", &nn);
+	ret = cli_parse_u32(cl, argv[1], "nn", &nn);
 	if (!ret)
-		ret = cli_nn(cl, nn);
+		ret = cli_check_nn(cl, nn);
 	if (!ret)
-		ret = cli_u32(cl, argv[2], "enable", &en);
+		ret = cli_parse_u32(cl, argv[2], "enable", &en);
 	if (!ret && en > 1)
-		ret = cli_err(cl, EINVAL, "enable is 0 or 1");
+		ret = cli_set_err(cl, EINVAL, "enable is 0 or 1");
 	return ret ? ret : ramon_spw_loopback(cl->c, nn, (int)en, &cl->st);
 }
 
 static int cmd_spwsync(struct cli *cl, int argc, char **argv)
 {
 	uint32_t first, last, nn, tries;
-	int ret = nn_or_all(cl, argc, argv, 1, &first, &last);
+	int ret = parse_nn_range(cl, argc, argv, 1, &first, &last);
 
 	for (nn = first; !ret && nn <= last; nn++) {
 		if (!ramon_spw_present(cl->c, nn))
@@ -252,7 +254,7 @@ static int cmd_spwstatus(struct cli *cl, int argc, char **argv)
 	uint32_t first, last, nn, v;
 	char win[8];
 	unsigned i;
-	int ret = nn_or_all(cl, argc, argv, 1, &first, &last);
+	int ret = parse_nn_range(cl, argc, argv, 1, &first, &last);
 
 	if (!ret)
 		ret = ramon_get_stats(cl->c, 0, &g, &cl->st);
@@ -291,17 +293,17 @@ static int cmd_spwreg(struct cli *cl, int argc, char **argv)
 	char win[8];
 	int ret;
 
-	ret = cli_u32(cl, argv[1], "nn", &nn);
+	ret = cli_parse_u32(cl, argv[1], "nn", &nn);
 	if (!ret)
-		ret = cli_nn(cl, nn);
+		ret = cli_check_nn(cl, nn);
 	if (!ret)
-		ret = cli_u32(cl, argv[2], "offset", &off);
+		ret = cli_parse_u32(cl, argv[2], "offset", &off);
 	if (!ret && argc > 3)
-		ret = cli_u32(cl, argv[3], "value", &val);
+		ret = cli_parse_u32(cl, argv[3], "value", &val);
 	if (ret)
 		return ret;
 	snprintf(win, sizeof(win), "spw%u", nn);
-	return cli_regio(cl, win, 0, 0, off, argc > 3, val);
+	return cli_access_reg(cl, win, 0, 0, off, argc > 3, val);
 }
 
 static int cmd_spwrx(struct cli *cl, int argc, char **argv)
@@ -310,11 +312,11 @@ static int cmd_spwrx(struct cli *cl, int argc, char **argv)
 	int ret;
 
 	(void)argc;
-	ret = cli_u32(cl, argv[1], "nn", &nn);
+	ret = cli_parse_u32(cl, argv[1], "nn", &nn);
 	if (!ret)
-		ret = cli_nn(cl, nn);
+		ret = cli_check_nn(cl, nn);
 	if (!ret)
-		ret = cli_u32(cl, argv[2], "on", &on);
+		ret = cli_parse_u32(cl, argv[2], "on", &on);
 	if (ret)
 		return ret;
 	if (!on)
@@ -322,34 +324,35 @@ static int cmd_spwrx(struct cli *cl, int argc, char **argv)
 	return ramon_spw_rx_start(cl->c, nn, cli_spw_rx_cb, cl, &cl->st);
 }
 
-static int set_level(struct cli *cl, const char *s, uint32_t max, int *field, const char *what)
+static int set_rx_setting(struct cli *cl, const char *s, uint32_t max, int *setting,
+			  const char *what)
 {
 	uint32_t v;
-	int ret = cli_u32(cl, s, what, &v);
+	int ret = cli_parse_u32(cl, s, what, &v);
 
 	if (!ret && v > max)
-		ret = cli_err(cl, EINVAL, "%s is 0..%u", what, max);
+		ret = cli_set_err(cl, EINVAL, "%s is 0..%u", what, max);
 	if (!ret)
-		*field = (int)v;
+		*setting = (int)v;
 	return ret;
 }
 
 static int cmd_spwdump(struct cli *cl, int argc, char **argv)
 {
 	(void)argc;
-	return set_level(cl, argv[1], 3, &cl->dump_level, "level");
+	return set_rx_setting(cl, argv[1], 3, &cl->dump_level, "level");
 }
 
 static int cmd_log(struct cli *cl, int argc, char **argv)
 {
 	(void)argc;
-	return set_level(cl, argv[1], 1, &cl->log_rx, "log");
+	return set_rx_setting(cl, argv[1], 1, &cl->rx_log_on, "log");
 }
 
 static int cmd_fdirauto(struct cli *cl, int argc, char **argv)
 {
 	(void)argc;
-	return set_level(cl, argv[1], 1, &cl->fdir_auto, "fdirauto");
+	return set_rx_setting(cl, argv[1], 1, &cl->fdir_auto_on, "fdirauto");
 }
 
 struct send_job {
@@ -367,7 +370,7 @@ static void *send_thread(void *arg)
 	struct send_job *j = arg;
 	uint32_t i;
 
-	for (i = 0; i < j->count && !cli_intr(); i++) {
+	for (i = 0; i < j->count && !cli_is_interrupted(); i++) {
 		j->ret = ramon_spw_send(j->cl->c, j->nn, &j->m, &j->iov, 1, 0, &j->st);
 		if (j->ret)
 			break;
@@ -380,41 +383,41 @@ static void *send_thread(void *arg)
 
 static int cmd_spwsend(struct cli *cl, int argc, char **argv)
 {
-	uint32_t len, count, threads, delay, nn, dst, app, proto, attr, i, sent = 0;
+	uint32_t len, count, n_threads, delay_ms, nn, dst, app, proto, attr, i, sent = 0;
 	struct send_job *jobs;
 	pthread_t *th;
 	uint32_t *payload;
-	uint64_t t0, ns;
+	uint64_t t0, elapsed_ns;
 	int ret;
 
-	ret = cli_u32(cl, argv[1], "len", &len);
+	ret = cli_parse_u32(cl, argv[1], "len", &len);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 2, 1, "count", &count);
+		ret = cli_parse_opt_u32(cl, argc, argv, 2, 1, "count", &count);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 3, 1, "threads", &threads);
+		ret = cli_parse_opt_u32(cl, argc, argv, 3, 1, "threads", &n_threads);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 4, 0, "delay_ms", &delay);
+		ret = cli_parse_opt_u32(cl, argc, argv, 4, 0, "delay_ms", &delay_ms);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 5, 0, "nn", &nn);
+		ret = cli_parse_opt_u32(cl, argc, argv, 5, 0, "nn", &nn);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 6, cl->node, "dst_node", &dst);
+		ret = cli_parse_opt_u32(cl, argc, argv, 6, cl->node, "dst_node", &dst);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 7, 0, "dst_app", &app);
+		ret = cli_parse_opt_u32(cl, argc, argv, 7, 0, "dst_app", &app);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 8, 0, "proto", &proto);
+		ret = cli_parse_opt_u32(cl, argc, argv, 8, 0, "proto", &proto);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 9, 0, "attr", &attr);
+		ret = cli_parse_opt_u32(cl, argc, argv, 9, 0, "attr", &attr);
 	if (!ret)
-		ret = cli_nn(cl, nn);
-	if (!ret && (!threads || threads > 64))
-		ret = cli_err(cl, EINVAL, "threads is 1..64");
+		ret = cli_check_nn(cl, nn);
+	if (!ret && (!n_threads || n_threads > 64))
+		ret = cli_set_err(cl, EINVAL, "threads is 1..64");
 	if (ret)
 		return ret;
 	payload = calloc(1, len + 4);
-	jobs = calloc(threads, sizeof(*jobs));
-	th = calloc(threads, sizeof(*th));
+	jobs = calloc(n_threads, sizeof(*jobs));
+	th = calloc(n_threads, sizeof(*th));
 	if (!payload || !jobs || !th) {
-		ret = cli_err(cl, ENOMEM, "out of memory");
+		ret = cli_set_err(cl, ENOMEM, "out of memory");
 		goto out;
 	}
 	for (i = 0; i < (len + 3) / 4; i++)
@@ -422,11 +425,11 @@ static int cmd_spwsend(struct cli *cl, int argc, char **argv)
 	__atomic_store_n(&cl->rx_packets, 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&cl->rx_errors, 0, __ATOMIC_RELAXED);
 	t0 = tc_now_ns();
-	for (i = 0; i < threads; i++) {
+	for (i = 0; i < n_threads; i++) {
 		jobs[i].cl = cl;
 		jobs[i].nn = nn;
 		jobs[i].count = count;
-		jobs[i].delay_ms = delay;
+		jobs[i].delay_ms = delay_ms;
 		jobs[i].m.dst = (uint8_t)dst;
 		jobs[i].m.app_type = (uint16_t)app;
 		jobs[i].m.protocol_id = (uint8_t)proto;
@@ -434,12 +437,12 @@ static int cmd_spwsend(struct cli *cl, int argc, char **argv)
 		jobs[i].iov.base = payload;
 		jobs[i].iov.len = len;
 		if (pthread_create(&th[i], NULL, send_thread, &jobs[i])) {
-			ret = cli_err(cl, EAGAIN, "pthread_create failed");
-			threads = i;
+			ret = cli_set_err(cl, EAGAIN, "pthread_create failed");
+			n_threads = i;
 			break;
 		}
 	}
-	for (i = 0; i < threads; i++) {
+	for (i = 0; i < n_threads; i++) {
 		pthread_join(th[i], NULL);
 		sent += jobs[i].sent;
 		if (jobs[i].ret && !ret) {
@@ -447,9 +450,10 @@ static int cmd_spwsend(struct cli *cl, int argc, char **argv)
 			cl->st = jobs[i].st;
 		}
 	}
-	ns = tc_now_ns() - t0;
+	elapsed_ns = tc_now_ns() - t0;
 	printf("      sent %u packet(s) of %u payload bytes to node %u app 0x%x on spw%u, %.1f MiB/s\n",
-	       sent, len, dst, app, nn, tc_mibps((uint64_t)sent * (len + RAMON_SPW_HDR_BYTES), ns));
+	       sent, len, dst, app, nn,
+	       tc_mibps((uint64_t)sent * (len + RAMON_SPW_HDR_BYTES), elapsed_ns));
 out:
 	free(payload);
 	free(jobs);
@@ -460,19 +464,19 @@ out:
 static int cmd_spwrecv(struct cli *cl, int argc, char **argv)
 {
 	struct ramon_spw_rx rx;
-	uint32_t nn, timeout;
+	uint32_t nn, timeout_ms;
 	uint8_t *buf;
 	int ret;
 
-	ret = cli_u32(cl, argv[1], "nn", &nn);
+	ret = cli_parse_u32(cl, argv[1], "nn", &nn);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 2, 3000, "timeout_ms", &timeout);
+		ret = cli_parse_opt_u32(cl, argc, argv, 2, 3000, "timeout_ms", &timeout_ms);
 	if (ret)
 		return ret;
 	buf = malloc(SPW_RECV_CAP);
 	if (!buf)
-		return cli_err(cl, ENOMEM, "out of memory");
-	ret = ramon_spw_recv(cl->c, nn, buf, SPW_RECV_CAP, timeout, &rx, &cl->st);
+		return cli_set_err(cl, ENOMEM, "out of memory");
+	ret = ramon_spw_recv(cl->c, nn, buf, SPW_RECV_CAP, timeout_ms, &rx, &cl->st);
 	if (!ret)
 		print_rx(&rx, 1);
 	free(buf);
@@ -482,7 +486,7 @@ static int cmd_spwrecv(struct cli *cl, int argc, char **argv)
 static int cmd_spwdrain(struct cli *cl, int argc, char **argv)
 {
 	uint32_t first, last, nn, n;
-	int ret = nn_or_all(cl, argc, argv, 1, &first, &last);
+	int ret = parse_nn_range(cl, argc, argv, 1, &first, &last);
 
 	for (nn = first; !ret && nn <= last; nn++) {
 		if (!ramon_spw_present(cl->c, nn))
@@ -501,26 +505,26 @@ static int cmd_spwloop(struct cli *cl, int argc, char **argv)
 	struct ramon_spw_rx rx;
 	struct ramon_iov iov;
 	struct ramon_status st;
-	uint32_t nn, len, count, i, ok = 0;
-	uint8_t *tx = NULL, *rbuf = NULL;
-	uint64_t t0, ns;
+	uint32_t nn, len, count, i, n_ok = 0;
+	uint8_t *tx_buf = NULL, *rx_buf = NULL;
+	uint64_t t0, elapsed_ns;
 	int was_on = 0, ret;
 
-	ret = cli_u32(cl, argv[1], "nn", &nn);
+	ret = cli_parse_u32(cl, argv[1], "nn", &nn);
 	if (!ret)
-		ret = cli_nn(cl, nn);
+		ret = cli_check_nn(cl, nn);
 	if (!ret)
-		ret = cli_u32(cl, argv[2], "len", &len);
+		ret = cli_parse_u32(cl, argv[2], "len", &len);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 3, 1, "count", &count);
+		ret = cli_parse_opt_u32(cl, argc, argv, 3, 1, "count", &count);
 	if (ret)
 		return ret;
 	if (ramon_spw_rx_running(cl->c, nn))
-		return cli_err(cl, EBUSY, "stop the RX thread first (spwrx %u 0)", nn);
-	tx = malloc(len + 1);
-	rbuf = malloc(len + 256);
-	if (!tx || !rbuf) {
-		ret = cli_err(cl, ENOMEM, "out of memory");
+		return cli_set_err(cl, EBUSY, "stop the RX thread first (spwrx %u 0)", nn);
+	tx_buf = malloc(len + 1);
+	rx_buf = malloc(len + 256);
+	if (!tx_buf || !rx_buf) {
+		ret = cli_set_err(cl, ENOMEM, "out of memory");
 		goto out;
 	}
 	ret = ramon_spw_loopback_get(cl->c, nn, &was_on, &cl->st);
@@ -529,42 +533,43 @@ static int cmd_spwloop(struct cli *cl, int argc, char **argv)
 	if (!ret)
 		ret = ramon_spw_drain(cl->c, nn, 20, NULL, &cl->st);
 	t0 = tc_now_ns();
-	for (i = 0; !ret && i < count && !cli_intr(); i++) {
-		tc_fill(tx, len, i);
+	for (i = 0; !ret && i < count && !cli_is_interrupted(); i++) {
+		tc_fill(tx_buf, len, i);
 		memset(&m, 0, sizeof(m));
 		m.dst = cl->node;
 		m.packet_id = (uint16_t)i;
 		m.flags = RAMON_SPW_MSG_KEEP_ID;
-		iov.base = tx;
+		iov.base = tx_buf;
 		iov.len = len;
 		ret = ramon_spw_send(cl->c, nn, &m, &iov, 1, 0, &cl->st);
 		if (!ret)
-			ret = ramon_spw_recv(cl->c, nn, rbuf, len + 256, LOOP_WAIT_MS, &rx, &cl->st);
+			ret = ramon_spw_recv(cl->c, nn, rx_buf, len + 256, LOOP_WAIT_MS, &rx,
+					     &cl->st);
 		if (ret)
 			break;
 		if (rx.flags || rx.hdr->packet_id != (uint16_t)i || rx.payload_len != len ||
-		    tc_verify(rx.payload, len, i) >= 0) {
+		    tc_find_mismatch(rx.payload, len, i) >= 0) {
 			print_rx(&rx, 0);
-			ret = cli_err(cl, EIO, "packet %u came back wrong", i);
+			ret = cli_set_err(cl, EIO, "packet %u came back wrong", i);
 			break;
 		}
-		ok++;
+		n_ok++;
 	}
-	ns = tc_now_ns() - t0;
-	printf("      %u of %u packet(s) of %u bytes came back intact, %.1f MiB/s round trip\n", ok,
-	       count, len, tc_mibps((uint64_t)ok * len, ns));
+	elapsed_ns = tc_now_ns() - t0;
+	printf("      %u of %u packet(s) of %u bytes came back intact, %.1f MiB/s round trip\n",
+	       n_ok, count, len, tc_mibps((uint64_t)n_ok * len, elapsed_ns));
 out:
 	if (!was_on && ramon_spw_loopback(cl->c, nn, 0, &st))
 		tc_fail_st("restoring loopback off", &st);
-	free(tx);
-	free(rbuf);
+	free(tx_buf);
+	free(rx_buf);
 	return ret;
 }
 
 static int cmd_spwdps(struct cli *cl, int argc, char **argv)
 {
 	uint32_t nn;
-	int ret = cli_opt_u32(cl, argc, argv, 1, 0, "nn", &nn);
+	int ret = cli_parse_opt_u32(cl, argc, argv, 1, 0, "nn", &nn);
 
 	if (!ret)
 		ret = ramon_spw_nn_dps(cl->c, nn, 0, &cl->st);
@@ -577,7 +582,7 @@ static int cmd_nnswver(struct cli *cl, int argc, char **argv)
 {
 	struct ramon_nn_version v;
 	uint32_t nn;
-	int ret = cli_opt_u32(cl, argc, argv, 1, 0, "nn", &nn);
+	int ret = cli_parse_opt_u32(cl, argc, argv, 1, 0, "nn", &nn);
 
 	if (!ret)
 		ret = ramon_spw_nn_version(cl->c, nn, &v, 0, &cl->st);
@@ -591,7 +596,7 @@ static void swup_progress(void *user, uint32_t done, uint32_t total)
 {
 	struct cli *cl = user;
 
-	if (!cl->script || done == total) {
+	if (!cl->is_batch || done == total) {
 		printf("\r      packet %u/%u", done, total);
 		if (done == total)
 			printf("\n");
@@ -606,14 +611,14 @@ static int cmd_nnupdate(struct cli *cl, int argc, char **argv)
 	size_t len;
 	int ret;
 
-	ret = cli_opt_u32(cl, argc, argv, 2, 0, "nn", &nn);
+	ret = cli_parse_opt_u32(cl, argc, argv, 2, 0, "nn", &nn);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 3, 0, "sw_type", &type);
+		ret = cli_parse_opt_u32(cl, argc, argv, 3, 0, "sw_type", &type);
 	if (ret)
 		return ret;
 	ret = tc_read_file(argv[1], &img, &len, 0xFFFFu * RAMON_SPW_SWUP_CHUNK);
 	if (ret)
-		return cli_err(cl, -ret, "%s: %s", argv[1], strerror(-ret));
+		return cli_set_err(cl, -ret, "%s: %s", argv[1], strerror(-ret));
 	printf("      %s: %zu bytes, %zu packets\n", argv[1], len,
 	       (len + RAMON_SPW_SWUP_CHUNK - 1) / RAMON_SPW_SWUP_CHUNK);
 	ret = ramon_spw_nn_sw_update(cl->c, nn, (uint8_t)type, img, len, swup_progress, cl, &cl->st);
@@ -630,14 +635,14 @@ static int cmd_nnconf(struct cli *cl, int argc, char **argv)
 	uint32_t nn;
 	uint8_t *data;
 	size_t len;
-	int ret = cli_opt_u32(cl, argc, argv, 2, 0, "nn", &nn);
+	int ret = cli_parse_opt_u32(cl, argc, argv, 2, 0, "nn", &nn);
 
 	if (ret)
 		return ret;
 	ret = tc_read_file(argv[1], &data, &len, RAMON_SPW_CONFIG_MAX);
 	if (ret)
-		return cli_err(cl, -ret, "%s: %s%s", argv[1], strerror(-ret),
-			       ret == -EFBIG ? " (the limit is 4096 bytes)" : "");
+		return cli_set_err(cl, -ret, "%s: %s%s", argv[1], strerror(-ret),
+				   ret == -EFBIG ? " (the limit is 4096 bytes)" : "");
 	ret = ramon_spw_nn_config_push(cl->c, nn, data, (uint32_t)len, 0, &cl->st);
 	if (!ret)
 		printf("      NN configuration (%zu bytes) acknowledged\n", len);
@@ -651,11 +656,11 @@ static int cmd_fdir(struct cli *cl, int argc, char **argv)
 	int ret;
 
 	(void)argc;
-	ret = cli_u32(cl, argv[1], "nn", &nn);
+	ret = cli_parse_u32(cl, argv[1], "nn", &nn);
 	if (!ret)
-		ret = cli_u32(cl, argv[2], "dst_node", &dst);
+		ret = cli_parse_u32(cl, argv[2], "dst_node", &dst);
 	if (!ret)
-		ret = cli_u32(cl, argv[3], "dst_app", &app);
+		ret = cli_parse_u32(cl, argv[3], "dst_app", &app);
 	if (!ret)
 		ret = fdir_send(cl, nn, dst, app);
 	if (!ret)
@@ -672,35 +677,35 @@ static int cmd_axiloop(struct cli *cl, int argc, char **argv)
 	struct ramon_iov iov;
 	struct ramon_status st;
 	ramon_buf tx, rx;
-	uint32_t nn, size, n_items, count, rxc, txc, len, i, ok = 0, piece;
+	uint32_t nn, size, n_items, count, rx_chan, tx_chan, len, i, n_ok = 0, piece;
 	uint8_t *payload = NULL;
-	uint64_t t0, ns;
+	uint64_t t0, elapsed_ns;
 	int was_on = 0, ret;
 
 	memset(&tx, 0, sizeof(tx));
 	memset(&rx, 0, sizeof(rx));
-	ret = cli_u32(cl, argv[1], "nn", &nn);
+	ret = cli_parse_u32(cl, argv[1], "nn", &nn);
 	if (!ret)
-		ret = cli_nn(cl, nn);
+		ret = cli_check_nn(cl, nn);
 	if (!ret)
-		ret = cli_u32(cl, argv[2], "size", &size);
+		ret = cli_parse_u32(cl, argv[2], "size", &size);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 3, 1, "items", &n_items);
+		ret = cli_parse_opt_u32(cl, argc, argv, 3, 1, "items", &n_items);
 	if (!ret)
-		ret = cli_opt_u32(cl, argc, argv, 4, 1, "count", &count);
+		ret = cli_parse_opt_u32(cl, argc, argv, 4, 1, "count", &count);
 	if (!ret && (size < RAMON_SPW_HDR_BYTES || !n_items || n_items > RAMON_AXI_MAX_ITEMS ||
 		     n_items > size))
-		ret = cli_err(cl, EINVAL, "size >= 40 bytes and items 1..min(size, %u)",
-			      RAMON_AXI_MAX_ITEMS);
+		ret = cli_set_err(cl, EINVAL, "size >= 40 bytes and items 1..min(size, %u)",
+				  RAMON_AXI_MAX_ITEMS);
 	if (!ret && size - RAMON_SPW_HDR_BYTES > RAMON_SPW_MAX_PAYLOAD)
-		ret = cli_err(cl, EMSGSIZE, "packet of %u bytes: payload %u is above the SPW maximum of %u (size <= %u); not sent",
-			      size, size - RAMON_SPW_HDR_BYTES, RAMON_SPW_MAX_PAYLOAD,
-			      RAMON_SPW_MAX_PAYLOAD + RAMON_SPW_HDR_BYTES);
+		ret = cli_set_err(cl, EMSGSIZE, "packet of %u bytes: payload %u is above the SPW maximum of %u (size <= %u); not sent",
+				  size, size - RAMON_SPW_HDR_BYTES, RAMON_SPW_MAX_PAYLOAD,
+				  RAMON_SPW_MAX_PAYLOAD + RAMON_SPW_HDR_BYTES);
 	if (ret)
 		return ret;
 	if (ramon_spw_rx_running(cl->c, nn))
-		return cli_err(cl, EBUSY, "stop the RX thread first (spwrx %u 0)", nn);
-	ret = ramon_axi_find_pair(cl->c, nn, &rxc, &txc, &cl->st);
+		return cli_set_err(cl, EBUSY, "stop the RX thread first (spwrx %u 0)", nn);
+	ret = ramon_axi_find_pair(cl->c, nn, &rx_chan, &tx_chan, &cl->st);
 	if (!ret)
 		ret = ramon_buf_alloc(cl->c, size, 0, &tx, &cl->st);
 	if (!ret)
@@ -708,7 +713,7 @@ static int cmd_axiloop(struct cli *cl, int argc, char **argv)
 	payload = malloc(size);
 	items = calloc(n_items, sizeof(*items));
 	if (!ret && (!payload || !items))
-		ret = cli_err(cl, ENOMEM, "out of memory");
+		ret = cli_set_err(cl, ENOMEM, "out of memory");
 	if (ret)
 		goto out;
 	tc_fill(payload, size - RAMON_SPW_HDR_BYTES, AXILOOP_SEED);
@@ -727,8 +732,8 @@ static int cmd_axiloop(struct cli *cl, int argc, char **argv)
 	if (!ret)
 		ret = ramon_spw_loopback(cl->c, nn, 1, &cl->st);
 	t0 = tc_now_ns();
-	for (i = 0; !ret && i < count && !cli_intr(); i++) {
-		ret = ramon_axi_xfer(cl->c, txc, items, n_items, 0, NULL, &cl->st);
+	for (i = 0; !ret && i < count && !cli_is_interrupted(); i++) {
+		ret = ramon_axi_xfer(cl->c, tx_chan, items, n_items, 0, NULL, &cl->st);
 		memset(&w, 0, sizeof(w));
 		w.nn = nn;
 		w.timeout_ms = LOOP_WAIT_MS;
@@ -740,23 +745,24 @@ static int cmd_axiloop(struct cli *cl, int argc, char **argv)
 			break;
 		}
 		if (w.size > rx.size) {
-			ret = cli_err(cl, EIO, "received %u bytes, sent %u: the RX stream is out of step",
-				      w.size, len);
+			ret = cli_set_err(cl, EIO, "received %u bytes, sent %u: the RX stream is out of step",
+					  w.size, len);
 			break;
 		}
-		ret = ramon_axi_xfer1(cl->c, rxc, &rx, 0, w.size, 0, &cl->st);
+		ret = ramon_axi_xfer1(cl->c, rx_chan, &rx, 0, w.size, 0, &cl->st);
 		if (ret)
 			break;
 		if (w.size != len + RAMON_SPW_FOOTER_BYTES || memcmp(rx.ptr, tx.ptr, len)) {
-			ret = cli_err(cl, EIO, "iteration %u: %u bytes back for %u sent, or different data",
-				      i, w.size, len);
+			ret = cli_set_err(cl, EIO, "iteration %u: %u bytes back for %u sent, or different data",
+					  i, w.size, len);
 			break;
 		}
-		ok++;
+		n_ok++;
 	}
-	ns = tc_now_ns() - t0;
+	elapsed_ns = tc_now_ns() - t0;
 	printf("      %u of %u loop(s) of %u bytes in %u SG item(s) on channels %u -> %u, %.1f MiB/s, %llu prep retries\n",
-	       ok, count, len, n_items, txc, rxc, tc_mibps((uint64_t)ok * len, ns),
+	       n_ok, count, len, n_items, tx_chan, rx_chan,
+	       tc_mibps((uint64_t)n_ok * len, elapsed_ns),
 	       (unsigned long long)ramon_axi_retries(cl->c));
 	if (!was_on && ramon_spw_loopback(cl->c, nn, 0, &st))
 		tc_fail_st("restoring loopback off", &st);
@@ -770,9 +776,9 @@ out:
 
 /* ---- loopdiag: why does FPGA loopback not return packets? ---- */
 
-#define DIAG_LEN	1024
-#define DIAG_WAIT_MS	1500
-#define DIAG_RAW_MS	2000
+#define DIAG_LEN		1024
+#define DIAG_WAIT_MS		1500
+#define DIAG_BLIND_RX_MS	2000
 
 struct diag_rx {
 	struct cli *cl;
@@ -792,7 +798,7 @@ static void *diag_rx_thread(void *arg)
 	return NULL;
 }
 
-static void diag_link(struct cli *cl, uint32_t nn, const char *when)
+static void diag_print_link(struct cli *cl, uint32_t nn, const char *when)
 {
 	uint32_t link = 0, lb = 0;
 	char win[8];
@@ -804,7 +810,7 @@ static void diag_link(struct cli *cl, uint32_t nn, const char *when)
 	       (link & 7) == 5 ? "synced" : "NOT synced", lb);
 }
 
-static uint64_t diag_spw_rx(struct cli *cl, uint32_t nn)
+static uint64_t diag_spw_rx_count(struct cli *cl, uint32_t nn)
 {
 	struct ramon_get_stats g;
 
@@ -812,15 +818,15 @@ static uint64_t diag_spw_rx(struct cli *cl, uint32_t nn)
 }
 
 /* one SPW packet to our own node, then SPW_WAIT_RX and the RX of that size; 1 if it came back */
-static int diag_packet(struct cli *cl, uint32_t nn, uint32_t rxc, uint32_t txc, ramon_buf *tx,
-		       ramon_buf *rx, const char *step)
+static int diag_try_packet(struct cli *cl, uint32_t nn, uint32_t rx_chan, uint32_t tx_chan,
+			   ramon_buf *tx, ramon_buf *rx, const char *step)
 {
 	struct ramon_spw_wait_rx w;
 	struct ramon_spw_msg m;
 	struct ramon_status st;
 	struct ramon_iov iov;
 	uint8_t payload[DIAG_LEN];
-	uint64_t before = diag_spw_rx(cl, nn);
+	uint64_t before = diag_spw_rx_count(cl, nn);
 	uint32_t len;
 	char msg[256];
 
@@ -830,7 +836,7 @@ static int diag_packet(struct cli *cl, uint32_t nn, uint32_t rxc, uint32_t txc, 
 	iov.base = payload;
 	iov.len = sizeof(payload);
 	ramon_spw_build(cl->node, &m, &iov, 1, tx->ptr, tx->size, &len);
-	if (ramon_axi_xfer1(cl->c, txc, tx, 0, len, 0, &st)) {
+	if (ramon_axi_xfer1(cl->c, tx_chan, tx, 0, len, 0, &st)) {
 		ramon_strerror(&st, msg, sizeof(msg));
 		printf("      %s: TX of %u bytes failed: %s\n", step, len, msg);
 		return 0;
@@ -840,7 +846,7 @@ static int diag_packet(struct cli *cl, uint32_t nn, uint32_t rxc, uint32_t txc, 
 	w.timeout_ms = DIAG_WAIT_MS;
 	if (ramon_ioc_spw_wait_rx(cl->c, &w)) {
 		printf("      %s: sent %u bytes; no RX size within %u ms (driver spw_rx +%llu)\n", step,
-		       len, DIAG_WAIT_MS, (unsigned long long)(diag_spw_rx(cl, nn) - before));
+		       len, DIAG_WAIT_MS, (unsigned long long)(diag_spw_rx_count(cl, nn) - before));
 		return 0;
 	}
 	printf("      %s: sent %u bytes; RX size %u arrived (%s)\n", step, len, w.size,
@@ -851,7 +857,7 @@ static int diag_packet(struct cli *cl, uint32_t nn, uint32_t rxc, uint32_t txc, 
 		return 0;
 	}
 	memset(rx->ptr, 0, w.size);
-	if (ramon_axi_xfer1(cl->c, rxc, rx, 0, w.size, 0, &st)) {
+	if (ramon_axi_xfer1(cl->c, rx_chan, rx, 0, w.size, 0, &st)) {
 		ramon_strerror(&st, msg, sizeof(msg));
 		printf("      %s: RX transfer of %u bytes failed: %s\n", step, w.size, msg);
 		return 0;
@@ -862,10 +868,10 @@ static int diag_packet(struct cli *cl, uint32_t nn, uint32_t rxc, uint32_t txc, 
 }
 
 /* an RX transfer with no size first, as the old xsgdma did; tx_len 0 = only receive */
-static int diag_blind(struct cli *cl, uint32_t rxc, uint32_t txc, ramon_buf *tx, ramon_buf *rx,
-		      uint32_t tx_len, const char *step)
+static int diag_try_blind_rx(struct cli *cl, uint32_t rx_chan, uint32_t tx_chan, ramon_buf *tx,
+			     ramon_buf *rx, uint32_t tx_len, const char *step)
 {
-	struct diag_rx d = { cl, rxc, rx, rx->size, DIAG_RAW_MS, 0, { 0 } };
+	struct diag_rx d = { cl, rx_chan, rx, rx->size, DIAG_BLIND_RX_MS, 0, { 0 } };
 	struct ramon_status st;
 	pthread_t th;
 	char msg[256];
@@ -876,7 +882,7 @@ static int diag_blind(struct cli *cl, uint32_t rxc, uint32_t txc, ramon_buf *tx,
 	if (tx_len) {
 		tc_sleep_ms(20);
 		memset(tx->ptr, 0xA5, tx_len);
-		if (ramon_axi_xfer1(cl->c, txc, tx, 0, tx_len, 0, &st)) {
+		if (ramon_axi_xfer1(cl->c, tx_chan, tx, 0, tx_len, 0, &st)) {
 			ramon_strerror(&st, msg, sizeof(msg));
 			printf("      %s: TX failed: %s\n", step, msg);
 		}
@@ -884,7 +890,7 @@ static int diag_blind(struct cli *cl, uint32_t rxc, uint32_t txc, ramon_buf *tx,
 	pthread_join(th, NULL);
 	if (d.ret) {
 		ramon_strerror(&d.st, msg, sizeof(msg));
-		printf("      %s: nothing received in %u ms (%s)\n", step, DIAG_RAW_MS, msg);
+		printf("      %s: nothing received in %u ms (%s)\n", step, DIAG_BLIND_RX_MS, msg);
 		return 0;
 	}
 	printf("      %s: the RX DMA received data; first bytes:\n", step);
@@ -894,21 +900,21 @@ static int diag_blind(struct cli *cl, uint32_t rxc, uint32_t txc, ramon_buf *tx,
 
 static int cmd_loopdiag(struct cli *cl, int argc, char **argv)
 {
-	uint32_t nn, rxc, txc, tries, dropped = 0;
+	uint32_t nn, rx_chan, tx_chan, tries, dropped = 0;
 	struct ramon_status st;
-	int was_on = 0, ok = 0, synced_ok = 0, stuck = 0, blind = 0, ret;
+	int was_on = 0, ok = 0, synced_ok = 0, stuck = 0, blind_rx_ok = 0, ret;
 	ramon_buf tx, rx;
 
 	memset(&tx, 0, sizeof(tx));
 	memset(&rx, 0, sizeof(rx));
-	ret = cli_opt_u32(cl, argc, argv, 1, 0, "nn", &nn);
+	ret = cli_parse_opt_u32(cl, argc, argv, 1, 0, "nn", &nn);
 	if (!ret)
-		ret = cli_nn(cl, nn);
+		ret = cli_check_nn(cl, nn);
 	if (ret)
 		return ret;
 	if (ramon_spw_rx_running(cl->c, nn))
-		return cli_err(cl, EBUSY, "stop the RX thread first (spwrx %u 0)", nn);
-	ret = ramon_axi_find_pair(cl->c, nn, &rxc, &txc, &cl->st);
+		return cli_set_err(cl, EBUSY, "stop the RX thread first (spwrx %u 0)", nn);
+	ret = ramon_axi_find_pair(cl->c, nn, &rx_chan, &tx_chan, &cl->st);
 	if (!ret)
 		ret = ramon_buf_alloc(cl->c, DIAG_LEN + RAMON_SPW_HDR_BYTES, 0, &tx, &cl->st);
 	if (!ret)
@@ -918,34 +924,35 @@ static int cmd_loopdiag(struct cli *cl, int argc, char **argv)
 	if (ret)
 		goto out;
 	printf("      spw%u: TX channel %u, RX channel %u, node %u. RX timeouts below reset this\n"
-	       "      axi_dma IP; the driver recovers from that.\n", nn, txc, rxc, cl->node);
-	diag_link(cl, nn, "before:");
+	       "      axi_dma IP; the driver recovers from that.\n", nn, tx_chan, rx_chan,
+	       cl->node);
+	diag_print_link(cl, nn, "before:");
 	ret = ramon_spw_loopback(cl->c, nn, 1, &cl->st);
 	if (ret)
 		goto out;
 	tc_sleep_ms(100);
-	diag_link(cl, nn, "loopback on, +100 ms:");
+	diag_print_link(cl, nn, "loopback on, +100 ms:");
 	ramon_spw_drain(cl->c, nn, 20, &dropped, NULL);
 	if (dropped)
 		printf("      dropped %u queued packet(s) first\n", dropped);
 
 	printf("   1. SPW packet, wait for its RX size (how the library and tests work)\n");
-	ok = diag_packet(cl, nn, rxc, txc, &tx, &rx, "1");
+	ok = diag_try_packet(cl, nn, rx_chan, tx_chan, &tx, &rx, "1");
 	if (!ok) {
 		printf("   2. link sync with loopback on, then the same packet\n");
 		if (ramon_spw_sync(cl->c, nn, &tries, &st)) {
 			printf("      sync failed after %u resets\n", tries);
 		} else {
 			printf("      synced after %u reset(s)\n", tries);
-			synced_ok = diag_packet(cl, nn, rxc, txc, &tx, &rx, "2");
+			synced_ok = diag_try_packet(cl, nn, rx_chan, tx_chan, &tx, &rx, "2");
 		}
-		diag_link(cl, nn, "after step 2:");
+		diag_print_link(cl, nn, "after step 2:");
 	}
 	if (!ok && !synced_ok) {
 		printf("   3. RX DMA without a size: is data from steps 1-2 waiting in the stream?\n");
-		stuck = diag_blind(cl, rxc, txc, &tx, &rx, 0, "3");
+		stuck = diag_try_blind_rx(cl, rx_chan, tx_chan, &tx, &rx, 0, "3");
 		printf("   4. old xsgdma: RX DMA started, then %u raw bytes sent\n", DIAG_LEN);
-		blind = diag_blind(cl, rxc, txc, &tx, &rx, DIAG_LEN, "4");
+		blind_rx_ok = diag_try_blind_rx(cl, rx_chan, tx_chan, &tx, &rx, DIAG_LEN, "4");
 	}
 
 	printf("   verdict: ");
@@ -955,7 +962,7 @@ static int cmd_loopdiag(struct cli *cl, int argc, char **argv)
 	else if (synced_ok)
 		printf("loopback works once the link is re-synced after enabling it; the library\n"
 		       "            must sync after switching loopback on.\n");
-	else if (stuck || blind)
+	else if (stuck || blind_rx_ok)
 		printf("looped data reaches the RX DMA, but no RX size interrupt is raised;\n"
 		       "            SPW_WAIT_RX cannot see loopback traffic.\n");
 	else
@@ -964,46 +971,48 @@ out:
 	if (!was_on && ramon_spw_loopback(cl->c, nn, 0, &st))
 		tc_fail_st("restoring loopback off", &st);
 	else if (!was_on)
-		diag_link(cl, nn, "loopback off again:");
+		diag_print_link(cl, nn, "loopback off again:");
 	ramon_buf_free(&tx, NULL);
 	ramon_buf_free(&rx, NULL);
 	return ret;
 }
 
 const struct cli_cmd cli_spw_cmds[] = {
-	{ "spwinit", cmd_spwinit, 0, 0, CMD_NEED_SPW, "", "set up SPW and sync every present link" },
+	{ "spwinit", cmd_spwinit, 0, 0, CMD_NEEDS_SPW, "",
+	  "set up SPW and sync every present link" },
 	{ "spwterm", cmd_spwterm, 0, 0, 0, "", "stop the RX threads and free the SPW buffers" },
 	{ "spwnode", cmd_spwnode, 1, 1, 0, "<node>", "our node id (old spwappinit)" },
 	{ "loopback", cmd_loopback, 2, 2, 0, "<nn> <0|1>", "FPGA SPW loopback" },
 	{ "spwsync", cmd_spwsync, 0, 1, 0, "[nn]", "reset the link until it syncs" },
 	{ "spwstatus", cmd_spwstatus, 0, 1, 0, "[nn]", "SPW registers and counters" },
 	{ "spwreg", cmd_spwreg, 2, 3, 0, "<nn> <off> [val]", "SPW register" },
-	{ "spwrx", cmd_spwrx, 2, 2, CMD_NEED_SPW, "<nn> <0|1>",
+	{ "spwrx", cmd_spwrx, 2, 2, CMD_NEEDS_SPW, "<nn> <0|1>",
 	  "RX thread that prints/counts packets (see spwdump, log)" },
 	{ "spwdump", cmd_spwdump, 1, 1, 0, "<0-3>",
 	  "RX printing: 1 errors + spwsend pattern check, 2 headers, 3 payload" },
 	{ "log", cmd_log, 1, 1, 0, "<0|1>", "RX: one line per packet" },
 	{ "fdirauto", cmd_fdirauto, 1, 1, 0, "<0|1>",
 	  "RX: answer attribute 0xA0 with the FDIR snapshot" },
-	{ "spwsend", cmd_spwsend, 1, 9, CMD_NEED_SPW,
+	{ "spwsend", cmd_spwsend, 1, 9, CMD_NEEDS_SPW,
 	  "<len> [count] [threads] [delay_ms] [nn] [dst_node] [dst_app] [proto] [attr]",
 	  "send packets (payload words 0,1,2..; dst default: our node)" },
-	{ "spwrecv", cmd_spwrecv, 1, 2, CMD_NEED_SPW, "<nn> [timeout_ms]", "receive one packet" },
-	{ "spwdrain", cmd_spwdrain, 0, 1, CMD_NEED_SPW, "[nn]", "drop queued packets" },
-	{ "spwloop", cmd_spwloop, 2, 3, CMD_NEED_SPW, "<nn> <len> [count]",
+	{ "spwrecv", cmd_spwrecv, 1, 2, CMD_NEEDS_SPW, "<nn> [timeout_ms]", "receive one packet" },
+	{ "spwdrain", cmd_spwdrain, 0, 1, CMD_NEEDS_SPW, "[nn]", "drop queued packets" },
+	{ "spwloop", cmd_spwloop, 2, 3, CMD_NEEDS_SPW, "<nn> <len> [count]",
 	  "loopback round trip, verified (replaces spwtest)" },
-	{ "spwtest", cmd_spwloop, 2, 3, CMD_NEED_SPW | CMD_HIDDEN, "<nn> <len> [count]",
+	{ "spwtest", cmd_spwloop, 2, 3, CMD_NEEDS_SPW | CMD_HIDDEN, "<nn> <len> [count]",
 	  "old name of spwloop" },
-	{ "spwdps", cmd_spwdps, 0, 1, CMD_NEED_SPW, "[nn]", "DPS request to the NN" },
-	{ "nnswver", cmd_nnswver, 0, 1, CMD_NEED_SPW, "[nn]", "NN software versions" },
-	{ "nnupdate", cmd_nnupdate, 1, 3, CMD_NEED_SPW | CMD_DESTRUCTIVE, "<file> [nn] [sw_type]",
+	{ "spwdps", cmd_spwdps, 0, 1, CMD_NEEDS_SPW, "[nn]", "DPS request to the NN" },
+	{ "nnswver", cmd_nnswver, 0, 1, CMD_NEEDS_SPW, "[nn]", "NN software versions" },
+	{ "nnupdate", cmd_nnupdate, 1, 3, CMD_NEEDS_SPW | CMD_DESTRUCTIVE, "<file> [nn] [sw_type]",
 	  "NN software update" },
-	{ "nnconf", cmd_nnconf, 1, 2, CMD_NEED_SPW, "<file> [nn]", "send a JSON configuration" },
-	{ "fdir", cmd_fdir, 3, 3, CMD_NEED_SPW, "<nn> <dst_node> <dst_app>", "send the FDIR snapshot" },
+	{ "nnconf", cmd_nnconf, 1, 2, CMD_NEEDS_SPW, "<file> [nn]", "send a JSON configuration" },
+	{ "fdir", cmd_fdir, 3, 3, CMD_NEEDS_SPW, "<nn> <dst_node> <dst_app>",
+	  "send the FDIR snapshot" },
 	{ "axiloop", cmd_axiloop, 2, 4, 0, "<nn> <size> [items] [count]",
 	  "raw AXI loopback through SPW, with MiB/s (old xsgdma)" },
 	{ "xsgdma", cmd_axiloop, 2, 4, CMD_HIDDEN, "<nn> <size> [items] [count]", "old name of axiloop" },
-	{ "loopdiag", cmd_loopdiag, 0, 1, CMD_NEED_SPW, "[nn]",
+	{ "loopdiag", cmd_loopdiag, 0, 1, CMD_NEEDS_SPW, "[nn]",
 	  "find out why FPGA loopback does not return packets" },
 	{ NULL, NULL, 0, 0, 0, NULL, NULL },
 };

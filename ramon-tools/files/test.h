@@ -22,31 +22,31 @@ struct test_opts {
 	uint8_t node;
 	uint8_t target;
 	uint32_t spfi_chan[RAMON_NN_COUNT];
-	uint32_t spfi_pages;
+	uint32_t spfi_perf_max_pages;
 	uint32_t runs;
-	uint32_t spw_max;
-	uint32_t minutes;
-	int prep;
-	int format;
+	uint32_t spw_max_payload_bytes;
+	uint32_t soak_minutes;
+	int prep_requested;
+	int format_requested;
 	int skip_spw;
 	int skip_spfi;
-	int long_tests;
+	int long_requested;
 	int strict;
-	int json;
+	int json_requested;
 	int fail_fast;
 };
 
 struct test_env {
 	ramon_ctx *c;
-	struct test_opts o;
-	int spw_nn;		/* first synced SPW NN, or -1 */
-	int spfi_nn;		/* first SPFI NN whose link is up, or -1 */
-	uint32_t spw_present;	/* masks */
-	uint32_t spfi_present;
-	uint32_t n_zdma;
+	struct test_opts opts;
+	int spw_nn;			/* first synced SPW NN, or -1 */
+	int spfi_nn;			/* first SPFI NN whose link is up, or -1 */
+	uint32_t spw_present_mask;	/* masks */
+	uint32_t spfi_present_mask;
+	uint32_t n_zdma_chan;
 };
 
-extern struct test_env T;
+extern struct test_env t_env;
 
 struct test {
 	const char *name;
@@ -57,7 +57,7 @@ struct test {
 };
 
 /* a number for --json and the summary of the current test */
-void t_metric(const char *name, double value);
+void t_add_metric(const char *name, double value);
 /* reports a failed call; returns ret */
 int t_check(int ret, const char *what, const struct ramon_status *st);
 
@@ -65,9 +65,9 @@ int t_check(int ret, const char *what, const struct ramon_status *st);
 /* sends n loopback packets on NN nn and returns how many came back intact */
 unsigned t_spw_loop_packets(uint32_t nn, unsigned n);
 
-extern const struct test test_core[];
-extern const struct test test_spw[];
-extern const struct test test_spfi[];
-extern const struct test test_soak[];
+extern const struct test t_core_tests[];
+extern const struct test t_spw_tests[];
+extern const struct test t_spfi_tests[];
+extern const struct test t_soak_tests[];
 
 #endif /* TEST_H */

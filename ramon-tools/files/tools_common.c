@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-/* Helpers shared by ramon_cli and ramon_test */
+/* Helpers shared by ramon_cli, ramon_test and ramon_accept */
 #include "tools_common.h"
 
 #include <errno.h>
@@ -104,9 +104,9 @@ void tc_sleep_ms(unsigned ms)
 	nanosleep(&ts, NULL);
 }
 
-double tc_mibps(uint64_t bytes, uint64_t ns)
+double tc_mibps(uint64_t bytes, uint64_t elapsed_ns)
 {
-	return ns ? (double)bytes / 1048576.0 / ((double)ns / 1e9) : 0.0;
+	return elapsed_ns ? (double)bytes / 1048576.0 / ((double)elapsed_ns / 1e9) : 0.0;
 }
 
 static uint32_t pattern_word(uint32_t seed, size_t i)
@@ -127,7 +127,7 @@ void tc_fill(void *p, size_t bytes, uint32_t seed)
 	}
 }
 
-long tc_verify(const void *p, size_t bytes, uint32_t seed)
+long tc_find_mismatch(const void *p, size_t bytes, uint32_t seed)
 {
 	const uint32_t *w = p;
 	uint32_t last;
@@ -163,23 +163,23 @@ int tc_all_zero(const void *p, size_t bytes)
 	return 1;
 }
 
-void tc_hexdump(const void *p, size_t n, size_t base, size_t max)
+void tc_hexdump(const void *p, size_t len, size_t base_off, size_t max_len)
 {
 	const uint8_t *b = p;
 	size_t i, j;
 
-	if (n > max)
-		n = max;
-	for (i = 0; i < n; i += 16) {
-		printf("      %08zx ", base + i);
+	if (len > max_len)
+		len = max_len;
+	for (i = 0; i < len; i += 16) {
+		printf("      %08zx ", base_off + i);
 		for (j = i; j < i + 16; j++) {
-			if (j < n)
+			if (j < len)
 				printf(" %02x", b[j]);
 			else
 				printf("   ");
 		}
 		printf("  ");
-		for (j = i; j < i + 16 && j < n; j++)
+		for (j = i; j < i + 16 && j < len; j++)
 			putchar(b[j] >= 0x20 && b[j] < 0x7f ? b[j] : '.');
 		putchar('\n');
 	}
@@ -220,7 +220,7 @@ int tc_parse_pair(const char *s, uint32_t v[2])
 	return tc_parse_u32(a, &v[0]) || tc_parse_u32(comma + 1, &v[1]) ? -EINVAL : 0;
 }
 
-long tc_meminfo_kb(const char *key)
+long tc_read_meminfo_kb(const char *key)
 {
 	char line[128];
 	size_t n = strlen(key);
@@ -239,14 +239,14 @@ long tc_meminfo_kb(const char *key)
 	return v;
 }
 
-int tc_read_line(const char *path, char *buf, size_t len)
+int tc_read_line(const char *path, char *buf, size_t cap)
 {
 	FILE *f = fopen(path, "r");
 	int ret = 0;
 
 	if (!f)
 		return -errno;
-	if (!fgets(buf, (int)len, f))
+	if (!fgets(buf, (int)cap, f))
 		ret = -EIO;
 	else
 		buf[strcspn(buf, "\n")] = 0;
@@ -254,7 +254,7 @@ int tc_read_line(const char *path, char *buf, size_t len)
 	return ret;
 }
 
-int tc_read_file(const char *path, uint8_t **data, size_t *len, size_t max)
+int tc_read_file(const char *path, uint8_t **data, size_t *len, size_t max_len)
 {
 	FILE *f = fopen(path, "rb");
 	long size;
@@ -268,7 +268,7 @@ int tc_read_file(const char *path, uint8_t **data, size_t *len, size_t max)
 		ret = -errno;
 		goto out;
 	}
-	if ((size_t)size > max) {
+	if ((size_t)size > max_len) {
 		ret = -EFBIG;
 		goto out;
 	}
