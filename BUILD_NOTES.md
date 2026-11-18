@@ -1622,3 +1622,45 @@ ramon_cli spfireg 0x2C 0          # word 11 (loopback) still writable
 ramon_cli regwins                 # spfi0 shows cmd-protected; phys shown as root
 ramon_accept --spfi-format spfi-prep spfi-link spfi-stream   # SPFI unaffected
 ```
+
+### Naming pass: driver 0.8.13, libramon 0.4.1, smoke 0.8.21, tools 0.5.4
+
+Internal names now follow the naming rules; nothing else changed.
+
+- **What changed.** Functions start with a verb (`ramon_of_find_spfi()`, `ramon_spfi_fail_wait()`,
+  `cli_parse_u32()`, `a_set_summary()`), booleans read as conditions (`can_see_phys`,
+  `needs_rearm`, `receiver_active`, `is_batch`), times and sizes carry units
+  (`RAMON_TIMEOUT_*_MS`, `timeout_ms`, `max_bytes`, `SPFI_PAGE_BYTES`), counts use `n_` (`n_chan`,
+  `n_items`), invented abbreviations are spelled out (`TMO`, `inited`, `stw`/`str`, `rxc`/`txc`),
+  and one concept has one name across the components. The tools' program-wide globals `T` and `A`
+  are now `t_env` and `a_env`, with `opts` for their options. Short locals in long functions are
+  spelled out (`selected`, `results`, `write_stream` / `read_stream`, `write_ns` / `read_ns`,
+  `stats_before` / `stats_after`, `elapsed_ns`). Loop indices keep short names, and so does a local
+  named after its struct type's initials (`gi` for a `ramon_get_info`, `ri`, `th`, `fc`).
+- **Public interfaces are unchanged:** `ramon_dma_uapi.h`, the module parameters, libramon's
+  installed headers (only prototype parameter names changed), CLI commands and flags, test and
+  step names, limits-file keys, JSON keys and all output text. The kernel log names one renamed
+  function: when the SPFI "not acknowledged" warning is rate-limited, the kernel's "callbacks
+  suppressed" line now starts with `ramon_spfi_fail_wait` (was `ramon_spfi_wait_failed`).
+- **No functional change, checked on the host.** 0.8.12 / 0.4.0 / 0.8.20 / 0.5.3 and the renamed
+  sources were built (the driver against the host's 6.8 headers with gcc 11, userspace with `-O2
+  -Werror`) and compared object by object, section by section, a renamed symbol matched by its
+  new name. Only the version numbers differ in userspace (the version strings). The driver's
+  version differs too (the string and one byte of `drv_patch` code); apart from that, every
+  `.text` section and relocation is identical, and the data and one symbol size differ only
+  where the kernel embeds names and source positions (the lockdep names of the renamed mutexes,
+  one ratelimit `__func__`, and dyndbg, BUG-table and UBSAN line/column records, each matched to
+  the same token in the renamed source).
+- **Names that earlier notes use:** in `struct ramon_spfi`, `write_lock` / `read_lock` are now
+  `data_write_lock` / `read_stream_lock` and `track[]` is `track_state[]`; in
+  `struct ramon_regwin`, `wr_protect_end` is `write_protect_end`.
+- No new kernel symbols; `linux-xlnx/ramon_dma.ksyms` is unchanged.
+
+```sh
+petalinux-build -c ramon-dma         # 0.8.13
+petalinux-build -c ramon-api         # 0.4.1
+petalinux-build -c ramon-smoke       # 0.8.21
+petalinux-build -c ramon-tools       # 0.5.4
+ramon_smoke --errors              # same results as 0.8.20
+ramon_test                        # same results as 0.5.3
+```
