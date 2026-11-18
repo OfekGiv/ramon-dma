@@ -85,14 +85,14 @@ int ramon_buf_free(ramon_buf *b, struct ramon_status *st)
 
 int ramon_buf_dma_addr(const ramon_buf *b, uint64_t *dma_addr, struct ramon_status *st)
 {
-	struct ramon_buf_info i;
+	struct ramon_buf_info bi;
 	int ret;
 
 	if (!b->ctx || !b->handle)
 		return ramon__fail(st, RAMON_EL_INVAL, 0, 0, 0, "buffer not allocated");
-	memset(&i, 0, sizeof(i));
-	i.handle = b->handle;
-	ret = ramon__ioctl(b->ctx, RAMON_IOC_BUF_INFO, &i, &i.st, st);
-	*dma_addr = ret ? 0 : i.dma_addr;
+	memset(&bi, 0, sizeof(bi));
+	bi.handle = b->handle;
+	ret = ramon__ioctl(b->ctx, RAMON_IOC_BUF_INFO, &bi, &bi.st, st);
+	*dma_addr = ret ? 0 : bi.dma_addr;
 	return ret;
 }

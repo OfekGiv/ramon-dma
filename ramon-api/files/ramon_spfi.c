@@ -3,13 +3,13 @@
 #include "ramon_priv.h"
 
 #define SPFI_SETTLE_DEFAULT_MS	500
-#define SPFI_SCRATCH_DEFAULT	64
+#define SPFI_SCRATCH_PAGES_DEFAULT	64
 #define SPFI_LINK_REG		RAMON_SPFI_REG_PHY_STATUS1
 #define SPFI_LINK_MASK		0xFFu
 #define SPFI_ALERT_WAIT_MS	1000	/* alert thread wait period; bounds how long a stop takes */
 #define SPFI_ERR_BACKOFF_MS	100
 #define SPFI_RETRY_DELAY_MS	2
-#define SPFI_LINK_WAIT_MS	2000	/* the SPFI link, after the SPW core enable and sync */
+#define SPFI_LINK_TIMEOUT_MS	2000	/* the SPFI link, after the SPW core enable and sync */
 #define SPFI_LINK_POLL_MS	10
 
 /* ---- configuration and lifecycle ---- */
@@ -20,25 +20,25 @@ void ramon_spfi_config_default(struct ramon_spfi_config *cfg)
 	cfg->chan[0] = RAMON_SPFI_CHAN_NN0;
 	cfg->chan[1] = RAMON_SPFI_CHAN_NN1;
 	cfg->settle_ms = SPFI_SETTLE_DEFAULT_MS;
-	cfg->scratch_pages = SPFI_SCRATCH_DEFAULT;
+	cfg->scratch_pages = SPFI_SCRATCH_PAGES_DEFAULT;
 }
 
-static void spfi_fill_config(struct ramon_spfi_config *d, const struct ramon_spfi_config *in,
+static void spfi_fill_config(struct ramon_spfi_config *out, const struct ramon_spfi_config *in,
 			     const struct ramon_get_info *gi)
 {
 	struct ramon_spfi_config def;
 
 	ramon_spfi_config_default(&def);
-	*d = in ? *in : def;
-	if (!d->chan[0] && !d->chan[1]) {
-		d->chan[0] = def.chan[0];
-		d->chan[1] = def.chan[1];
+	*out = in ? *in : def;
+	if (!out->chan[0] && !out->chan[1]) {
+		out->chan[0] = def.chan[0];
+		out->chan[1] = def.chan[1];
 	}
-	if (!d->settle_ms)
-		d->settle_ms = def.settle_ms;
-	if (!d->scratch_pages)
-		d->scratch_pages = def.scratch_pages;
-	d->nn_mask = d->nn_mask ? d->nn_mask & gi->spfi_mask : gi->spfi_mask;
+	if (!out->settle_ms)
+		out->settle_ms = def.settle_ms;
+	if (!out->scratch_pages)
+		out->scratch_pages = def.scratch_pages;
+	out->nn_mask = out->nn_mask ? out->nn_mask & gi->spfi_mask : gi->spfi_mask;
 }
 
 void ramon__spfi_ctx_init(struct ramon_ctx *c)
@@ -68,7 +68,7 @@ void ramon__spfi_ctx_destroy(struct ramon_ctx *c)
 
 int ramon_spfi_is_inited(const ramon_ctx *c)
 {
-	return c->spfi.inited;
+	return c->spfi.initialised;
 }
 
 void ramon_spfi_get_config(const ramon_ctx *c, struct ramon_spfi_config *cfg)
@@ -83,37 +83,37 @@ int ramon_spfi_present(const ramon_ctx *c, uint32_t nn)
 
 int ramon_spfi_init(ramon_ctx *c, const struct ramon_spfi_config *cfg, struct ramon_status *st)
 {
-	struct ramon_spfi_config d;
+	struct ramon_spfi_config new_cfg;
 	struct ramon_chan_info ci;
 	uint32_t nn;
 	int ret;
 
 	pthread_mutex_lock(&c->lock);
-	if (c->spfi.inited) {
+	if (c->spfi.initialised) {
 		pthread_mutex_unlock(&c->lock);
 		return ramon__fail(st, RAMON_EL_BUSY, EALREADY, 0, 0, "SPFI layer already initialised");
 	}
-	spfi_fill_config(&d, cfg, &c->info);
+	spfi_fill_config(&new_cfg, cfg, &c->info);
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
 		struct spfi_nn *s = &c->spfi.nn[nn];
 
 		s->present = 0;
-		if (!(d.nn_mask & (1u << nn)))
+		if (!(new_cfg.nn_mask & (1u << nn)))
 			continue;
-		ret = ramon_chan_info(c, d.chan[nn], &ci, st);
+		ret = ramon_chan_info(c, new_cfg.chan[nn], &ci, st);
 		if (!ret && (ci.type != RAMON_CHAN_AXI || ci.dir != RAMON_DIR_MEM_TO_DEV))
-			ret = ramon__fail(st, RAMON_EL_INVAL, 0, nn, d.chan[nn],
+			ret = ramon__fail(st, RAMON_EL_INVAL, 0, nn, new_cfg.chan[nn],
 					  "spfi%u: channel %u is not an AXI MEM_TO_DEV channel; set the write channel (--spfi-chans)",
-					  nn, d.chan[nn]);
+					  nn, new_cfg.chan[nn]);
 		if (ret) {
 			pthread_mutex_unlock(&c->lock);
 			return ret;
 		}
-		s->chan = d.chan[nn];
+		s->chan = new_cfg.chan[nn];
 		s->present = 1;
 	}
-	c->spfi.cfg = d;
-	c->spfi.inited = 1;
+	c->spfi.cfg = new_cfg;
+	c->spfi.initialised = 1;
 	pthread_mutex_unlock(&c->lock);
 	ramon_status_clear(st);
 	return 0;
@@ -123,7 +123,7 @@ void ramon_spfi_fini(ramon_ctx *c)
 {
 	uint32_t nn;
 
-	if (!c->spfi.inited)
+	if (!c->spfi.initialised)
 		return;
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++)
 		ramon_spfi_alert_stop(c, nn);
@@ -132,13 +132,13 @@ void ramon_spfi_fini(ramon_ctx *c)
 		ramon_buf_free(&c->spfi.nn[nn].scratch, NULL);
 		c->spfi.nn[nn].present = 0;
 	}
-	c->spfi.inited = 0;
+	c->spfi.initialised = 0;
 	spfi_fill_config(&c->spfi.cfg, NULL, &c->info);
 	pthread_mutex_unlock(&c->lock);
 }
 
 /* every SPFI entry: NN valid, layer initialised (with the defaults if needed), NN enabled */
-static int spfi_check(struct ramon_ctx *c, uint32_t nn, struct ramon_status *st)
+static int spfi_check_or_init(struct ramon_ctx *c, uint32_t nn, struct ramon_status *st)
 {
 	int ret;
 
@@ -148,7 +148,7 @@ static int spfi_check(struct ramon_ctx *c, uint32_t nn, struct ramon_status *st)
 		return ramon__fail(st, RAMON_EL_NOT_PRESENT, 0, nn, c->info.spfi_mask,
 				   "spfi%u is not present or masked off by the driver (spfi_mask 0x%x)",
 				   nn, c->info.spfi_mask);
-	if (!c->spfi.inited) {
+	if (!c->spfi.initialised) {
 		ret = ramon_spfi_init(c, NULL, st);
 		if (ret && ret != -EALREADY)
 			return ret;
@@ -162,16 +162,17 @@ static int spfi_check(struct ramon_ctx *c, uint32_t nn, struct ramon_status *st)
 /* after an SPFI timeout a late answer may still come: keep the next command back */
 static void spfi_settle(struct spfi_nn *s)
 {
-	uint64_t until = __atomic_load_n(&s->settle_until_ns, __ATOMIC_RELAXED);
-	uint64_t now = ramon__now_ns();
+	uint64_t until_ns = __atomic_load_n(&s->settle_until_ns, __ATOMIC_RELAXED);
+	uint64_t now_ns = ramon__now_ns();
 
-	if (now < until)
-		ramon__sleep_ms((uint32_t)((until - now + 999999) / 1000000));
+	if (now_ns < until_ns)
+		ramon__sleep_ms((uint32_t)((until_ns - now_ns + 999999) / 1000000));
 }
 
-static void spfi_note(struct ramon_ctx *c, struct spfi_nn *s, const struct ramon_status *t)
+static void spfi_note_timeout(struct ramon_ctx *c, struct spfi_nn *s,
+			      const struct ramon_status *trailer)
 {
-	switch (t->code) {
+	switch (trailer->code) {
 	case RAMON_E_SPFI_CMD_TIMEOUT:
 	case RAMON_E_SPFI_WRITE_TIMEOUT:
 	case RAMON_E_SPFI_READ_TIMEOUT:
@@ -180,7 +181,7 @@ static void spfi_note(struct ramon_ctx *c, struct spfi_nn *s, const struct ramon
 				 ramon__now_ns() + (uint64_t)c->spfi.cfg.settle_ms * 1000000ull,
 				 __ATOMIC_RELAXED);
 		ramon__log(c, RAMON_LOG_INFO, "spfi%u: %s, next command waits %u ms", s->nn,
-			   ramon_err_str(t->code), c->spfi.cfg.settle_ms);
+			   ramon_err_str(trailer->code), c->spfi.cfg.settle_ms);
 		break;
 	default:
 		break;
@@ -207,24 +208,24 @@ int ramon_spfi_link_up(ramon_ctx *c, uint32_t nn, uint32_t *raw, struct ramon_st
 int ramon_spfi_wait_link(ramon_ctx *c, uint32_t nn, uint32_t timeout_ms, uint32_t *raw,
 			 struct ramon_status *st)
 {
-	uint32_t v = 0, waited = 0;
+	uint32_t v = 0, waited_ms = 0;
 	int up;
 
 	for (;;) {
 		up = ramon_spfi_link_up(c, nn, &v, st);
 		if (up < 0)
 			return up;
-		if (up || waited >= timeout_ms)
+		if (up || waited_ms >= timeout_ms)
 			break;
 		ramon__sleep_ms(SPFI_LINK_POLL_MS);
-		waited += SPFI_LINK_POLL_MS;
+		waited_ms += SPFI_LINK_POLL_MS;
 	}
 	if (raw)
 		*raw = v;
 	if (!up)
 		return ramon__fail(st, RAMON_EL_SPFI_LINK_DOWN, 0, v, RAMON_SPFI_LINK_UP,
 				   "spfi%u: link down after %u ms: 0xCC = 0x%x, low byte not 0x%x", nn,
-				   waited, v, RAMON_SPFI_LINK_UP);
+				   waited_ms, v, RAMON_SPFI_LINK_UP);
 	ramon_status_clear(st);
 	return 0;
 }
@@ -257,7 +258,7 @@ int ramon_spfi_command(ramon_ctx *c, uint32_t nn, uint32_t opcode, const struct 
 	struct spfi_nn *s;
 	int ret;
 
-	ret = spfi_check(c, nn, st);
+	ret = spfi_check_or_init(c, nn, st);
 	if (ret)
 		return ret;
 	if (opcode == RAMON_SPFI_OP_DATA_WRITE || opcode == RAMON_SPFI_OP_READ_STREAM)
@@ -282,7 +283,7 @@ int ramon_spfi_command(ramon_ctx *c, uint32_t nn, uint32_t opcode, const struct 
 	spfi_settle(s);
 	ret = ramon__ioctl(c, RAMON_IOC_SPFI_CMD, &k, &k.st, st);
 	if (ret)
-		spfi_note(c, s, &k.st);
+		spfi_note_timeout(c, s, &k.st);
 	if (r) {
 		r->rx_opcode = k.rx_opcode;
 		r->rx_err_code = k.rx_err_code;
@@ -296,7 +297,7 @@ int ramon_spfi_command(ramon_ctx *c, uint32_t nn, uint32_t opcode, const struct 
 }
 
 static int spfi_op(struct ramon_ctx *c, uint32_t nn, uint32_t opcode, const struct ramon_spfi_args *a,
-		   struct ramon_spfi_reply *r, int check, struct ramon_status *st)
+		   struct ramon_spfi_reply *r, int fail_on_nn_error, struct ramon_status *st)
 {
 	struct ramon_spfi_reply tmp;
 	int ret;
@@ -305,7 +306,7 @@ static int spfi_op(struct ramon_ctx *c, uint32_t nn, uint32_t opcode, const stru
 		r = &tmp;
 	memset(r, 0, sizeof(*r));
 	ret = ramon_spfi_command(c, nn, opcode, a, r, st);
-	if (!ret && check && r->rx_err_code)
+	if (!ret && fail_on_nn_error && r->rx_err_code)
 		return ramon__fail(st, RAMON_EL_SPFI_NN_ERROR, 0, r->rx_err_code, r->rx_opcode,
 				   "spfi%u %s stream %u: NN rx_err_code %u", nn,
 				   ramon_spfi_op_name(opcode), a ? a->stream_id : 0, r->rx_err_code);
@@ -350,7 +351,8 @@ int ramon_spfi_set_tod(ramon_ctx *c, uint32_t nn, uint32_t tod, struct ramon_spf
 }
 
 static int spfi_stream_cmd(struct ramon_ctx *c, uint32_t nn, uint32_t opcode, uint32_t sid,
-			   uint32_t last, struct ramon_spfi_reply *r, struct ramon_status *st)
+			   uint32_t last_offset, struct ramon_spfi_reply *r,
+			   struct ramon_status *st)
 {
 	struct ramon_spfi_args a;
 
@@ -358,7 +360,7 @@ static int spfi_stream_cmd(struct ramon_ctx *c, uint32_t nn, uint32_t opcode, ui
 		return ramon__fail(st, RAMON_EL_INVAL, 0, sid, 0, "no stream id %u", sid);
 	memset(&a, 0, sizeof(a));
 	a.stream_id = sid;
-	a.stream_last_offset = last;
+	a.stream_last_offset = last_offset;
 	return spfi_op(c, nn, opcode, &a, r, 1, st);
 }
 
@@ -398,7 +400,7 @@ int ramon_spfi_mem_read(ramon_ctx *c, uint32_t nn, uint32_t off, uint32_t size, 
 	struct ramon_spfi_mem_read m;
 	int ret;
 
-	ret = spfi_check(c, nn, st);
+	ret = spfi_check_or_init(c, nn, st);
 	if (ret)
 		return ret;
 	memset(&m, 0, sizeof(m));
@@ -415,7 +417,7 @@ int ramon_spfi_tx_offs_write(ramon_ctx *c, uint32_t nn, uint32_t off, uint32_t s
 	struct ramon_spfi_tx_offs_write m;
 	int ret;
 
-	ret = spfi_check(c, nn, st);
+	ret = spfi_check_or_init(c, nn, st);
 	if (ret)
 		return ret;
 	memset(&m, 0, sizeof(m));
@@ -455,12 +457,12 @@ unsigned ramon_spfi_count_exist(const struct ramon_spfi_table *t)
 	return n;
 }
 
-unsigned ramon_spfi_find_free(const struct ramon_spfi_table *t, uint32_t *out, unsigned want)
+unsigned ramon_spfi_find_free(const struct ramon_spfi_table *t, uint32_t *out, unsigned max_ids)
 {
 	unsigned n = 0;
 	uint32_t sid;
 
-	for (sid = RAMON_SPFI_STREAMS_USABLE; sid-- > 0 && n < want;)
+	for (sid = RAMON_SPFI_STREAMS_USABLE; sid-- > 0 && n < max_ids;)
 		if (!(t->rec[sid].status & RAMON_SPFI_ST_EXIST))
 			out[n++] = sid;
 	return n;
@@ -478,7 +480,7 @@ int ramon_spfi_write(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first_pag
 	uint32_t i;
 	int ret, retried = 0;
 
-	ret = spfi_check(c, nn, st);
+	ret = spfi_check_or_init(c, nn, st);
 	if (ret)
 		return ret;
 	if (sid >= RAMON_SPFI_STREAMS)
@@ -516,7 +518,7 @@ int ramon_spfi_write(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first_pag
 		ramon__sleep_ms(SPFI_RETRY_DELAY_MS);
 	}
 	if (ret)
-		spfi_note(c, s, &w.st);
+		spfi_note_timeout(c, s, &w.st);
 	if (rx_status)
 		*rx_status = w.rx_status;
 	return ret;
@@ -535,60 +537,60 @@ int ramon_spfi_write_buf(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first
 	return ramon_spfi_write(c, nn, sid, first_page, &it, 1, n_pages, timeout_ms, NULL, st);
 }
 
-int ramon_spfi_read(ramon_ctx *c, uint32_t nn, uint32_t sid, const uint32_t *pages, uint32_t n,
-		    const ramon_buf *dst, uint64_t dst_off, uint32_t timeout_ms, uint32_t *rx_status,
-		    struct ramon_status *st)
+int ramon_spfi_read(ramon_ctx *c, uint32_t nn, uint32_t sid, const uint32_t *pages,
+		    uint32_t n_pages, const ramon_buf *dst, uint64_t dst_off, uint32_t timeout_ms,
+		    uint32_t *rx_status, struct ramon_status *st)
 {
 	struct ramon_spfi_read r;
 	struct spfi_nn *s;
 	int ret;
 
-	ret = spfi_check(c, nn, st);
+	ret = spfi_check_or_init(c, nn, st);
 	if (ret)
 		return ret;
-	if (!n || n > RAMON_SPFI_READ_MAX_PAGES)
-		return ramon__fail(st, RAMON_EL_INVAL, 0, n, RAMON_SPFI_READ_MAX_PAGES,
-				   "%u pages per read (1..%u)", n, RAMON_SPFI_READ_MAX_PAGES);
+	if (!n_pages || n_pages > RAMON_SPFI_READ_MAX_PAGES)
+		return ramon__fail(st, RAMON_EL_INVAL, 0, n_pages, RAMON_SPFI_READ_MAX_PAGES,
+				   "%u pages per read (1..%u)", n_pages, RAMON_SPFI_READ_MAX_PAGES);
 	s = &c->spfi.nn[nn];
 	spfi_settle(s);
 	memset(&r, 0, sizeof(r));
 	r.nn = nn;
 	r.stream_id = sid;
-	r.n_offsets = n;
+	r.n_offsets = n_pages;
 	r.dst_handle = dst->handle;
 	r.offsets = (uintptr_t)pages;
 	r.dst_off = dst_off;
 	r.timeout_ms = timeout_ms ? timeout_ms : c->spfi.cfg.read_timeout_ms;
 	ret = ramon__ioctl(c, RAMON_IOC_SPFI_READ, &r, &r.st, st);
 	if (ret)
-		spfi_note(c, s, &r.st);
+		spfi_note_timeout(c, s, &r.st);
 	if (rx_status)
 		*rx_status = r.rx_status;
 	return ret;
 }
 
-int ramon_spfi_read_seq(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first_page, uint32_t n,
-			const ramon_buf *dst, uint64_t dst_off, uint32_t timeout_ms,
-			struct ramon_status *st)
+int ramon_spfi_read_seq(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first_page,
+			uint32_t n_pages, const ramon_buf *dst, uint64_t dst_off,
+			uint32_t timeout_ms, struct ramon_status *st)
 {
 	uint32_t *pages, i;
 	int ret;
 
-	if (!n || n > RAMON_SPFI_READ_MAX_PAGES)
-		return ramon__fail(st, RAMON_EL_INVAL, 0, n, RAMON_SPFI_READ_MAX_PAGES,
-				   "%u pages per read (1..%u)", n, RAMON_SPFI_READ_MAX_PAGES);
-	pages = malloc((size_t)n * sizeof(*pages));
+	if (!n_pages || n_pages > RAMON_SPFI_READ_MAX_PAGES)
+		return ramon__fail(st, RAMON_EL_INVAL, 0, n_pages, RAMON_SPFI_READ_MAX_PAGES,
+				   "%u pages per read (1..%u)", n_pages, RAMON_SPFI_READ_MAX_PAGES);
+	pages = malloc((size_t)n_pages * sizeof(*pages));
 	if (!pages)
 		return ramon__fail(st, RAMON_EL_SYS, ENOMEM, 0, 0, "out of memory");
-	for (i = 0; i < n; i++)
+	for (i = 0; i < n_pages; i++)
 		pages[i] = first_page + i;
-	ret = ramon_spfi_read(c, nn, sid, pages, n, dst, dst_off, timeout_ms, NULL, st);
+	ret = ramon_spfi_read(c, nn, sid, pages, n_pages, dst, dst_off, timeout_ms, NULL, st);
 	free(pages);
 	return ret;
 }
 
 /* the bounce buffer of the *_mem calls; scratch_lock held */
-static int spfi_scratch(struct ramon_ctx *c, struct spfi_nn *s, struct ramon_status *st)
+static int spfi_ensure_scratch(struct ramon_ctx *c, struct spfi_nn *s, struct ramon_status *st)
 {
 	if (s->scratch.handle)
 		return 0;
@@ -601,57 +603,57 @@ int ramon_spfi_write_mem(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first
 {
 	const uint8_t *p = data;
 	struct spfi_nn *s;
-	uint32_t pages, done = 0, n;
+	uint32_t n_pages, done = 0, chunk_pages;
 	int ret;
 
-	ret = spfi_check(c, nn, st);
+	ret = spfi_check_or_init(c, nn, st);
 	if (ret)
 		return ret;
 	if (!len || len % RAMON_SPFI_PAGE)
 		return ramon__fail(st, RAMON_EL_INVAL, 0, len, RAMON_SPFI_PAGE,
 				   "%zu bytes is not a whole number of 16 KiB pages", len);
 	s = &c->spfi.nn[nn];
-	pages = (uint32_t)(len / RAMON_SPFI_PAGE);
+	n_pages = (uint32_t)(len / RAMON_SPFI_PAGE);
 	pthread_mutex_lock(&s->scratch_lock);
-	ret = spfi_scratch(c, s, st);
-	while (!ret && done < pages) {
-		n = pages - done;
-		if (n > c->spfi.cfg.scratch_pages)
-			n = c->spfi.cfg.scratch_pages;
+	ret = spfi_ensure_scratch(c, s, st);
+	while (!ret && done < n_pages) {
+		chunk_pages = n_pages - done;
+		if (chunk_pages > c->spfi.cfg.scratch_pages)
+			chunk_pages = c->spfi.cfg.scratch_pages;
 		memcpy(s->scratch.ptr, p + (size_t)done * RAMON_SPFI_PAGE,
-		       (size_t)n * RAMON_SPFI_PAGE);
-		ret = ramon_spfi_write_buf(c, nn, sid, first_page + done, &s->scratch, 0, n,
-					   timeout_ms, st);
-		done += n;
+		       (size_t)chunk_pages * RAMON_SPFI_PAGE);
+		ret = ramon_spfi_write_buf(c, nn, sid, first_page + done, &s->scratch, 0,
+					   chunk_pages, timeout_ms, st);
+		done += chunk_pages;
 	}
 	pthread_mutex_unlock(&s->scratch_lock);
 	return ret;
 }
 
-int ramon_spfi_read_mem(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first_page, uint32_t n,
-			void *out, uint32_t timeout_ms, struct ramon_status *st)
+int ramon_spfi_read_mem(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first_page,
+			uint32_t n_pages, void *out, uint32_t timeout_ms, struct ramon_status *st)
 {
 	uint8_t *p = out;
 	struct spfi_nn *s;
-	uint32_t done = 0, k;
+	uint32_t done = 0, chunk_pages;
 	int ret;
 
-	ret = spfi_check(c, nn, st);
+	ret = spfi_check_or_init(c, nn, st);
 	if (ret)
 		return ret;
 	s = &c->spfi.nn[nn];
 	pthread_mutex_lock(&s->scratch_lock);
-	ret = spfi_scratch(c, s, st);
-	while (!ret && done < n) {
-		k = n - done;
-		if (k > c->spfi.cfg.scratch_pages)
-			k = c->spfi.cfg.scratch_pages;
-		ret = ramon_spfi_read_seq(c, nn, sid, first_page + done, k, &s->scratch, 0,
-					  timeout_ms, st);
+	ret = spfi_ensure_scratch(c, s, st);
+	while (!ret && done < n_pages) {
+		chunk_pages = n_pages - done;
+		if (chunk_pages > c->spfi.cfg.scratch_pages)
+			chunk_pages = c->spfi.cfg.scratch_pages;
+		ret = ramon_spfi_read_seq(c, nn, sid, first_page + done, chunk_pages,
+					  &s->scratch, 0, timeout_ms, st);
 		if (!ret)
 			memcpy(p + (size_t)done * RAMON_SPFI_PAGE, s->scratch.ptr,
-			       (size_t)k * RAMON_SPFI_PAGE);
-		done += k;
+			       (size_t)chunk_pages * RAMON_SPFI_PAGE);
+		done += chunk_pages;
 	}
 	pthread_mutex_unlock(&s->scratch_lock);
 	return ret;
@@ -660,14 +662,14 @@ int ramon_spfi_read_mem(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first_
 /* ---- stream helper ---- */
 
 int ramon_spfi_stream_open(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t size_pages,
-			   struct ramon_spfi_stream *s, struct ramon_status *st)
+			   struct ramon_spfi_stream *stream, struct ramon_status *st)
 {
 	struct ramon_spfi_table *t;
 	const struct ramon_spfi_record *r;
-	unsigned open;
+	unsigned n_open;
 	int ret;
 
-	memset(s, 0, sizeof(*s));
+	memset(stream, 0, sizeof(*stream));
 	if (sid >= RAMON_SPFI_STREAMS_USABLE)
 		return ramon__fail(st, RAMON_EL_SPFI_RULE, 0, sid, RAMON_SPFI_STREAMS_USABLE,
 				   "stream ids %u..%u are reserved by the NN", RAMON_SPFI_STREAMS_USABLE,
@@ -679,89 +681,93 @@ int ramon_spfi_stream_open(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t siz
 	if (ret)
 		goto out;
 	r = &t->rec[sid];
-	open = ramon_spfi_count_open(t);
+	n_open = ramon_spfi_count_open(t);
 	if (r->status & RAMON_SPFI_ST_EXIST) {
 		ret = ramon__fail(st, RAMON_EL_SPFI_RULE, 0, sid, r->status,
 				  "spfi%u stream %u exists (status 0x%x): delete it before opening it again",
 				  nn, sid, r->status);
 		goto out;
 	}
-	if (open >= RAMON_SPFI_MAX_OPEN) {
-		ret = ramon__fail(st, RAMON_EL_SPFI_RULE, 0, open, RAMON_SPFI_MAX_OPEN,
-				  "spfi%u: %u streams are open, the NN allows %u", nn, open,
+	if (n_open >= RAMON_SPFI_MAX_OPEN) {
+		ret = ramon__fail(st, RAMON_EL_SPFI_RULE, 0, n_open, RAMON_SPFI_MAX_OPEN,
+				  "spfi%u: %u streams are open, the NN allows %u", nn, n_open,
 				  RAMON_SPFI_MAX_OPEN);
 		goto out;
 	}
 	/* the first page comes from the table read before OPEN, as the old spfi_send() did */
-	s->nn = nn;
-	s->sid = sid;
-	s->first_page = r->latest_write_offs + 1;
-	s->next_page = s->first_page;
+	stream->nn = nn;
+	stream->sid = sid;
+	stream->first_page = r->latest_write_offs + 1;
+	stream->next_page = stream->first_page;
 	ret = ramon_spfi_open(c, nn, sid, size_pages, NULL, st);
 	if (!ret)
-		s->open = 1;
+		stream->open = 1;
 out:
 	free(t);
 	return ret;
 }
 
-int ramon_spfi_stream_append(ramon_ctx *c, struct ramon_spfi_stream *s, const ramon_buf *b,
+int ramon_spfi_stream_append(ramon_ctx *c, struct ramon_spfi_stream *stream, const ramon_buf *b,
 			     uint64_t off, uint32_t n_pages, uint32_t timeout_ms,
 			     struct ramon_status *st)
 {
 	int ret;
 
-	if (!s->open)
-		return ramon__fail(st, RAMON_EL_INVAL, 0, s->sid, 0, "stream %u is not open", s->sid);
-	ret = ramon_spfi_write_buf(c, s->nn, s->sid, s->next_page, b, off, n_pages, timeout_ms, st);
+	if (!stream->open)
+		return ramon__fail(st, RAMON_EL_INVAL, 0, stream->sid, 0, "stream %u is not open",
+				   stream->sid);
+	ret = ramon_spfi_write_buf(c, stream->nn, stream->sid, stream->next_page, b, off, n_pages,
+				   timeout_ms, st);
 	if (!ret) {
-		s->next_page += n_pages;
-		s->pages_written += n_pages;
+		stream->next_page += n_pages;
+		stream->pages_written += n_pages;
 	}
 	return ret;
 }
 
-int ramon_spfi_stream_append_mem(ramon_ctx *c, struct ramon_spfi_stream *s, const void *data,
+int ramon_spfi_stream_append_mem(ramon_ctx *c, struct ramon_spfi_stream *stream, const void *data,
 				 size_t len, uint32_t timeout_ms, struct ramon_status *st)
 {
-	uint32_t n = (uint32_t)(len / RAMON_SPFI_PAGE);
+	uint32_t n_pages = (uint32_t)(len / RAMON_SPFI_PAGE);
 	int ret;
 
-	if (!s->open)
-		return ramon__fail(st, RAMON_EL_INVAL, 0, s->sid, 0, "stream %u is not open", s->sid);
-	ret = ramon_spfi_write_mem(c, s->nn, s->sid, s->next_page, data, len, timeout_ms, st);
+	if (!stream->open)
+		return ramon__fail(st, RAMON_EL_INVAL, 0, stream->sid, 0, "stream %u is not open",
+				   stream->sid);
+	ret = ramon_spfi_write_mem(c, stream->nn, stream->sid, stream->next_page, data, len,
+				   timeout_ms, st);
 	if (!ret) {
-		s->next_page += n;
-		s->pages_written += n;
+		stream->next_page += n_pages;
+		stream->pages_written += n_pages;
 	}
 	return ret;
 }
 
-int ramon_spfi_stream_flush(ramon_ctx *c, struct ramon_spfi_stream *s, struct ramon_status *st)
+int ramon_spfi_stream_flush(ramon_ctx *c, struct ramon_spfi_stream *stream, struct ramon_status *st)
 {
-	return ramon_spfi_flush(c, s->nn, s->sid, NULL, st);
+	return ramon_spfi_flush(c, stream->nn, stream->sid, NULL, st);
 }
 
-int ramon_spfi_stream_close(ramon_ctx *c, struct ramon_spfi_stream *s, int and_delete,
+int ramon_spfi_stream_close(ramon_ctx *c, struct ramon_spfi_stream *stream, int and_delete,
 			    struct ramon_status *st)
 {
 	int ret = 0;
 
-	if (s->open) {
-		ret = ramon_spfi_close(c, s->nn, s->sid, NULL, st);
+	if (stream->open) {
+		ret = ramon_spfi_close(c, stream->nn, stream->sid, NULL, st);
 		if (ret)
 			return ret;
-		s->open = 0;
+		stream->open = 0;
 	}
 	if (and_delete)
-		ret = ramon_spfi_delete(c, s->nn, s->sid, NULL, st);
+		ret = ramon_spfi_delete(c, stream->nn, stream->sid, NULL, st);
 	return ret;
 }
 
 /* ---- alerts ---- */
 
-static int spfi_wait_alert_raw(struct ramon_ctx *c, uint32_t nn, uint32_t timeout_ms,
-			       struct ramon_spfi_alert *a, struct ramon_status *st)
+static int spfi_wait_alert_ioctl(struct ramon_ctx *c, uint32_t nn, uint32_t timeout_ms,
+				 struct ramon_spfi_alert *a, struct ramon_status *st)
 {
 	struct ramon_spfi_wait_alert w;
 	int ret;
@@ -784,9 +790,9 @@ static int spfi_wait_alert_raw(struct ramon_ctx *c, uint32_t nn, uint32_t timeou
 int ramon_spfi_wait_alert(ramon_ctx *c, uint32_t nn, uint32_t timeout_ms, struct ramon_spfi_alert *a,
 			  struct ramon_status *st)
 {
-	int ret = spfi_check(c, nn, st);
+	int ret = spfi_check_or_init(c, nn, st);
 
-	return ret ? ret : spfi_wait_alert_raw(c, nn, timeout_ms, a, st);
+	return ret ? ret : spfi_wait_alert_ioctl(c, nn, timeout_ms, a, st);
 }
 
 int ramon_spfi_cancel_alert(ramon_ctx *c, uint32_t nn, struct ramon_status *st)
@@ -794,7 +800,7 @@ int ramon_spfi_cancel_alert(ramon_ctx *c, uint32_t nn, struct ramon_status *st)
 	struct ramon_spfi_cancel_alert k;
 	int ret;
 
-	ret = spfi_check(c, nn, st);
+	ret = spfi_check_or_init(c, nn, st);
 	if (ret)
 		return ret;
 	memset(&k, 0, sizeof(k));
@@ -802,7 +808,7 @@ int ramon_spfi_cancel_alert(ramon_ctx *c, uint32_t nn, struct ramon_status *st)
 	return ramon__ioctl(c, RAMON_IOC_SPFI_CANCEL_ALERT, &k, &k.st, st);
 }
 
-static int spfi_alert_state(struct spfi_nn *s)
+static int spfi_get_alert_state(struct spfi_nn *s)
 {
 	int state;
 
@@ -820,8 +826,8 @@ static void *spfi_alert_main(void *arg)
 	struct ramon_status st;
 	int ret;
 
-	while (spfi_alert_state(s) == SPFI_ALERT_RUNNING) {
-		ret = spfi_wait_alert_raw(c, s->nn, SPFI_ALERT_WAIT_MS, &a, &st);
+	while (spfi_get_alert_state(s) == SPFI_ALERT_RUNNING) {
+		ret = spfi_wait_alert_ioctl(c, s->nn, SPFI_ALERT_WAIT_MS, &a, &st);
 		if (!ret) {
 			s->cb(s->cb_user, &a);
 			continue;
@@ -845,14 +851,14 @@ int ramon_spfi_alert_start(ramon_ctx *c, uint32_t nn, ramon_spfi_alert_cb cb, vo
 	struct spfi_nn *s;
 	int ret;
 
-	ret = spfi_check(c, nn, st);
+	ret = spfi_check_or_init(c, nn, st);
 	if (ret)
 		return ret;
 	if (!cb)
 		return ramon__fail(st, RAMON_EL_INVAL, 0, 0, 0, "no alert callback");
 	s = &c->spfi.nn[nn];
 	pthread_mutex_lock(&s->lock);
-	if (s->thread_valid) {
+	if (s->thread_joinable) {
 		pthread_mutex_unlock(&s->lock);
 		return ramon__fail(st, RAMON_EL_BUSY, 0, nn, 0, "spfi%u: alert thread already running",
 				   nn);
@@ -866,7 +872,7 @@ int ramon_spfi_alert_start(ramon_ctx *c, uint32_t nn, ramon_spfi_alert_cb cb, vo
 		pthread_mutex_unlock(&s->lock);
 		return ramon__fail(st, RAMON_EL_SYS, -ret, 0, 0, "pthread_create: %s", strerror(-ret));
 	}
-	s->thread_valid = 1;
+	s->thread_joinable = 1;
 	pthread_mutex_unlock(&s->lock);
 	ramon_status_clear(st);
 	return 0;
@@ -881,7 +887,7 @@ int ramon_spfi_alert_stop(ramon_ctx *c, uint32_t nn)
 		return -EINVAL;
 	s = &c->spfi.nn[nn];
 	pthread_mutex_lock(&s->lock);
-	if (!s->thread_valid) {
+	if (!s->thread_joinable) {
 		pthread_mutex_unlock(&s->lock);
 		return 0;
 	}
@@ -896,7 +902,7 @@ int ramon_spfi_alert_stop(ramon_ctx *c, uint32_t nn)
 	ramon__ioctl(c, RAMON_IOC_SPFI_CANCEL_ALERT, &k, &k.st, NULL);
 	pthread_join(s->thread, NULL);
 	pthread_mutex_lock(&s->lock);
-	s->thread_valid = 0;
+	s->thread_joinable = 0;
 	s->alert_state = SPFI_ALERT_NONE;
 	s->cb = NULL;
 	s->cb_user = NULL;
@@ -905,23 +911,23 @@ int ramon_spfi_alert_stop(ramon_ctx *c, uint32_t nn)
 }
 
 int ramon_spfi_drain_alerts(ramon_ctx *c, uint32_t nn, uint32_t idle_ms, ramon_spfi_alert_cb cb,
-			    void *user, uint32_t *n, struct ramon_status *st)
+			    void *user, uint32_t *n_drained, struct ramon_status *st)
 {
 	struct ramon_spfi_alert a;
 	uint32_t count = 0;
 	int ret;
 
-	ret = spfi_check(c, nn, st);
+	ret = spfi_check_or_init(c, nn, st);
 	while (!ret) {
-		ret = spfi_wait_alert_raw(c, nn, idle_ms ? idle_ms : 1, &a, st);
+		ret = spfi_wait_alert_ioctl(c, nn, idle_ms ? idle_ms : 1, &a, st);
 		if (ret)
 			break;
 		count++;
 		if (cb)
 			cb(user, &a);
 	}
-	if (n)
-		*n = count;
+	if (n_drained)
+		*n_drained = count;
 	if (ret == -ETIMEDOUT && st && st->code == RAMON_E_SPFI_ALERT_TIMEOUT) {
 		ramon_status_clear(st);
 		return 0;
@@ -994,7 +1000,7 @@ size_t ramon_spfi_diag_format(const struct ramon_spfi_diag *d, char *buf, size_t
 }
 
 /* prefixes st->msg with the bring-up stage that failed */
-static int prep_stage(struct ramon_status *st, const char *stage, int ret)
+static int prep_prefix_stage(struct ramon_status *st, const char *stage, int ret)
 {
 	char msg[RAMON_MSG_LEN];
 
@@ -1007,54 +1013,54 @@ static int prep_stage(struct ramon_status *st, const char *stage, int ret)
 	return ret;
 }
 
-int ramon_spfi_prep(ramon_ctx *c, uint32_t nn, const struct ramon_spfi_prep_opts *o,
+int ramon_spfi_prep(ramon_ctx *c, uint32_t nn, const struct ramon_spfi_prep_opts *opts,
 		    struct ramon_spfi_table *t, struct ramon_status *st)
 {
-	struct ramon_spfi_prep_opts none;
+	struct ramon_spfi_prep_opts defaults;
 	struct ramon_spfi_reply r;
 	uint32_t raw = 0;
 	int ret;
 
-	if (!o) {
-		memset(&none, 0, sizeof(none));
-		o = &none;
+	if (!opts) {
+		memset(&defaults, 0, sizeof(defaults));
+		opts = &defaults;
 	}
-	ret = spfi_check(c, nn, st);
+	ret = spfi_check_or_init(c, nn, st);
 	if (ret)
-		return prep_stage(st, "setup", ret);
+		return prep_prefix_stage(st, "setup", ret);
 	/* SPW first: its core enable and link sync bring the SPFI link up */
-	if (!o->skip_spw_dps) {
+	if (!opts->skip_spw_dps) {
 		if (!ramon_spw_is_inited(c)) {
 			ret = ramon_spw_init(c, NULL, st);
 			if (ret && ret != -EALREADY)
-				return prep_stage(st, "spw-init", ret);
+				return prep_prefix_stage(st, "spw-init", ret);
 		}
 		ret = ramon_spw_sync(c, nn, NULL, st);
 		if (ret)
-			return prep_stage(st, "spw-sync", ret);
+			return prep_prefix_stage(st, "spw-sync", ret);
 	}
-	ret = ramon_spfi_wait_link(c, nn, SPFI_LINK_WAIT_MS, &raw, st);
+	ret = ramon_spfi_wait_link(c, nn, SPFI_LINK_TIMEOUT_MS, &raw, st);
 	if (ret)
-		return prep_stage(st, "link", ret);
-	if (!o->skip_spw_dps) {
+		return prep_prefix_stage(st, "link", ret);
+	if (!opts->skip_spw_dps) {
 		ret = ramon_spw_nn_dps(c, nn, 0, st);
 		if (ret)
-			return prep_stage(st, "dps", ret);
+			return prep_prefix_stage(st, "dps", ret);
 	}
 	ret = ramon_spfi_init_nn(c, nn, 0, &r, st);
 	if (ret)
-		return prep_stage(st, "init", ret);
+		return prep_prefix_stage(st, "init", ret);
 	ramon__log(c, RAMON_LOG_INFO, "spfi%u INIT: rx_err_code %u init_info 0x%x", nn,
 		   r.rx_err_code, r.rx_init_info);
-	if (o->format) {
+	if (opts->format) {
 		ret = ramon_spfi_format(c, nn, NULL, st);
 		if (ret)
-			return prep_stage(st, "format", ret);
+			return prep_prefix_stage(st, "format", ret);
 	}
 	if (t) {
 		ret = ramon_spfi_get_table(c, nn, t, st);
 		if (ret)
-			return prep_stage(st, "table", ret);
+			return prep_prefix_stage(st, "table", ret);
 	}
 	ramon_status_clear(st);
 	return 0;

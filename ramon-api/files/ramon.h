@@ -66,7 +66,7 @@ enum ramon_lib_err {
 	RAMON_LIB_ERR_LIST(RAMON_LIB_ERR_ENUM)
 };
 
-/* "RAMON_E_BUF_RANGE", "RAMON_EL_SPW_NACK", or "RAMON_E_UNKNOWN" */
+/* "RAMON_E_BUF_RANGE", "RAMON_EL_SPW_NACK"; unknown: "RAMON_E_UNKNOWN", "RAMON_EL_UNKNOWN" */
 const char *ramon_err_str(uint32_t code);
 /* the one-line description of a driver or library code */
 const char *ramon_err_text(uint32_t code);
@@ -148,8 +148,9 @@ int ramon_ioc_get_stats(ramon_ctx *c, struct ramon_get_stats *a);
 int ramon_get_info(ramon_ctx *c, struct ramon_get_info *gi, struct ramon_status *st);
 int ramon_chan_info(ramon_ctx *c, uint32_t index, struct ramon_chan_info *ci, struct ramon_status *st);
 int ramon_regwin_info(ramon_ctx *c, uint32_t index, struct ramon_regwin_info *ri, struct ramon_status *st);
-/* reset != 0 zeroes the driver counters after reading them (for every user of the device) */
-int ramon_get_stats(ramon_ctx *c, int reset, struct ramon_get_stats *g, struct ramon_status *st);
+/* and_reset != 0 zeroes the driver counters after reading them (for every user of the device) */
+int ramon_get_stats(ramon_ctx *c, int and_reset, struct ramon_get_stats *g,
+		    struct ramon_status *st);
 
 /* ------------------------------------------------------------------------ */
 /* DMA buffers                                                               */
@@ -201,9 +202,9 @@ uint64_t ramon_axi_retries(const ramon_ctx *c);
 int ramon_axi_find_pair(ramon_ctx *c, uint32_t nn, uint32_t *rx_chan, uint32_t *tx_chan,
 			struct ramon_status *st);
 
-/* n 1..RAMON_ZDMA_MAX_COPIES; *done = entries completed (may be NULL) */
-int ramon_zdma_copy(ramon_ctx *c, const struct ramon_copy *e, uint32_t n, uint32_t timeout_ms,
-		    uint32_t *done, struct ramon_status *st);
+/* n_entries 1..RAMON_ZDMA_MAX_COPIES; *n_done = entries completed (may be NULL) */
+int ramon_zdma_copy(ramon_ctx *c, const struct ramon_copy *entries, uint32_t n_entries,
+		    uint32_t timeout_ms, uint32_t *n_done, struct ramon_status *st);
 int ramon_zdma_copy1(ramon_ctx *c, const ramon_buf *src, uint64_t src_off, const ramon_buf *dst,
 		     uint64_t dst_off, uint64_t len, uint32_t timeout_ms, struct ramon_status *st);
 
@@ -260,9 +261,9 @@ struct ramon_rstop_time {
 	unsigned sec, min, hour, day, month, year;	/* year: two digits */
 };
 /* RS-TOP 0x00/0x04/0x08 */
-int ramon_rstop_version(ramon_ctx *c, uint32_t v[3], struct ramon_status *st);
+int ramon_rstop_version(ramon_ctx *c, uint32_t version[3], struct ramon_status *st);
 /* RS-TOP 0x10 bit fields: sec[5:0] min[11:6] hour[16:12] year[22:17] month[26:23] day[31:27] */
-void ramon_rstop_decode_time(uint32_t v, struct ramon_rstop_time *t);
+void ramon_rstop_decode_time(uint32_t raw, struct ramon_rstop_time *t);
 
 /* SYSMON: temperature at offset 0 of each window, 37 voltage rails */
 #define RAMON_SYSMON_RAILS	37

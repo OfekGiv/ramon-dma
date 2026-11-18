@@ -21,18 +21,18 @@ static void crc_init(void)
 	}
 }
 
-uint32_t ramon_crc32_update(uint32_t crc, const void *data, size_t n)
+uint32_t ramon_crc32_update(uint32_t crc, const void *data, size_t len)
 {
 	const uint8_t *p = data;
 	size_t i;
 
 	pthread_once(&crc_once, crc_init);
-	for (i = 0; i < n; i++)
+	for (i = 0; i < len; i++)
 		crc = crc_table[(uint8_t)crc ^ p[i]] ^ crc >> 8;
 	return crc;
 }
 
-uint32_t ramon_crc32(const void *data, size_t n)
+uint32_t ramon_crc32(const void *data, size_t len)
 {
-	return ramon_crc32_update(0, data, n);
+	return ramon_crc32_update(0, data, len);
 }

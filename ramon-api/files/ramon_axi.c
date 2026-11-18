@@ -76,19 +76,19 @@ int ramon_axi_find_pair(ramon_ctx *c, uint32_t nn, uint32_t *rx_chan, uint32_t *
 	return 0;
 }
 
-int ramon_zdma_copy(ramon_ctx *c, const struct ramon_copy *e, uint32_t n, uint32_t timeout_ms,
-		    uint32_t *done, struct ramon_status *st)
+int ramon_zdma_copy(ramon_ctx *c, const struct ramon_copy *entries, uint32_t n_entries,
+		    uint32_t timeout_ms, uint32_t *n_done, struct ramon_status *st)
 {
 	struct ramon_zdma_copy z;
 	int ret;
 
 	memset(&z, 0, sizeof(z));
 	z.timeout_ms = timeout_ms;
-	z.n = n;
-	z.entries = (uintptr_t)e;
+	z.n = n_entries;
+	z.entries = (uintptr_t)entries;
 	ret = ramon__ioctl(c, RAMON_IOC_ZDMA_COPY, &z, &z.st, st);
-	if (done)
-		*done = z.done;
+	if (n_done)
+		*n_done = z.done;
 	return ret;
 }
 

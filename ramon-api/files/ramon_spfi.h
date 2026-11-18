@@ -172,8 +172,8 @@ int ramon_spfi_get_table(ramon_ctx *c, uint32_t nn, struct ramon_spfi_table *t,
 			 struct ramon_status *st);
 unsigned ramon_spfi_count_open(const struct ramon_spfi_table *t);
 unsigned ramon_spfi_count_exist(const struct ramon_spfi_table *t);
-/* up to want usable ids that do not exist, highest first; returns how many */
-unsigned ramon_spfi_find_free(const struct ramon_spfi_table *t, uint32_t *out, unsigned want);
+/* up to max_ids usable ids that do not exist, highest first; returns how many */
+unsigned ramon_spfi_find_free(const struct ramon_spfi_table *t, uint32_t *out, unsigned max_ids);
 int ramon_spfi_mem_read(ramon_ctx *c, uint32_t nn, uint32_t off, uint32_t size, void *out,
 			struct ramon_status *st);
 int ramon_spfi_tx_offs_write(ramon_ctx *c, uint32_t nn, uint32_t off, uint32_t size, const void *in,
@@ -193,17 +193,17 @@ int ramon_spfi_write_buf(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first
 int ramon_spfi_write_mem(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first_page,
 			 const void *data, size_t len, uint32_t timeout_ms, struct ramon_status *st);
 /*
- * pages[0..n-1] (1..8192) into dst at dst_off; dst must hold n * 16 KiB there.
+ * pages[0..n_pages-1] (1..8192) into dst at dst_off; dst must hold n_pages * 16 KiB there.
  * The driver FLUSHes the stream first if a page is past what it has flushed.
  */
-int ramon_spfi_read(ramon_ctx *c, uint32_t nn, uint32_t sid, const uint32_t *pages, uint32_t n,
-		    const ramon_buf *dst, uint64_t dst_off, uint32_t timeout_ms, uint32_t *rx_status,
-		    struct ramon_status *st);
-int ramon_spfi_read_seq(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first_page, uint32_t n,
-			const ramon_buf *dst, uint64_t dst_off, uint32_t timeout_ms,
-			struct ramon_status *st);
-int ramon_spfi_read_mem(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first_page, uint32_t n,
-			void *out, uint32_t timeout_ms, struct ramon_status *st);
+int ramon_spfi_read(ramon_ctx *c, uint32_t nn, uint32_t sid, const uint32_t *pages,
+		    uint32_t n_pages, const ramon_buf *dst, uint64_t dst_off, uint32_t timeout_ms,
+		    uint32_t *rx_status, struct ramon_status *st);
+int ramon_spfi_read_seq(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first_page,
+			uint32_t n_pages, const ramon_buf *dst, uint64_t dst_off,
+			uint32_t timeout_ms, struct ramon_status *st);
+int ramon_spfi_read_mem(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t first_page,
+			uint32_t n_pages, void *out, uint32_t timeout_ms, struct ramon_status *st);
 
 /* an open stream and where the next write goes */
 struct ramon_spfi_stream {
@@ -220,15 +220,16 @@ struct ramon_spfi_stream {
  * first page, then OPENs.
  */
 int ramon_spfi_stream_open(ramon_ctx *c, uint32_t nn, uint32_t sid, uint32_t size_pages,
-			   struct ramon_spfi_stream *s, struct ramon_status *st);
-int ramon_spfi_stream_append(ramon_ctx *c, struct ramon_spfi_stream *s, const ramon_buf *b,
+			   struct ramon_spfi_stream *stream, struct ramon_status *st);
+int ramon_spfi_stream_append(ramon_ctx *c, struct ramon_spfi_stream *stream, const ramon_buf *b,
 			     uint64_t off, uint32_t n_pages, uint32_t timeout_ms,
 			     struct ramon_status *st);
-int ramon_spfi_stream_append_mem(ramon_ctx *c, struct ramon_spfi_stream *s, const void *data,
+int ramon_spfi_stream_append_mem(ramon_ctx *c, struct ramon_spfi_stream *stream, const void *data,
 				 size_t len, uint32_t timeout_ms, struct ramon_status *st);
-int ramon_spfi_stream_flush(ramon_ctx *c, struct ramon_spfi_stream *s, struct ramon_status *st);
+int ramon_spfi_stream_flush(ramon_ctx *c, struct ramon_spfi_stream *stream,
+			    struct ramon_status *st);
 /* CLOSE, and DELETE if and_delete */
-int ramon_spfi_stream_close(ramon_ctx *c, struct ramon_spfi_stream *s, int and_delete,
+int ramon_spfi_stream_close(ramon_ctx *c, struct ramon_spfi_stream *stream, int and_delete,
 			    struct ramon_status *st);
 
 /* alerts */
@@ -252,7 +253,7 @@ int ramon_spfi_alert_start(ramon_ctx *c, uint32_t nn, ramon_spfi_alert_cb cb, vo
 int ramon_spfi_alert_stop(ramon_ctx *c, uint32_t nn);
 /* waits for alerts until none arrives for idle_ms; cb may be NULL */
 int ramon_spfi_drain_alerts(ramon_ctx *c, uint32_t nn, uint32_t idle_ms, ramon_spfi_alert_cb cb,
-			    void *user, uint32_t *n, struct ramon_status *st);
+			    void *user, uint32_t *n_drained, struct ramon_status *st);
 
 /* diagnostics: SPFI status words and the driver's per-NN counters */
 #define RAMON_SPFI_DIAG_WORDS	7
@@ -280,7 +281,7 @@ struct ramon_spfi_prep_opts {
 	int format;
 	int skip_spw_dps;
 };
-int ramon_spfi_prep(ramon_ctx *c, uint32_t nn, const struct ramon_spfi_prep_opts *o,
+int ramon_spfi_prep(ramon_ctx *c, uint32_t nn, const struct ramon_spfi_prep_opts *opts,
 		    struct ramon_spfi_table *t, struct ramon_status *st);
 
 #ifdef __cplusplus

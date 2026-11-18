@@ -72,26 +72,26 @@ int ramon_regwin_find(ramon_ctx *c, const char *name, uint32_t *index, struct ra
 	return ramon__fail(st, RAMON_EL_INVAL, ENOENT, 0, 0, "no register window \"%.40s\"", name);
 }
 
-int ramon_rstop_version(ramon_ctx *c, uint32_t v[3], struct ramon_status *st)
+int ramon_rstop_version(ramon_ctx *c, uint32_t version[3], struct ramon_status *st)
 {
 	int ret;
 
-	ret = ramon_reg_read(c, "rs_top", RAMON_RSTOP_MAJOR, &v[0], st);
+	ret = ramon_reg_read(c, "rs_top", RAMON_RSTOP_MAJOR, &version[0], st);
 	if (!ret)
-		ret = ramon_reg_read(c, "rs_top", RAMON_RSTOP_MINOR, &v[1], st);
+		ret = ramon_reg_read(c, "rs_top", RAMON_RSTOP_MINOR, &version[1], st);
 	if (!ret)
-		ret = ramon_reg_read(c, "rs_top", RAMON_RSTOP_MINOR_MINOR, &v[2], st);
+		ret = ramon_reg_read(c, "rs_top", RAMON_RSTOP_MINOR_MINOR, &version[2], st);
 	return ret;
 }
 
-void ramon_rstop_decode_time(uint32_t v, struct ramon_rstop_time *t)
+void ramon_rstop_decode_time(uint32_t raw, struct ramon_rstop_time *t)
 {
-	t->sec = v & 0x3F;
-	t->min = (v >> 6) & 0x3F;
-	t->hour = (v >> 12) & 0x1F;
-	t->year = (v >> 17) & 0x3F;
-	t->month = (v >> 23) & 0x0F;
-	t->day = (v >> 27) & 0x1F;
+	t->sec = raw & 0x3F;
+	t->min = (raw >> 6) & 0x3F;
+	t->hour = (raw >> 12) & 0x1F;
+	t->year = (raw >> 17) & 0x3F;
+	t->month = (raw >> 23) & 0x0F;
+	t->day = (raw >> 27) & 0x1F;
 }
 
 /* the old init_sysmon_list(): 10 PS rails, then 27 PL rails */

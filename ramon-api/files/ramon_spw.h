@@ -191,9 +191,9 @@ int ramon_spw_enable(ramon_ctx *c, uint32_t nn, struct ramon_status *st);
 int ramon_spw_link_status(ramon_ctx *c, uint32_t nn, uint32_t *raw, struct ramon_status *st);
 /*
  * The old spw_init() loop: resets the link until it reports synced. Returns 0
- * with *tries (may be NULL) = resets needed, or -ENOLINK / RAMON_EL_SPW_LINK_DOWN.
+ * with *n_resets (may be NULL) = resets needed, or -ENOLINK / RAMON_EL_SPW_LINK_DOWN.
  */
-int ramon_spw_sync(ramon_ctx *c, uint32_t nn, uint32_t *tries, struct ramon_status *st);
+int ramon_spw_sync(ramon_ctx *c, uint32_t nn, uint32_t *n_resets, struct ramon_status *st);
 /*
  * FPGA loopback on NN nn. A change resets the link, which is then synced
  * again (ramon_spw_sync), in loopback with itself when enabling, as the old
@@ -203,12 +203,12 @@ int ramon_spw_loopback(ramon_ctx *c, uint32_t nn, int enable, struct ramon_statu
 int ramon_spw_loopback_get(ramon_ctx *c, uint32_t nn, int *enabled, struct ramon_status *st);
 
 /* Pure helpers (no context). CRC-32 as the old rc_crc32sw() with initial value 0 (== zlib crc32). */
-uint32_t ramon_crc32(const void *data, size_t n);
-uint32_t ramon_crc32_update(uint32_t crc, const void *data, size_t n);
+uint32_t ramon_crc32(const void *data, size_t len);
+uint32_t ramon_crc32_update(uint32_t crc, const void *data, size_t len);
 uint32_t ramon_spw_header_crc(const struct ramon_spw_hdr *h);
-/* header + gathered payload + both CRCs into out; -EMSGSIZE if it does not fit cap */
+/* header + gathered payload + both CRCs into out; -EMSGSIZE if it does not fit cap_bytes */
 int ramon_spw_build(uint8_t src_node, const struct ramon_spw_msg *m, const struct ramon_iov *iov,
-		    unsigned n_iov, void *out, size_t cap, uint32_t *out_len);
+		    unsigned n_iov, void *out, size_t cap_bytes, uint32_t *out_len);
 /*
  * Parses a received packet (header + payload + footer). Returns 0 and sets
  * rx->flags for CRC, length, address and footer problems; -EINVAL only if raw
@@ -243,10 +243,10 @@ int ramon_spw_rx_running(ramon_ctx *c, uint32_t nn);
  * receive mode B: waits for one packet in the calling thread and copies it
  * (header + payload + footer) into buf. rx points into buf. Fails with
  * RAMON_EL_BUSY while an RX thread or another receiver runs on the NN, and
- * with -EMSGSIZE (packet consumed and dropped) if cap is too small.
+ * with -EMSGSIZE (packet consumed and dropped) if cap_bytes is too small.
  * CRC problems are reported in rx->flags, not as an error.
  */
-int ramon_spw_recv(ramon_ctx *c, uint32_t nn, void *buf, uint32_t cap, uint32_t timeout_ms,
+int ramon_spw_recv(ramon_ctx *c, uint32_t nn, void *buf, uint32_t cap_bytes, uint32_t timeout_ms,
 		   struct ramon_spw_rx *rx, struct ramon_status *st);
 /* mode B: receives and drops packets until none arrives for idle_ms */
 int ramon_spw_drain(ramon_ctx *c, uint32_t nn, uint32_t idle_ms, uint32_t *n_dropped,
@@ -274,7 +274,7 @@ struct ramon_spw_match {
  */
 int ramon_spw_request(ramon_ctx *c, uint32_t nn, const struct ramon_spw_msg *m,
 		      const struct ramon_iov *iov, unsigned n_iov,
-		      const struct ramon_spw_match *want, void *reply, uint32_t cap,
+		      const struct ramon_spw_match *want, void *reply, uint32_t cap_bytes,
 		      uint32_t timeout_ms, struct ramon_spw_rx *rx, struct ramon_status *st);
 
 /* NN services; dst is cfg.nn_node, timeout_ms 0 = RAMON_SPW_REPLY_MS */
@@ -326,7 +326,7 @@ struct ramon_spw_stats {
 	uint64_t rx_wait_errors;
 	uint64_t rx_to_request;		/* handed to a waiting ramon_spw_request() */
 };
-int ramon_spw_get_stats(ramon_ctx *c, uint32_t nn, struct ramon_spw_stats *s, int reset);
+int ramon_spw_get_stats(ramon_ctx *c, uint32_t nn, struct ramon_spw_stats *out, int and_reset);
 
 #ifdef __cplusplus
 }

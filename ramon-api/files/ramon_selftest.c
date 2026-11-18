@@ -35,9 +35,9 @@ static void test_crc(void)
 }
 
 /* packet as the FPGA delivers it: built packet + 16-byte footer */
-static uint32_t with_footer(uint8_t *buf, uint32_t len, uint32_t err)
+static uint32_t append_footer(uint8_t *buf, uint32_t len, uint32_t error_flags)
 {
-	struct ramon_spw_footer f = { len, err, 7, 0 };
+	struct ramon_spw_footer f = { len, error_flags, 7, 0 };
 
 	memcpy(buf + len, &f, sizeof(f));
 	return len + sizeof(f);
@@ -66,7 +66,7 @@ static void test_spw(void)
 	CHECK(h.header_crc == ramon_spw_header_crc(&h), "header crc");
 
 	/* as the NN would receive it, and as our own node */
-	raw = with_footer(buf, len, 0);
+	raw = append_footer(buf, len, 0);
 	CHECK(!ramon_spw_parse(buf, raw, 0x41, &rx), "parse");
 	CHECK(rx.flags == 0, "clean packet flags 0x%x", rx.flags);
 	CHECK(rx.payload_len == 1037 && !memcmp(rx.payload, pay1, 1000) &&
@@ -87,13 +87,13 @@ static void test_spw(void)
 	ramon_spw_parse(buf, raw - 100, 0x41, &rx);
 	CHECK(rx.flags & RAMON_SPW_RX_TRUNCATED, "truncated flags 0x%x", rx.flags);
 	CHECK(ramon_spw_parse(buf, 39, 0x41, &rx) == -EINVAL && !rx.hdr, "shorter than a header");
-	with_footer(buf, len, 0x4);
+	append_footer(buf, len, 0x4);
 	ramon_spw_parse(buf, raw, 0x41, &rx);
 	CHECK(rx.flags == RAMON_SPW_RX_FOOTER_ERR, "footer error flags 0x%x", rx.flags);
 
 	/* empty payload, and a buffer too small */
 	CHECK(!ramon_spw_build(68, &m, NULL, 0, buf, sizeof(buf), &len) && len == 40, "empty");
-	raw = with_footer(buf, len, 0);
+	raw = append_footer(buf, len, 0);
 	ramon_spw_parse(buf, raw, 0x41, &rx);
 	CHECK(rx.flags == 0 && rx.payload_len == 0, "empty payload flags 0x%x", rx.flags);
 	CHECK(ramon_spw_build(68, &m, iov, 2, buf, 100, &len) == -EMSGSIZE, "too small");
@@ -126,10 +126,10 @@ static void test_board(void)
 {
 	struct ramon_rstop_time tm;
 	uint32_t raw = (uint32_t)((25.0 + 280.239) / 509.314 * 65536.0);
-	double c = ramon_sysmon_temp_c(raw);
+	double temp_c = ramon_sysmon_temp_c(raw);
 	uint32_t v;
 
-	CHECK(c > 24.98 && c < 25.02, "temperature %.3f", c);
+	CHECK(temp_c > 24.98 && temp_c < 25.02, "temperature %.3f", temp_c);
 	CHECK(ramon_sysmon_volts(32768, 3) == 1.5, "volts");
 	CHECK(ramon_sysmon_rails[0].offset == 0x0004 && ramon_sysmon_rails[36].offset == 0x020C &&
 	      ramon_sysmon_rails[10].win == RAMON_WIN_SYSMON_PL, "rail table");

@@ -41,10 +41,10 @@ struct spw_waiter {
 	int armed;
 	int done;
 	int err;
-	int any;			/* want was NULL */
+	int accept_any;			/* want was NULL */
 	struct ramon_spw_match want;
-	void *buf;
-	uint32_t cap;
+	void *reply;
+	uint32_t reply_cap_bytes;
 	struct ramon_spw_rx rx;
 	struct ramon_status st;
 };
@@ -61,11 +61,11 @@ struct spw_nn {
 
 	pthread_mutex_t lock;		/* everything below */
 	pthread_cond_t cond;		/* waiter.done */
-	int state;			/* enum spw_rx_state */
-	int thread_valid;		/* thread created and not yet joined */
-	int thread_done;		/* the thread left its loop by itself (device removed) */
+	int rx_state;			/* enum spw_rx_state */
+	int thread_joinable;		/* thread created and not yet joined */
+	int thread_exited;		/* spw_rx_main() exited: stopped or device removed */
 	pthread_t thread;
-	int receiver;			/* a mode-B receiver owns rxbuf */
+	int receiver_active;		/* a mode-B receiver owns rxbuf */
 	ramon_spw_rx_cb cb;
 	void *cb_user;
 	struct spw_waiter waiter;
@@ -73,15 +73,15 @@ struct spw_nn {
 };
 
 struct spw_state {
-	int inited;
+	int initialised;
 	struct ramon_spw_config cfg;
 	struct spw_nn nn[RAMON_NN_COUNT];
 	pthread_mutex_t pool_lock;
 	pthread_cond_t pool_cond;
-	ramon_buf *slot;
-	unsigned char *busy;
+	ramon_buf *slots;
+	unsigned char *slot_busy;
 	unsigned n_slots;
-	uint32_t packet_id;		/* __atomic */
+	uint32_t next_packet_id;	/* __atomic */
 };
 
 /* ---- SPFI ---- */
@@ -102,14 +102,14 @@ struct spfi_nn {
 	ramon_buf scratch;
 	pthread_mutex_t lock;		/* the alert thread fields */
 	int alert_state;
-	int thread_valid;
+	int thread_joinable;
 	pthread_t thread;
 	ramon_spfi_alert_cb cb;
 	void *cb_user;
 };
 
 struct spfi_state {
-	int inited;
+	int initialised;
 	struct ramon_spfi_config cfg;
 	struct spfi_nn nn[RAMON_NN_COUNT];
 };
@@ -134,8 +134,8 @@ struct ramon_ctx {
 int ramon__ioctl(struct ramon_ctx *c, unsigned long req, void *arg, struct ramon_status *trailer,
 		 struct ramon_status *st);
 /* sets a library error in st and returns -(its errno), or -err_override if non-zero */
-int ramon__fail(struct ramon_status *st, uint32_t code, int err, uint64_t a0, uint64_t a1,
-		const char *fmt, ...) RAMON_PRINTF(6, 7);
+int ramon__fail(struct ramon_status *st, uint32_t code, int err_override, uint64_t arg0,
+		uint64_t arg1, const char *fmt, ...) RAMON_PRINTF(6, 7);
 void ramon__log(struct ramon_ctx *c, int level, const char *fmt, ...) RAMON_PRINTF(3, 4);
 uint64_t ramon__now_ns(void);
 void ramon__sleep_ms(uint32_t ms);

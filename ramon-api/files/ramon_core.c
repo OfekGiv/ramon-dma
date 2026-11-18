@@ -83,20 +83,20 @@ size_t ramon_strerror(const struct ramon_status *st, char *buf, size_t len)
 	return n < 0 ? 0 : (size_t)n;
 }
 
-static void status_vset(struct ramon_status *st, uint32_t code, int err, uint64_t a0, uint64_t a1,
-			const char *fmt, va_list ap)
+static void status_vset(struct ramon_status *st, uint32_t code, int err, uint64_t arg0,
+			uint64_t arg1, const char *fmt, va_list ap)
 {
 	st->code = code;
 	st->err = err;
-	st->arg[0] = a0;
-	st->arg[1] = a1;
+	st->arg[0] = arg0;
+	st->arg[1] = arg1;
 	if (fmt)
 		vsnprintf(st->msg, sizeof(st->msg), fmt, ap);
 	else
 		st->msg[0] = 0;
 }
 
-void ramon_status_set(struct ramon_status *st, uint32_t code, int err, uint64_t a0, uint64_t a1,
+void ramon_status_set(struct ramon_status *st, uint32_t code, int err, uint64_t arg0, uint64_t arg1,
 		      const char *fmt, ...)
 {
 	va_list ap;
@@ -104,7 +104,7 @@ void ramon_status_set(struct ramon_status *st, uint32_t code, int err, uint64_t 
 	if (!st)
 		return;
 	va_start(ap, fmt);
-	status_vset(st, code, err, a0, a1, fmt, ap);
+	status_vset(st, code, err, arg0, arg1, fmt, ap);
 	va_end(ap);
 }
 
@@ -114,20 +114,20 @@ void ramon_status_clear(struct ramon_status *st)
 		memset(st, 0, sizeof(*st));
 }
 
-int ramon__fail(struct ramon_status *st, uint32_t code, int err, uint64_t a0, uint64_t a1,
-		const char *fmt, ...)
+int ramon__fail(struct ramon_status *st, uint32_t code, int err_override, uint64_t arg0,
+		uint64_t arg1, const char *fmt, ...)
 {
 	const struct lib_err *e = lib_err_lookup(code);
 	va_list ap;
 
-	if (!err)
-		err = e && e->err ? e->err : EIO;
+	if (!err_override)
+		err_override = e && e->err ? e->err : EIO;
 	if (st) {
 		va_start(ap, fmt);
-		status_vset(st, code, -err, a0, a1, fmt, ap);
+		status_vset(st, code, -err_override, arg0, arg1, fmt, ap);
 		va_end(ap);
 	}
-	return -err;
+	return -err_override;
 }
 
 /* ---- small helpers ---- */
@@ -286,10 +286,10 @@ int ramon_regwin_info(ramon_ctx *c, uint32_t index, struct ramon_regwin_info *ri
 	return ramon__ioctl(c, RAMON_IOC_REGWIN_INFO, ri, &ri->st, st);
 }
 
-int ramon_get_stats(ramon_ctx *c, int reset, struct ramon_get_stats *g, struct ramon_status *st)
+int ramon_get_stats(ramon_ctx *c, int and_reset, struct ramon_get_stats *g, struct ramon_status *st)
 {
 	memset(g, 0, sizeof(*g));
-	g->reset = reset ? 1 : 0;
+	g->reset = and_reset ? 1 : 0;
 	return ramon__ioctl(c, RAMON_IOC_GET_STATS, g, &g->st, st);
 }
 
@@ -297,7 +297,7 @@ int ramon_get_stats(ramon_ctx *c, int reset, struct ramon_get_stats *g, struct r
 
 #define VERSION_KEY(a, b, c)	((uint64_t)(a) << 40 | (uint64_t)(b) << 20 | (uint64_t)(c))
 
-static int version_older(const struct ramon_get_info *gi)
+static int is_driver_below_min(const struct ramon_get_info *gi)
 {
 	return VERSION_KEY(gi->drv_major, gi->drv_minor, gi->drv_patch) <
 	       VERSION_KEY(RAMON_API_DRIVER_MIN_MAJOR, RAMON_API_DRIVER_MIN_MINOR,
@@ -332,7 +332,7 @@ int ramon_open(const char *dev_path, ramon_ctx **out, struct ramon_status *st)
 				  c->info.abi_version, RAMON_ABI_VERSION);
 		goto err;
 	}
-	if (version_older(&c->info))
+	if (is_driver_below_min(&c->info))
 		ramon__log(c, RAMON_LOG_WARN, "driver %u.%u.%u is older than %s, which libramon %s expects",
 			   c->info.drv_major, c->info.drv_minor, c->info.drv_patch,
 			   RAMON_API_DRIVER_MIN, RAMON_API_VERSION);

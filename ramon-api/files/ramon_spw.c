@@ -12,7 +12,7 @@
 #define SPW_RX_WAIT_MS		1000	/* RX thread wait period; bounds how long a stop takes */
 #define SPW_RX_XFER_MS		3000
 #define SPW_ERR_BACKOFF_MS	100
-#define SPW_REPLY_CAP		0x10000
+#define SPW_REPLY_BUF_BYTES	0x10000
 #define SPW_DRAIN_FIRST_MS	1
 /* l3_len counts L3 + L4 + payload */
 #define SPW_L3L4_BYTES		(RAMON_SPW_L3_BYTES + RAMON_SPW_HDR_BYTES - RAMON_SPW_L2L3_BYTES)
@@ -34,28 +34,28 @@ void ramon_spw_config_default(struct ramon_spw_config *cfg)
 	cfg->sync_sleep_ms = 10;
 }
 
-static void spw_fill_config(struct ramon_spw_config *d, const struct ramon_spw_config *in,
+static void spw_fill_config(struct ramon_spw_config *out, const struct ramon_spw_config *in,
 			    const struct ramon_get_info *gi)
 {
 	struct ramon_spw_config def;
 
 	ramon_spw_config_default(&def);
-	*d = in ? *in : def;
-	if (!d->node_id)
-		d->node_id = def.node_id;
-	if (!d->nn_node)
-		d->nn_node = def.nn_node;
-	if (!d->rx_buf_bytes)
-		d->rx_buf_bytes = def.rx_buf_bytes;
-	if (!d->tx_slots)
-		d->tx_slots = def.tx_slots;
-	if (!d->tx_slot_bytes)
-		d->tx_slot_bytes = def.tx_slot_bytes;
-	if (!d->sync_tries)
-		d->sync_tries = def.sync_tries;
-	if (!d->sync_sleep_ms)
-		d->sync_sleep_ms = def.sync_sleep_ms;
-	d->nn_mask = d->nn_mask ? d->nn_mask & gi->spw_mask : gi->spw_mask;
+	*out = in ? *in : def;
+	if (!out->node_id)
+		out->node_id = def.node_id;
+	if (!out->nn_node)
+		out->nn_node = def.nn_node;
+	if (!out->rx_buf_bytes)
+		out->rx_buf_bytes = def.rx_buf_bytes;
+	if (!out->tx_slots)
+		out->tx_slots = def.tx_slots;
+	if (!out->tx_slot_bytes)
+		out->tx_slot_bytes = def.tx_slot_bytes;
+	if (!out->sync_tries)
+		out->sync_tries = def.sync_tries;
+	if (!out->sync_sleep_ms)
+		out->sync_sleep_ms = def.sync_sleep_ms;
+	out->nn_mask = out->nn_mask ? out->nn_mask & gi->spw_mask : gi->spw_mask;
 }
 
 void ramon__spw_ctx_init(struct ramon_ctx *c)
@@ -90,7 +90,7 @@ void ramon__spw_ctx_destroy(struct ramon_ctx *c)
 
 int ramon_spw_is_inited(const ramon_ctx *c)
 {
-	return c->spw.inited;
+	return c->spw.initialised;
 }
 
 void ramon_spw_get_config(const ramon_ctx *c, struct ramon_spw_config *cfg)
@@ -112,7 +112,7 @@ static int spw_check(struct ramon_ctx *c, uint32_t nn, int need_init, struct ram
 				   "spw%u is not present (spw_mask 0x%x)", nn, c->info.spw_mask);
 	if (!need_init)
 		return 0;
-	if (!c->spw.inited)
+	if (!c->spw.initialised)
 		return ramon__fail(st, RAMON_EL_NOT_INITED, 0, 0, 0, "ramon_spw_init() not called");
 	if (!c->spw.nn[nn].present)
 		return ramon__fail(st, RAMON_EL_NOT_PRESENT, 0, nn, c->spw.cfg.nn_mask,
@@ -122,55 +122,57 @@ static int spw_check(struct ramon_ctx *c, uint32_t nn, int need_init, struct ram
 
 static void spw_free_all(struct ramon_ctx *c)
 {
-	struct spw_state *w = &c->spw;
+	struct spw_state *spw = &c->spw;
 	unsigned i;
 	uint32_t nn;
 
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
-		ramon_buf_free(&w->nn[nn].rxbuf, NULL);
-		free(w->nn[nn].rxcopy);
-		w->nn[nn].rxcopy = NULL;
-		w->nn[nn].present = 0;
+		ramon_buf_free(&spw->nn[nn].rxbuf, NULL);
+		free(spw->nn[nn].rxcopy);
+		spw->nn[nn].rxcopy = NULL;
+		spw->nn[nn].present = 0;
 	}
-	for (i = 0; w->slot && i < w->n_slots; i++)
-		ramon_buf_free(&w->slot[i], NULL);
-	free(w->slot);
-	free(w->busy);
-	w->slot = NULL;
-	w->busy = NULL;
-	w->n_slots = 0;
+	for (i = 0; spw->slots && i < spw->n_slots; i++)
+		ramon_buf_free(&spw->slots[i], NULL);
+	free(spw->slots);
+	free(spw->slot_busy);
+	spw->slots = NULL;
+	spw->slot_busy = NULL;
+	spw->n_slots = 0;
 }
 
 int ramon_spw_init(ramon_ctx *c, const struct ramon_spw_config *cfg, struct ramon_status *st)
 {
-	struct spw_state *w = &c->spw;
-	struct ramon_spw_config d;
+	struct spw_state *spw = &c->spw;
+	struct ramon_spw_config new_cfg;
 	unsigned i;
 	uint32_t nn;
 	int ret = 0;
 
 	pthread_mutex_lock(&c->lock);
-	if (w->inited) {
+	if (spw->initialised) {
 		pthread_mutex_unlock(&c->lock);
 		return ramon__fail(st, RAMON_EL_BUSY, EALREADY, 0, 0, "SPW layer already initialised");
 	}
-	spw_fill_config(&d, cfg, &c->info);
-	if (d.tx_slot_bytes <= RAMON_SPW_HDR_BYTES || d.rx_buf_bytes < RAMON_SPW_HDR_BYTES) {
+	spw_fill_config(&new_cfg, cfg, &c->info);
+	if (new_cfg.tx_slot_bytes <= RAMON_SPW_HDR_BYTES ||
+	    new_cfg.rx_buf_bytes < RAMON_SPW_HDR_BYTES) {
 		pthread_mutex_unlock(&c->lock);
-		return ramon__fail(st, RAMON_EL_INVAL, 0, d.tx_slot_bytes, d.rx_buf_bytes,
-				   "tx_slot_bytes %u / rx_buf_bytes %u too small", d.tx_slot_bytes,
-				   d.rx_buf_bytes);
+		return ramon__fail(st, RAMON_EL_INVAL, 0, new_cfg.tx_slot_bytes,
+				   new_cfg.rx_buf_bytes,
+				   "tx_slot_bytes %u / rx_buf_bytes %u too small",
+				   new_cfg.tx_slot_bytes, new_cfg.rx_buf_bytes);
 	}
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++) {
-		struct spw_nn *s = &w->nn[nn];
+		struct spw_nn *s = &spw->nn[nn];
 
 		s->present = 0;
 		memset(&s->stats, 0, sizeof(s->stats));
-		if (!(d.nn_mask & (1u << nn)))
+		if (!(new_cfg.nn_mask & (1u << nn)))
 			continue;
 		ret = ramon_axi_find_pair(c, nn, &s->rx_chan, &s->tx_chan, st);
 		if (!ret)
-			ret = ramon_buf_alloc(c, d.rx_buf_bytes, 0, &s->rxbuf, st);
+			ret = ramon_buf_alloc(c, new_cfg.rx_buf_bytes, 0, &s->rxbuf, st);
 		if (ret)
 			goto err;
 		s->rxcopy = malloc(s->rxbuf.size);
@@ -183,20 +185,20 @@ int ramon_spw_init(ramon_ctx *c, const struct ramon_spw_config *cfg, struct ramo
 			goto err;
 		s->present = 1;
 	}
-	w->slot = calloc(d.tx_slots, sizeof(*w->slot));
-	w->busy = calloc(d.tx_slots, 1);
-	if (!w->slot || !w->busy) {
+	spw->slots = calloc(new_cfg.tx_slots, sizeof(*spw->slots));
+	spw->slot_busy = calloc(new_cfg.tx_slots, 1);
+	if (!spw->slots || !spw->slot_busy) {
 		ret = ramon__fail(st, RAMON_EL_SYS, ENOMEM, 0, 0, "out of memory");
 		goto err;
 	}
-	w->n_slots = d.tx_slots;
-	for (i = 0; i < d.tx_slots; i++) {
-		ret = ramon_buf_alloc(c, d.tx_slot_bytes, 0, &w->slot[i], st);
+	spw->n_slots = new_cfg.tx_slots;
+	for (i = 0; i < new_cfg.tx_slots; i++) {
+		ret = ramon_buf_alloc(c, new_cfg.tx_slot_bytes, 0, &spw->slots[i], st);
 		if (ret)
 			goto err;
 	}
-	w->cfg = d;
-	w->inited = 1;
+	spw->cfg = new_cfg;
+	spw->initialised = 1;
 	pthread_mutex_unlock(&c->lock);
 	ramon_status_clear(st);
 	return 0;
@@ -210,13 +212,13 @@ void ramon_spw_fini(ramon_ctx *c)
 {
 	uint32_t nn;
 
-	if (!c->spw.inited)
+	if (!c->spw.initialised)
 		return;
 	for (nn = 0; nn < RAMON_NN_COUNT; nn++)
 		ramon_spw_rx_stop(c, nn);
 	pthread_mutex_lock(&c->lock);
 	spw_free_all(c);
-	c->spw.inited = 0;
+	c->spw.initialised = 0;
 	spw_fill_config(&c->spw.cfg, NULL, &c->info);
 	pthread_mutex_unlock(&c->lock);
 }
@@ -247,7 +249,7 @@ int ramon_spw_enable(ramon_ctx *c, uint32_t nn, struct ramon_status *st)
 	return ret;
 }
 
-int ramon_spw_sync(ramon_ctx *c, uint32_t nn, uint32_t *tries, struct ramon_status *st)
+int ramon_spw_sync(ramon_ctx *c, uint32_t nn, uint32_t *n_resets, struct ramon_status *st)
 {
 	const struct ramon_spw_config *cfg = &c->spw.cfg;
 	uint32_t i, v = 0;
@@ -262,8 +264,8 @@ int ramon_spw_sync(ramon_ctx *c, uint32_t nn, uint32_t *tries, struct ramon_stat
 		if (ret < 0)
 			return ret;
 		if (ret == 1) {
-			if (tries)
-				*tries = i;
+			if (n_resets)
+				*n_resets = i;
 			ramon_status_clear(st);
 			return 0;
 		}
@@ -272,8 +274,8 @@ int ramon_spw_sync(ramon_ctx *c, uint32_t nn, uint32_t *tries, struct ramon_stat
 			return ret;
 		ramon__sleep_ms(cfg->sync_sleep_ms);
 	}
-	if (tries)
-		*tries = i;
+	if (n_resets)
+		*n_resets = i;
 	return ramon__fail(st, RAMON_EL_SPW_LINK_DOWN, 0, v, i,
 			   "spw%u: not synced after %u resets (0x28 = 0x%x)", nn, i, v);
 }
@@ -325,27 +327,28 @@ uint32_t ramon_spw_header_crc(const struct ramon_spw_hdr *h)
 }
 
 int ramon_spw_build(uint8_t src_node, const struct ramon_spw_msg *m, const struct ramon_iov *iov,
-		    unsigned n_iov, void *out, size_t cap, uint32_t *out_len)
+		    unsigned n_iov, void *out, size_t cap_bytes, uint32_t *out_len)
 {
 	struct ramon_spw_hdr h;
 	uint8_t *p = out;
-	size_t payload = 0, off;
+	size_t payload_len = 0, off;
 	uint32_t crc;
 	unsigned i;
 
 	for (i = 0; i < n_iov; i++) {
 		if (iov[i].len && !iov[i].base)
 			return -EINVAL;
-		payload += iov[i].len;
+		payload_len += iov[i].len;
 	}
-	if (payload > cap || RAMON_SPW_HDR_BYTES > cap - payload || payload > 0x7FFFFFFF)
+	if (payload_len > cap_bytes || RAMON_SPW_HDR_BYTES > cap_bytes - payload_len ||
+	    payload_len > 0x7FFFFFFF)
 		return -EMSGSIZE;
 	memset(&h, 0, sizeof(h));
 	h.dst = m->dst;
 	h.src = src_node;
 	h.protocol_id = m->protocol_id;
 	h.nack_id = m->nack_id;
-	h.l3_len = SPW_L3L4_BYTES + (uint32_t)payload;
+	h.l3_len = SPW_L3L4_BYTES + (uint32_t)payload_len;
 	h.packet_id = m->packet_id;
 	h.app_type = m->app_type;
 	h.attribute_id = m->attribute_id;
@@ -361,7 +364,7 @@ int ramon_spw_build(uint8_t src_node, const struct ramon_spw_msg *m, const struc
 		if (iov[i].len)
 			memcpy(p + off, iov[i].base, iov[i].len);
 	if (out_len)
-		*out_len = (uint32_t)(RAMON_SPW_HDR_BYTES + payload);
+		*out_len = (uint32_t)(RAMON_SPW_HDR_BYTES + payload_len);
 	return 0;
 }
 
@@ -369,7 +372,7 @@ int ramon_spw_parse(const void *raw, uint32_t raw_size, uint8_t our_node, struct
 {
 	const uint8_t *p = raw;
 	const struct ramon_spw_hdr *h = raw;
-	uint32_t area;
+	uint32_t max_payload_len;
 
 	memset(rx, 0, sizeof(*rx));
 	rx->raw = p;
@@ -385,10 +388,10 @@ int ramon_spw_parse(const void *raw, uint32_t raw_size, uint8_t our_node, struct
 		rx->payload_len = raw_size - RAMON_SPW_HDR_BYTES;
 	} else {
 		memcpy(&rx->footer, p + raw_size - RAMON_SPW_FOOTER_BYTES, sizeof(rx->footer));
-		area = raw_size - RAMON_SPW_HDR_BYTES - RAMON_SPW_FOOTER_BYTES;
-		if (h->l3_len < SPW_L3L4_BYTES || h->l3_len - SPW_L3L4_BYTES > area) {
+		max_payload_len = raw_size - RAMON_SPW_HDR_BYTES - RAMON_SPW_FOOTER_BYTES;
+		if (h->l3_len < SPW_L3L4_BYTES || h->l3_len - SPW_L3L4_BYTES > max_payload_len) {
 			rx->flags |= RAMON_SPW_RX_TRUNCATED;
-			rx->payload_len = area;
+			rx->payload_len = max_payload_len;
 		} else {
 			rx->payload_len = h->l3_len - SPW_L3L4_BYTES;
 			if (ramon_crc32(p + RAMON_SPW_L2L3_BYTES, h->l3_len - RAMON_SPW_L3_BYTES) !=
@@ -407,28 +410,28 @@ int ramon_spw_parse(const void *raw, uint32_t raw_size, uint8_t our_node, struct
 
 /* ---- TX ---- */
 
-static unsigned spw_slot_get(struct spw_state *w)
+static unsigned spw_slot_get(struct spw_state *spw)
 {
 	unsigned i;
 
-	pthread_mutex_lock(&w->pool_lock);
+	pthread_mutex_lock(&spw->pool_lock);
 	for (;;) {
-		for (i = 0; i < w->n_slots; i++)
-			if (!w->busy[i]) {
-				w->busy[i] = 1;
-				pthread_mutex_unlock(&w->pool_lock);
+		for (i = 0; i < spw->n_slots; i++)
+			if (!spw->slot_busy[i]) {
+				spw->slot_busy[i] = 1;
+				pthread_mutex_unlock(&spw->pool_lock);
 				return i;
 			}
-		pthread_cond_wait(&w->pool_cond, &w->pool_lock);
+		pthread_cond_wait(&spw->pool_cond, &spw->pool_lock);
 	}
 }
 
-static void spw_slot_put(struct spw_state *w, unsigned i)
+static void spw_slot_put(struct spw_state *spw, unsigned i)
 {
-	pthread_mutex_lock(&w->pool_lock);
-	w->busy[i] = 0;
-	pthread_cond_signal(&w->pool_cond);
-	pthread_mutex_unlock(&w->pool_lock);
+	pthread_mutex_lock(&spw->pool_lock);
+	spw->slot_busy[i] = 0;
+	pthread_cond_signal(&spw->pool_cond);
+	pthread_mutex_unlock(&spw->pool_lock);
 }
 
 static void spw_tx_account(struct spw_nn *s, int ret, uint32_t len)
@@ -445,10 +448,10 @@ int ramon_spw_send(ramon_ctx *c, uint32_t nn, const struct ramon_spw_msg *m,
 		   const struct ramon_iov *iov, unsigned n_iov, uint32_t timeout_ms,
 		   struct ramon_status *st)
 {
-	struct spw_state *w = &c->spw;
-	struct spw_nn *s = &w->nn[nn < RAMON_NN_COUNT ? nn : 0];
+	struct spw_state *spw = &c->spw;
+	struct spw_nn *s = &spw->nn[nn < RAMON_NN_COUNT ? nn : 0];
 	struct ramon_spw_msg mm = *m;
-	uint64_t payload = 0;
+	uint64_t payload_len = 0;
 	uint32_t len;
 	unsigned i, slot;
 	int ret;
@@ -457,27 +460,29 @@ int ramon_spw_send(ramon_ctx *c, uint32_t nn, const struct ramon_spw_msg *m,
 	if (ret)
 		return ret;
 	for (i = 0; i < n_iov; i++)
-		payload += iov[i].len;
-	if (payload > (m->flags & RAMON__SPW_MSG_SWUP ? SPW_SWUP_MAX_PAYLOAD : RAMON_SPW_MAX_PAYLOAD)) {
+		payload_len += iov[i].len;
+	if (payload_len >
+	    (m->flags & RAMON__SPW_MSG_SWUP ? SPW_SWUP_MAX_PAYLOAD : RAMON_SPW_MAX_PAYLOAD)) {
 		STAT_INC(s, tx_too_large);
-		return ramon__fail(st, RAMON_EL_TOO_LARGE, 0, payload, RAMON_SPW_MAX_PAYLOAD,
+		return ramon__fail(st, RAMON_EL_TOO_LARGE, 0, payload_len, RAMON_SPW_MAX_PAYLOAD,
 				   "spw%u: payload of %llu bytes is above the SPW maximum of %u; packet dropped, not sent",
-				   nn, (unsigned long long)payload, RAMON_SPW_MAX_PAYLOAD);
+				   nn, (unsigned long long)payload_len, RAMON_SPW_MAX_PAYLOAD);
 	}
-	if (payload + RAMON_SPW_HDR_BYTES > w->cfg.tx_slot_bytes)
-		return ramon__fail(st, RAMON_EL_TOO_LARGE, 0, payload, w->cfg.tx_slot_bytes,
+	if (payload_len + RAMON_SPW_HDR_BYTES > spw->cfg.tx_slot_bytes)
+		return ramon__fail(st, RAMON_EL_TOO_LARGE, 0, payload_len, spw->cfg.tx_slot_bytes,
 				   "payload of %llu bytes + header > tx_slot_bytes %u",
-				   (unsigned long long)payload, w->cfg.tx_slot_bytes);
+				   (unsigned long long)payload_len, spw->cfg.tx_slot_bytes);
 	if (!(m->flags & RAMON_SPW_MSG_KEEP_ID))
-		mm.packet_id = (uint16_t)__atomic_fetch_add(&w->packet_id, 1, __ATOMIC_RELAXED);
-	slot = spw_slot_get(w);
-	ret = ramon_spw_build(w->cfg.node_id, &mm, iov, n_iov, w->slot[slot].ptr,
-			      w->slot[slot].size, &len);
+		mm.packet_id = (uint16_t)__atomic_fetch_add(&spw->next_packet_id, 1,
+							    __ATOMIC_RELAXED);
+	slot = spw_slot_get(spw);
+	ret = ramon_spw_build(spw->cfg.node_id, &mm, iov, n_iov, spw->slots[slot].ptr,
+			      spw->slots[slot].size, &len);
 	if (ret)
 		ret = ramon__fail(st, RAMON_EL_INVAL, -ret, 0, 0, "bad payload gather list");
 	else
-		ret = ramon_axi_xfer1(c, s->tx_chan, &w->slot[slot], 0, len, timeout_ms, st);
-	spw_slot_put(w, slot);
+		ret = ramon_axi_xfer1(c, s->tx_chan, &spw->slots[slot], 0, len, timeout_ms, st);
+	spw_slot_put(spw, slot);
 	spw_tx_account(s, ret, len);
 	return ret;
 }
@@ -510,17 +515,17 @@ int ramon_spw_send_buf(ramon_ctx *c, uint32_t nn, const ramon_buf *pkt, uint64_t
 
 /*
  * Moves the packet whose size SPW_WAIT_RX returned into a cached buffer:
- * s->rxcopy, or a malloc'd one (*tmp set) when it is larger than rxbuf.
+ * s->rxcopy, or a malloc'd one (*must_free set) when it is larger than rxbuf.
  * Every popped size must be followed by exactly this transfer.
  */
 static int spw_consume(struct ramon_ctx *c, struct spw_nn *s, uint32_t size, uint8_t **data,
-		       int *tmp, struct ramon_status *st)
+		       int *must_free, struct ramon_status *st)
 {
 	ramon_buf big, *b = &s->rxbuf;
 	uint8_t *dst = s->rxcopy;
 	int ret;
 
-	*tmp = 0;
+	*must_free = 0;
 	if (!size) {
 		STAT_INC(s, rx_consume_failures);
 		return ramon__fail(st, RAMON_EL_SPW_BAD_PACKET, 0, 0, 0, "spw%u: zero-size packet",
@@ -554,7 +559,7 @@ static int spw_consume(struct ramon_ctx *c, struct spw_nn *s, uint32_t size, uin
 		return ret;
 	}
 	*data = dst;
-	*tmp = dst != s->rxcopy;
+	*must_free = dst != s->rxcopy;
 	return 0;
 }
 
@@ -577,26 +582,26 @@ static void spw_parse_account(struct ramon_ctx *c, struct spw_nn *s, const uint8
 		STAT_INC(s, rx_footer_errors);
 }
 
-static int spw_match(const struct ramon_spw_match *w, const struct ramon_spw_rx *rx)
+static int spw_match(const struct ramon_spw_match *want, const struct ramon_spw_rx *rx)
 {
-	if (!w->any_src && rx->hdr->src != w->src)
+	if (!want->any_src && rx->hdr->src != want->src)
 		return 0;
-	if (!w->any_app && rx->hdr->app_type != w->app_type)
+	if (!want->any_app && rx->hdr->app_type != want->app_type)
 		return 0;
-	if (!w->any_attr && rx->hdr->attribute_id != w->attribute_id)
+	if (!want->any_attr && rx->hdr->attribute_id != want->attribute_id)
 		return 0;
 	return 1;
 }
 
 /* is rx the reply a request waits for */
-static int spw_wanted(struct ramon_ctx *c, int any, const struct ramon_spw_match *want,
+static int spw_wanted(struct ramon_ctx *c, int accept_any, const struct ramon_spw_match *want,
 		      const struct ramon_spw_rx *rx)
 {
 	if (!rx->hdr || (rx->flags & RAMON_SPW_RX_NOT_FOR_US))
 		return 0;
 	if ((rx->flags & RAMON_SPW_RX_BAD) && !(c->spw.cfg.flags & RAMON_SPW_NO_CRC_CHECK))
 		return 0;
-	return any || spw_match(want, rx);
+	return accept_any || spw_match(want, rx);
 }
 
 /* RX thread: hand a consumed packet to a waiting request or to the callback */
@@ -607,9 +612,9 @@ static void spw_deliver(struct ramon_ctx *c, struct spw_nn *s, uint32_t size)
 	ramon_spw_rx_cb cb;
 	uint8_t *data;
 	void *user;
-	int tmp;
+	int must_free;
 
-	if (spw_consume(c, s, size, &data, &tmp, NULL))
+	if (spw_consume(c, s, size, &data, &must_free, NULL))
 		return;
 	if (size > SPW_RX_MAX_BYTES) {
 		/* taken off the FPGA (the next size belongs to the next packet), then dropped */
@@ -621,16 +626,17 @@ static void spw_deliver(struct ramon_ctx *c, struct spw_nn *s, uint32_t size)
 	}
 	spw_parse_account(c, s, data, size, &rx);
 	pthread_mutex_lock(&s->lock);
-	if (w->armed && !w->done && spw_wanted(c, w->any, &w->want, &rx)) {
-		if (size <= w->cap) {
-			memcpy(w->buf, data, size);
-			ramon_spw_parse(w->buf, size, c->spw.cfg.node_id, &w->rx);
+	if (w->armed && !w->done && spw_wanted(c, w->accept_any, &w->want, &rx)) {
+		if (size <= w->reply_cap_bytes) {
+			memcpy(w->reply, data, size);
+			ramon_spw_parse(w->reply, size, c->spw.cfg.node_id, &w->rx);
 			w->rx.nn = s->nn;
 			w->rx.flags = rx.flags;
 			w->err = 0;
 		} else {
-			w->err = ramon__fail(&w->st, RAMON_EL_TOO_LARGE, 0, size, w->cap,
-					     "reply of %u bytes, buffer of %u", size, w->cap);
+			w->err = ramon__fail(&w->st, RAMON_EL_TOO_LARGE, 0, size,
+					     w->reply_cap_bytes, "reply of %u bytes, buffer of %u",
+					     size, w->reply_cap_bytes);
 		}
 		w->done = 1;
 		pthread_cond_broadcast(&s->cond);
@@ -646,16 +652,16 @@ static void spw_deliver(struct ramon_ctx *c, struct spw_nn *s, uint32_t size)
 	else
 		STAT_INC(s, rx_dropped);
 out:
-	if (tmp)
+	if (must_free)
 		free(data);
 }
 
-static int spw_state(struct spw_nn *s)
+static int spw_get_rx_state(struct spw_nn *s)
 {
 	int state;
 
 	pthread_mutex_lock(&s->lock);
-	state = s->state;
+	state = s->rx_state;
 	pthread_mutex_unlock(&s->lock);
 	return state;
 }
@@ -667,7 +673,7 @@ static void *spw_rx_main(void *arg)
 	struct ramon_spw_wait_rx w;
 	int ret;
 
-	while (spw_state(s) == SPW_RX_RUNNING) {
+	while (spw_get_rx_state(s) == SPW_RX_RUNNING) {
 		memset(&w, 0, sizeof(w));
 		w.nn = s->nn;
 		w.timeout_ms = SPW_RX_WAIT_MS;
@@ -679,7 +685,7 @@ static void *spw_rx_main(void *arg)
 		if (ret == -ETIMEDOUT || ret == -EINTR)
 			continue;
 		if (ret == -ECANCELED) {
-			if (spw_state(s) == SPW_RX_RUNNING)
+			if (spw_get_rx_state(s) == SPW_RX_RUNNING)
 				ramon__log(c, RAMON_LOG_INFO,
 					   "spw%u: RX wait cancelled by another SPW_CANCEL user", s->nn);
 			continue;
@@ -694,7 +700,7 @@ static void *spw_rx_main(void *arg)
 		ramon__sleep_ms(SPW_ERR_BACKOFF_MS);
 	}
 	pthread_mutex_lock(&s->lock);
-	s->thread_done = 1;
+	s->thread_exited = 1;
 	pthread_mutex_unlock(&s->lock);
 	return NULL;
 }
@@ -710,32 +716,32 @@ int ramon_spw_rx_start(ramon_ctx *c, uint32_t nn, ramon_spw_rx_cb cb, void *user
 		return ret;
 	s = &c->spw.nn[nn];
 	pthread_mutex_lock(&s->lock);
-	if (s->thread_valid && !s->thread_done) {
+	if (s->thread_joinable && !s->thread_exited) {
 		pthread_mutex_unlock(&s->lock);
 		return ramon__fail(st, RAMON_EL_BUSY, 0, nn, 0, "spw%u: RX thread already running", nn);
 	}
-	if (s->receiver) {
+	if (s->receiver_active) {
 		pthread_mutex_unlock(&s->lock);
 		return ramon__fail(st, RAMON_EL_BUSY, 0, nn, 0, "spw%u: a receiver is active", nn);
 	}
-	if (s->thread_valid) {
+	if (s->thread_joinable) {
 		/* a thread that ended by itself (device removed) */
 		pthread_mutex_unlock(&s->lock);
 		pthread_join(s->thread, NULL);
 		pthread_mutex_lock(&s->lock);
-		s->thread_valid = 0;
+		s->thread_joinable = 0;
 	}
 	s->cb = cb;
 	s->cb_user = user;
-	s->state = SPW_RX_RUNNING;
-	s->thread_done = 0;
+	s->rx_state = SPW_RX_RUNNING;
+	s->thread_exited = 0;
 	ret = ramon__thread_start(&s->thread, spw_rx_main, s);
 	if (ret) {
-		s->state = SPW_RX_NONE;
+		s->rx_state = SPW_RX_NONE;
 		pthread_mutex_unlock(&s->lock);
 		return ramon__fail(st, RAMON_EL_SYS, -ret, 0, 0, "pthread_create: %s", strerror(-ret));
 	}
-	s->thread_valid = 1;
+	s->thread_joinable = 1;
 	pthread_mutex_unlock(&s->lock);
 	ramon_status_clear(st);
 	return 0;
@@ -750,7 +756,7 @@ int ramon_spw_rx_stop(ramon_ctx *c, uint32_t nn)
 		return -EINVAL;
 	s = &c->spw.nn[nn];
 	pthread_mutex_lock(&s->lock);
-	if (!s->thread_valid) {
+	if (!s->thread_joinable) {
 		pthread_mutex_unlock(&s->lock);
 		return 0;
 	}
@@ -758,15 +764,15 @@ int ramon_spw_rx_stop(ramon_ctx *c, uint32_t nn)
 		pthread_mutex_unlock(&s->lock);
 		return -EDEADLK;
 	}
-	s->state = SPW_RX_STOPPING;
+	s->rx_state = SPW_RX_STOPPING;
 	pthread_mutex_unlock(&s->lock);
 	memset(&k, 0, sizeof(k));
 	k.nn = nn;
 	ramon__ioctl(c, RAMON_IOC_SPW_CANCEL, &k, &k.st, NULL);
 	pthread_join(s->thread, NULL);
 	pthread_mutex_lock(&s->lock);
-	s->thread_valid = 0;
-	s->state = SPW_RX_NONE;
+	s->thread_joinable = 0;
+	s->rx_state = SPW_RX_NONE;
 	s->cb = NULL;
 	s->cb_user = NULL;
 	pthread_mutex_unlock(&s->lock);
@@ -782,7 +788,7 @@ int ramon_spw_rx_running(ramon_ctx *c, uint32_t nn)
 		return 0;
 	s = &c->spw.nn[nn];
 	pthread_mutex_lock(&s->lock);
-	r = s->thread_valid && s->state == SPW_RX_RUNNING && !s->thread_done;
+	r = s->thread_joinable && s->rx_state == SPW_RX_RUNNING && !s->thread_exited;
 	pthread_mutex_unlock(&s->lock);
 	return r;
 }
@@ -791,12 +797,12 @@ int ramon_spw_rx_running(ramon_ctx *c, uint32_t nn)
 static int spw_claim(struct spw_nn *s, struct ramon_status *st)
 {
 	pthread_mutex_lock(&s->lock);
-	if (s->thread_valid || s->receiver) {
+	if (s->thread_joinable || s->receiver_active) {
 		pthread_mutex_unlock(&s->lock);
 		return ramon__fail(st, RAMON_EL_BUSY, 0, s->nn, 0,
 				   "spw%u: an RX thread or another receiver owns the NN", s->nn);
 	}
-	s->receiver = 1;
+	s->receiver_active = 1;
 	pthread_mutex_unlock(&s->lock);
 	return 0;
 }
@@ -804,18 +810,18 @@ static int spw_claim(struct spw_nn *s, struct ramon_status *st)
 static void spw_release(struct spw_nn *s)
 {
 	pthread_mutex_lock(&s->lock);
-	s->receiver = 0;
+	s->receiver_active = 0;
 	pthread_mutex_unlock(&s->lock);
 }
 
 /* one packet into buf (or only consumed and dropped when buf is NULL) */
-static int spw_recv_one(struct ramon_ctx *c, struct spw_nn *s, void *buf, uint32_t cap,
+static int spw_recv_one(struct ramon_ctx *c, struct spw_nn *s, void *buf, uint32_t cap_bytes,
 			uint32_t timeout_ms, struct ramon_spw_rx *rx, struct ramon_status *st)
 {
 	struct ramon_spw_wait_rx w;
 	struct ramon_spw_rx tmp_rx;
 	uint8_t *data;
-	int ret, tmp;
+	int ret, must_free;
 
 	memset(&w, 0, sizeof(w));
 	w.nn = s->nn;
@@ -823,7 +829,7 @@ static int spw_recv_one(struct ramon_ctx *c, struct spw_nn *s, void *buf, uint32
 	ret = ramon__ioctl(c, RAMON_IOC_SPW_WAIT_RX, &w, &w.st, st);
 	if (ret)
 		return ret;
-	ret = spw_consume(c, s, w.size, &data, &tmp, st);
+	ret = spw_consume(c, s, w.size, &data, &must_free, st);
 	if (ret)
 		return ret;
 	if (w.size > SPW_RX_MAX_BYTES) {
@@ -836,29 +842,30 @@ static int spw_recv_one(struct ramon_ctx *c, struct spw_nn *s, void *buf, uint32
 			ret = ramon__fail(st, RAMON_EL_TOO_LARGE, 0, w.size, SPW_RX_MAX_BYTES,
 					  "spw%u: received a packet of %u bytes, above the SPW maximum of %u payload bytes; dropped",
 					  s->nn, w.size, RAMON_SPW_MAX_PAYLOAD);
-		if (tmp)
+		if (must_free)
 			free(data);
 		return ret;
 	}
 	spw_parse_account(c, s, data, w.size, &tmp_rx);
 	if (!buf) {
 		STAT_INC(s, rx_dropped);
-	} else if (w.size > cap) {
+	} else if (w.size > cap_bytes) {
 		STAT_INC(s, rx_dropped);
-		ret = ramon__fail(st, RAMON_EL_TOO_LARGE, 0, w.size, cap,
-				  "spw%u: packet of %u bytes, buffer of %u", s->nn, w.size, cap);
+		ret = ramon__fail(st, RAMON_EL_TOO_LARGE, 0, w.size, cap_bytes,
+				  "spw%u: packet of %u bytes, buffer of %u", s->nn, w.size,
+				  cap_bytes);
 	} else {
 		memcpy(buf, data, w.size);
 		ramon_spw_parse(buf, w.size, c->spw.cfg.node_id, rx);
 		rx->nn = s->nn;
 		rx->flags = tmp_rx.flags;
 	}
-	if (tmp)
+	if (must_free)
 		free(data);
 	return ret;
 }
 
-int ramon_spw_recv(ramon_ctx *c, uint32_t nn, void *buf, uint32_t cap, uint32_t timeout_ms,
+int ramon_spw_recv(ramon_ctx *c, uint32_t nn, void *buf, uint32_t cap_bytes, uint32_t timeout_ms,
 		   struct ramon_spw_rx *rx, struct ramon_status *st)
 {
 	struct spw_nn *s;
@@ -871,7 +878,7 @@ int ramon_spw_recv(ramon_ctx *c, uint32_t nn, void *buf, uint32_t cap, uint32_t 
 	ret = spw_claim(s, st);
 	if (ret)
 		return ret;
-	ret = spw_recv_one(c, s, buf, cap, timeout_ms, rx, st);
+	ret = spw_recv_one(c, s, buf, cap_bytes, timeout_ms, rx, st);
 	spw_release(s);
 	if (!ret)
 		ramon_status_clear(st);
@@ -921,10 +928,11 @@ int ramon_spw_drain(ramon_ctx *c, uint32_t nn, uint32_t idle_ms, uint32_t *n_dro
 
 /* ---- request / reply ---- */
 
-static int spw_request_thread(struct ramon_ctx *c, struct spw_nn *s, const struct ramon_spw_msg *m,
-			      const struct ramon_iov *iov, unsigned n_iov,
-			      const struct ramon_spw_match *want, void *reply, uint32_t cap,
-			      uint32_t timeout_ms, struct ramon_spw_rx *rx, struct ramon_status *st)
+static int spw_request_via_rx_thread(struct ramon_ctx *c, struct spw_nn *s,
+				     const struct ramon_spw_msg *m, const struct ramon_iov *iov,
+				     unsigned n_iov, const struct ramon_spw_match *want,
+				     void *reply, uint32_t cap_bytes, uint32_t timeout_ms,
+				     struct ramon_spw_rx *rx, struct ramon_status *st)
 {
 	struct spw_waiter *w = &s->waiter;
 	struct timespec ts;
@@ -938,11 +946,11 @@ static int spw_request_thread(struct ramon_ctx *c, struct spw_nn *s, const struc
 	}
 	memset(w, 0, sizeof(*w));
 	w->armed = 1;
-	w->any = !want;
+	w->accept_any = !want;
 	if (want)
 		w->want = *want;
-	w->buf = reply;
-	w->cap = cap;
+	w->reply = reply;
+	w->reply_cap_bytes = cap_bytes;
 	pthread_mutex_unlock(&s->lock);
 
 	ret = ramon_spw_send(c, s->nn, m, iov, n_iov, 0, st);
@@ -972,12 +980,12 @@ static int spw_request_thread(struct ramon_ctx *c, struct spw_nn *s, const struc
 
 int ramon_spw_request(ramon_ctx *c, uint32_t nn, const struct ramon_spw_msg *m,
 		      const struct ramon_iov *iov, unsigned n_iov,
-		      const struct ramon_spw_match *want, void *reply, uint32_t cap,
+		      const struct ramon_spw_match *want, void *reply, uint32_t cap_bytes,
 		      uint32_t timeout_ms, struct ramon_spw_rx *rx, struct ramon_status *st)
 {
 	struct ramon_spw_rx got;
 	struct spw_nn *s;
-	uint64_t end;
+	uint64_t end_ns;
 	int ret;
 
 	ret = spw_check(c, nn, 1, st);
@@ -987,8 +995,9 @@ int ramon_spw_request(ramon_ctx *c, uint32_t nn, const struct ramon_spw_msg *m,
 		timeout_ms = RAMON_SPW_REPLY_MS;
 	s = &c->spw.nn[nn];
 	pthread_mutex_lock(&s->lock);
-	if (s->thread_valid && s->state == SPW_RX_RUNNING && !s->thread_done)
-		return spw_request_thread(c, s, m, iov, n_iov, want, reply, cap, timeout_ms, rx, st);
+	if (s->thread_joinable && s->rx_state == SPW_RX_RUNNING && !s->thread_exited)
+		return spw_request_via_rx_thread(c, s, m, iov, n_iov, want, reply, cap_bytes,
+						 timeout_ms, rx, st);
 	pthread_mutex_unlock(&s->lock);
 
 	/* no RX thread: this thread receives */
@@ -998,16 +1007,17 @@ int ramon_spw_request(ramon_ctx *c, uint32_t nn, const struct ramon_spw_msg *m,
 	ret = spw_drain_claimed(c, s, SPW_DRAIN_FIRST_MS, NULL, st);
 	if (!ret)
 		ret = ramon_spw_send(c, nn, m, iov, n_iov, 0, st);
-	end = ramon__now_ns() + (uint64_t)timeout_ms * 1000000ull;
+	end_ns = ramon__now_ns() + (uint64_t)timeout_ms * 1000000ull;
 	while (!ret) {
-		uint64_t now = ramon__now_ns();
-		uint32_t left = now < end ? (uint32_t)((end - now + 999999) / 1000000) : 0;
+		uint64_t now_ns = ramon__now_ns();
+		uint32_t left_ms = now_ns < end_ns ?
+				   (uint32_t)((end_ns - now_ns + 999999) / 1000000) : 0;
 
-		if (!left) {
+		if (!left_ms) {
 			ret = -ETIMEDOUT;
 			break;
 		}
-		ret = spw_recv_one(c, s, reply, cap, left, &got, st);
+		ret = spw_recv_one(c, s, reply, cap_bytes, left_ms, &got, st);
 		if (ret)
 			break;
 		if (spw_wanted(c, !want, want, &got)) {
@@ -1029,7 +1039,8 @@ int ramon_spw_request(ramon_ctx *c, uint32_t nn, const struct ramon_spw_msg *m,
 
 /* ---- NN services ---- */
 
-static void spw_nn_msg(struct ramon_ctx *c, struct ramon_spw_msg *m, uint16_t app, uint32_t attr)
+static void spw_init_nn_msg(struct ramon_ctx *c, struct ramon_spw_msg *m, uint16_t app,
+			    uint32_t attr)
 {
 	memset(m, 0, sizeof(*m));
 	m->dst = c->spw.cfg.nn_node;
@@ -1046,10 +1057,10 @@ static int spw_nn_request(struct ramon_ctx *c, uint32_t nn, const struct ramon_s
 	struct ramon_iov iov = { data, len };
 	int ret;
 
-	*reply = malloc(SPW_REPLY_CAP);
+	*reply = malloc(SPW_REPLY_BUF_BYTES);
 	if (!*reply)
 		return ramon__fail(st, RAMON_EL_SYS, ENOMEM, 0, 0, "out of memory");
-	ret = ramon_spw_request(c, nn, m, &iov, len ? 1 : 0, NULL, *reply, SPW_REPLY_CAP,
+	ret = ramon_spw_request(c, nn, m, &iov, len ? 1 : 0, NULL, *reply, SPW_REPLY_BUF_BYTES,
 				timeout_ms, rx, st);
 	if (ret) {
 		free(*reply);
@@ -1073,7 +1084,7 @@ int ramon_spw_nn_version(ramon_ctx *c, uint32_t nn, struct ramon_nn_version *v, 
 	int ret;
 
 	memset(v, 0, sizeof(*v));
-	spw_nn_msg(c, &m, RAMON_SPW_VERSION_APP, RAMON_SPW_VERSION_ATTR);
+	spw_init_nn_msg(c, &m, RAMON_SPW_VERSION_APP, RAMON_SPW_VERSION_ATTR);
 	ret = spw_nn_request(c, nn, &m, NULL, 0, timeout_ms, &reply, &rx, st);
 	if (ret)
 		return ret;
@@ -1091,9 +1102,9 @@ int ramon_spw_nn_version(ramon_ctx *c, uint32_t nn, struct ramon_nn_version *v, 
 }
 
 /* request whose answer must carry attribute 0x101 */
-static int spw_nn_ack(struct ramon_ctx *c, uint32_t nn, uint16_t app, uint32_t attr,
-		      const void *data, uint32_t len, uint32_t timeout_ms, const char *what,
-		      struct ramon_status *st)
+static int spw_nn_request_ack(struct ramon_ctx *c, uint32_t nn, uint16_t app, uint32_t attr,
+			      const void *data, uint32_t len, uint32_t timeout_ms, const char *what,
+			      struct ramon_status *st)
 {
 	struct ramon_spw_msg m;
 	struct ramon_spw_rx rx;
@@ -1101,7 +1112,7 @@ static int spw_nn_ack(struct ramon_ctx *c, uint32_t nn, uint16_t app, uint32_t a
 	uint32_t got;
 	int ret;
 
-	spw_nn_msg(c, &m, app, attr);
+	spw_init_nn_msg(c, &m, app, attr);
 	ret = spw_nn_request(c, nn, &m, data, len, timeout_ms, &reply, &rx, st);
 	if (ret)
 		return ret;
@@ -1116,8 +1127,8 @@ static int spw_nn_ack(struct ramon_ctx *c, uint32_t nn, uint16_t app, uint32_t a
 
 int ramon_spw_nn_dps(ramon_ctx *c, uint32_t nn, uint32_t timeout_ms, struct ramon_status *st)
 {
-	return spw_nn_ack(c, nn, RAMON_SPW_DPS_APP, RAMON_SPW_DPS_ATTR, NULL, 0, timeout_ms, "DPS",
-			  st);
+	return spw_nn_request_ack(c, nn, RAMON_SPW_DPS_APP, RAMON_SPW_DPS_ATTR, NULL, 0, timeout_ms,
+				  "DPS", st);
 }
 
 int ramon_spw_nn_config_push(ramon_ctx *c, uint32_t nn, const void *data, uint32_t len,
@@ -1126,8 +1137,8 @@ int ramon_spw_nn_config_push(ramon_ctx *c, uint32_t nn, const void *data, uint32
 	if (!len || len > RAMON_SPW_CONFIG_MAX)
 		return ramon__fail(st, RAMON_EL_INVAL, 0, len, RAMON_SPW_CONFIG_MAX,
 				   "configuration of %u bytes (1..%u)", len, RAMON_SPW_CONFIG_MAX);
-	return spw_nn_ack(c, nn, RAMON_SPW_CONFIG_APP, RAMON_SPW_CONFIG_ATTR, data, len, timeout_ms,
-			  "configuration", st);
+	return spw_nn_request_ack(c, nn, RAMON_SPW_CONFIG_APP, RAMON_SPW_CONFIG_ATTR, data, len,
+				  timeout_ms, "configuration", st);
 }
 
 struct swup_start {
@@ -1138,17 +1149,17 @@ struct swup_start {
 
 struct swup_data {
 	uint8_t magic;
-	uint8_t reserve;
+	uint8_t reserved;
 	uint16_t index;
 	uint8_t data[RAMON_SPW_SWUP_CHUNK];
 } __attribute__((packed));
 
 struct swup_end {
 	uint8_t magic;
-	uint8_t reserve;
+	uint8_t reserved;
 	uint16_t index;
 	uint16_t data_length;
-	uint16_t reserve2;
+	uint16_t reserved2;
 	uint8_t data[RAMON_SPW_SWUP_CHUNK];
 } __attribute__((packed));
 
@@ -1182,7 +1193,7 @@ static int swup_step(struct ramon_ctx *c, uint32_t nn, uint32_t attr, const void
 	uint16_t status;
 	int ret;
 
-	spw_nn_msg(c, &m, RAMON_SPW_SWUP_APP, attr);
+	spw_init_nn_msg(c, &m, RAMON_SPW_SWUP_APP, attr);
 	m.flags |= RAMON__SPW_MSG_SWUP;		/* 4100- and 4104-byte packets, as the old tool */
 	ret = spw_nn_request(c, nn, &m, pkt, len, RAMON_SPW_REPLY_MS, &reply, &rx, st);
 	if (ret) {
@@ -1209,54 +1220,61 @@ int ramon_spw_nn_sw_update(ramon_ctx *c, uint32_t nn, uint8_t sw_type, const voi
 			   ramon_progress_fn progress, void *user, struct ramon_status *st)
 {
 	const uint8_t *img = image;
-	struct swup_start s0;
-	struct swup_data *d;
-	struct swup_end *e;
-	uint32_t n, i;
-	size_t last;
+	struct swup_start start_pkt;
+	struct swup_data *data_pkt;
+	struct swup_end *end_pkt;
+	uint32_t n_packets, i;
+	size_t last_len;
 	int ret;
 
 	if (!len || (len + RAMON_SPW_SWUP_CHUNK - 1) / RAMON_SPW_SWUP_CHUNK > 0xFFFF)
 		return ramon__fail(st, RAMON_EL_INVAL, 0, len, 0, "image of %zu bytes", len);
-	n = (uint32_t)((len + RAMON_SPW_SWUP_CHUNK - 1) / RAMON_SPW_SWUP_CHUNK);
-	d = calloc(1, sizeof(*d));
-	e = calloc(1, sizeof(*e));
-	if (!d || !e) {
+	n_packets = (uint32_t)((len + RAMON_SPW_SWUP_CHUNK - 1) / RAMON_SPW_SWUP_CHUNK);
+	data_pkt = calloc(1, sizeof(*data_pkt));
+	end_pkt = calloc(1, sizeof(*end_pkt));
+	if (!data_pkt || !end_pkt) {
 		ret = ramon__fail(st, RAMON_EL_SYS, ENOMEM, 0, 0, "out of memory");
 		goto out;
 	}
-	s0.magic = RAMON_SPW_SWUP_MAGIC;
-	s0.sw_type = sw_type;
-	s0.n_packets = (uint16_t)n;
-	ret = swup_step(c, nn, RAMON_SPW_SWUP_START_ATTR, &s0, sizeof(s0), RAMON_SWUP_START, 0, st);
+	start_pkt.magic = RAMON_SPW_SWUP_MAGIC;
+	start_pkt.sw_type = sw_type;
+	start_pkt.n_packets = (uint16_t)n_packets;
+	ret = swup_step(c, nn, RAMON_SPW_SWUP_START_ATTR, &start_pkt, sizeof(start_pkt),
+			RAMON_SWUP_START, 0, st);
 	if (progress && !ret)
-		progress(user, 0, n);
-	/* data packets 1..n-1 carry the first n-1 chunks; the end packet carries the last */
-	for (i = 1; !ret && i < n; i++) {
-		d->magic = RAMON_SPW_SWUP_MAGIC;
-		d->index = (uint16_t)i;
-		memcpy(d->data, img + (size_t)(i - 1) * RAMON_SPW_SWUP_CHUNK, RAMON_SPW_SWUP_CHUNK);
-		ret = swup_step(c, nn, RAMON_SPW_SWUP_DATA_ATTR, d, sizeof(*d), RAMON_SWUP_DATA, i, st);
+		progress(user, 0, n_packets);
+	/*
+	 * data packets 1..n_packets-1 carry the first n_packets-1 chunks; the end
+	 * packet carries the last
+	 */
+	for (i = 1; !ret && i < n_packets; i++) {
+		data_pkt->magic = RAMON_SPW_SWUP_MAGIC;
+		data_pkt->index = (uint16_t)i;
+		memcpy(data_pkt->data, img + (size_t)(i - 1) * RAMON_SPW_SWUP_CHUNK,
+		       RAMON_SPW_SWUP_CHUNK);
+		ret = swup_step(c, nn, RAMON_SPW_SWUP_DATA_ATTR, data_pkt, sizeof(*data_pkt),
+				RAMON_SWUP_DATA, i, st);
 		if (progress && !ret)
-			progress(user, i, n);
+			progress(user, i, n_packets);
 	}
 	if (ret)
 		goto out;
-	last = len - (size_t)(n - 1) * RAMON_SPW_SWUP_CHUNK;
-	e->magic = RAMON_SPW_SWUP_MAGIC;
-	e->index = (uint16_t)n;
-	e->data_length = (uint16_t)last;
-	memcpy(e->data, img + (size_t)(n - 1) * RAMON_SPW_SWUP_CHUNK, last);
-	ret = swup_step(c, nn, RAMON_SPW_SWUP_END_ATTR, e, sizeof(*e), RAMON_SWUP_END, n, st);
+	last_len = len - (size_t)(n_packets - 1) * RAMON_SPW_SWUP_CHUNK;
+	end_pkt->magic = RAMON_SPW_SWUP_MAGIC;
+	end_pkt->index = (uint16_t)n_packets;
+	end_pkt->data_length = (uint16_t)last_len;
+	memcpy(end_pkt->data, img + (size_t)(n_packets - 1) * RAMON_SPW_SWUP_CHUNK, last_len);
+	ret = swup_step(c, nn, RAMON_SPW_SWUP_END_ATTR, end_pkt, sizeof(*end_pkt),
+			RAMON_SWUP_END, n_packets, st);
 	if (progress && !ret)
-		progress(user, n, n);
+		progress(user, n_packets, n_packets);
 out:
-	free(d);
-	free(e);
+	free(data_pkt);
+	free(end_pkt);
 	return ret;
 }
 
-int ramon_spw_get_stats(ramon_ctx *c, uint32_t nn, struct ramon_spw_stats *out, int reset)
+int ramon_spw_get_stats(ramon_ctx *c, uint32_t nn, struct ramon_spw_stats *out, int and_reset)
 {
 	uint64_t *src, *dst = (uint64_t *)out;
 	size_t i;
@@ -1265,7 +1283,7 @@ int ramon_spw_get_stats(ramon_ctx *c, uint32_t nn, struct ramon_spw_stats *out, 
 		return -EINVAL;
 	src = (uint64_t *)&c->spw.nn[nn].stats;
 	for (i = 0; i < sizeof(*out) / sizeof(uint64_t); i++)
-		dst[i] = reset ? __atomic_exchange_n(&src[i], 0, __ATOMIC_RELAXED) :
-				 __atomic_load_n(&src[i], __ATOMIC_RELAXED);
+		dst[i] = and_reset ? __atomic_exchange_n(&src[i], 0, __ATOMIC_RELAXED) :
+				     __atomic_load_n(&src[i], __ATOMIC_RELAXED);
 	return 0;
 }
